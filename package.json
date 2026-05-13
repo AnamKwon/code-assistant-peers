@@ -1,0 +1,57 @@
+{
+  "name": "mcp-code-assistant-peers",
+  "version": "0.1.0",
+  "description": "MCP server that coordinates peer review workflows between Claude Code and Codex",
+  "type": "module",
+  "license": "MIT",
+  "author": "mcp-code-assistant-peers contributors",
+  "homepage": "https://github.com/anamkwon/mcp-code-assistant-peers#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/anamkwon/mcp-code-assistant-peers.git"
+  },
+  "bugs": {
+    "url": "https://github.com/anamkwon/mcp-code-assistant-peers/issues"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "codex",
+    "claude-code",
+    "code-review",
+    "peer-review"
+  ],
+  "bin": {
+    "code-assistant-peers": "./cli.ts",
+    "code-assistant-peers-server": "./server.ts"
+  },
+  "engines": {
+    "bun": ">=1.0"
+  },
+  "files": [
+    "README.md",
+    "LICENSE",
+    "SECURITY.md",
+    "CONTRIBUTING.md",
+    "server.ts",
+    "cli.ts",
+    "shared",
+    "scripts",
+    "docs"
+  ],
+  "scripts": {
+    "server": "bun server.ts",
+    "cli": "bun cli.ts",
+    "setup": "bun cli.ts setup both",
+    "test": "bun test",
+    "typecheck": "bun ./node_modules/typescript/bin/tsc --noEmit",
+    "check": "bun run typecheck && bun test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5"
+  }
+}
