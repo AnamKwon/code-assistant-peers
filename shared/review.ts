@@ -1,6 +1,7 @@
 import type { AssistantHost, GitStatusEntry, PeerTask, ReviewRequestOptions } from "./types.ts";
 import { getAssistantAdapter, normalizeHost, peerFor } from "./assistants.ts";
 import { formatStatus, getReviewDiff, getStatusEntries } from "./git.ts";
+import { buildSemanticContext } from "./semantic.ts";
 import { listFindings, listReviewRounds } from "./store.ts";
 
 const REVIEW_DIFF_BUDGET = parseInt(process.env.CODE_ASSISTANT_PEERS_DIFF_BUDGET ?? "12000", 10);
@@ -100,6 +101,10 @@ export async function buildReviewPrompt(
     base: options.base,
   });
   const focus = normalizeReviewFocus(options.focus ?? process.env.CODE_ASSISTANT_PEERS_REVIEW_FOCUS);
+  const semanticContext = await buildSemanticContext(task.cwd, reviewContext.changedFiles, options.semantic_context, {
+    diffLength: reviewContext.diff.length,
+    diffBudget: REVIEW_DIFF_BUDGET,
+  });
   const diff = truncateForReview(reviewContext.diff, REVIEW_DIFF_BUDGET);
   const warning = buildDirtyBaselineWarning(task.baseline_status, currentStatus);
   const modePrompt = mode === "adversarial"
@@ -148,6 +153,9 @@ ${formatStatus(currentStatus)}
 
 Changed files:
 ${reviewContext.changedFiles.length ? reviewContext.changedFiles.join("\n") : "(none detected)"}
+
+Semantic context:
+${semanticContext || "(semantic context provider disabled or no source symbols detected)"}
 
 Previous review memory:
 ${await buildPreviousReviewMemory(task.id)}

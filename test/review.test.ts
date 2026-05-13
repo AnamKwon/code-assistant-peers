@@ -13,7 +13,17 @@ import {
 } from "../shared/review.ts";
 import { loadAssistantRegistry, getAssistantAdapter, peersFor } from "../shared/assistants.ts";
 import { areConfiguredAssistantsReady, resolveMultiPeerTaskStatus } from "../shared/multi-peer.ts";
-import { upsertCodexMcpTimeoutConfig } from "../shared/setup.ts";
+import {
+  buildSemanticContext,
+  buildSerenaFindSymbolArgs,
+  buildSerenaNamePathArgs,
+  decideSerenaAuto,
+  extractSymbolHints,
+  formatSymbolHints,
+  parseSerenaCommand,
+  validateSerenaToolSet,
+} from "../shared/semantic.ts";
+import { buildSerenaEnv, resolveSerenaSetupConfig, upsertCodexMcpTimeoutConfig } from "../shared/setup.ts";
 import type { PeerTask } from "../shared/types.ts";
 
 describe("assistant routing", () => {
@@ -200,6 +210,59 @@ describe("setup helpers", () => {
     expect(result).toContain('args = ["/repo/quoted \\"server\\".ts"]');
     expect(result).toContain("tool_timeout_sec = 600");
   });
+
+  test("auto-enables Serena through uvx when available", () => {
+    const config = resolveSerenaSetupConfig({
+      mode: "auto",
+      hasSerenaBinary: false,
+      hasUvx: true,
+    });
+
+    expect(config.enabled).toBe(true);
+    expect(config.command?.[0]).toBe("uvx");
+    expect(buildSerenaEnv(config)).toContain("CODE_ASSISTANT_PEERS_CONTEXT_PROVIDER=serena-auto");
+    expect(buildSerenaEnv(config)).toContain("CODE_ASSISTANT_PEERS_DIFF_BUDGET=4000");
+  });
+
+  test("keeps standard review mode when Serena is not detected", () => {
+    const config = resolveSerenaSetupConfig({
+      mode: "auto",
+      hasSerenaBinary: false,
+      hasUvx: false,
+    });
+
+    expect(config.enabled).toBe(false);
+    expect(buildSerenaEnv(config)).toEqual([]);
+  });
+
+  test("accepts explicit Serena command", () => {
+    const config = resolveSerenaSetupConfig({
+      mode: "on",
+      explicitCommand: '["serena","start-mcp-server","--project-from-cwd"]',
+      hasSerenaBinary: false,
+      hasUvx: false,
+    });
+
+    expect(config.enabled).toBe(true);
+    expect(config.command).toEqual(["serena", "start-mcp-server", "--project-from-cwd"]);
+  });
+
+  test("requires a Serena executable when setup forces Serena on", () => {
+    expect(() => resolveSerenaSetupConfig({
+      mode: "on",
+      hasSerenaBinary: false,
+      hasUvx: false,
+    })).toThrow("--serena=on");
+  });
+
+  test("wraps malformed Serena command JSON with option context", () => {
+    expect(() => resolveSerenaSetupConfig({
+      mode: "on",
+      explicitCommand: "[\"serena\"",
+      hasSerenaBinary: false,
+      hasUvx: false,
+    })).toThrow("Invalid --serena-command JSON");
+  });
 });
 
 describe("review command construction", () => {
@@ -303,6 +366,141 @@ describe("review prompt shaping", () => {
     expect(prompt).toContain("security and data loss only");
   });
 
+  test("extracts lightweight symbol hints for TypeScript source", () => {
+    const hints = extractSymbolHints("shared/example.ts", [
+      "export class ReviewGate {",
+      "  async runReview() {",
+      "    return true;",
+      "  }",
+      "}",
+      "export function normalizeReviewFocus(value: string) { return value; }",
+      "export const buildPrompt = () => 'prompt';",
+    ].join("\n"));
+
+    expect(hints).toContainEqual({ file: "shared/example.ts", line: 1, kind: "class", name: "ReviewGate" });
+    expect(hints).toContainEqual({ file: "shared/example.ts", line: 2, kind: "method", name: "runReview" });
+    expect(hints).toContainEqual({ file: "shared/example.ts", line: 6, kind: "function", name: "normalizeReviewFocus" });
+    expect(hints).toContainEqual({ file: "shared/example.ts", line: 7, kind: "const-function", name: "buildPrompt" });
+  });
+
+  test("symbol hints ignore control-flow keywords that resemble methods", () => {
+    const hints = extractSymbolHints("shared/example.ts", [
+      "else if (ready) {",
+      "return(value) {",
+      "new Thing() {",
+      "delete item() {",
+      "typeof value() {",
+      "void cleanup() {",
+    ].join("\n"));
+    expect(hints).toEqual([]);
+  });
+
+  test("semantic context truncates large symbol hint output", async () => {
+    const hints = Array.from({ length: 100 }, (_, index) => ({
+      file: "shared/very-long-file-name-for-symbol-hints.ts",
+      line: index + 1,
+      kind: "function",
+      name: `veryLongFunctionName${index}`,
+    }));
+    const formatted = formatSymbolHints(hints, 300);
+    expect(formatted).toContain("Symbol hints truncated at 300 characters");
+
+    const context = await buildSemanticContext(process.cwd(), [], "x".repeat(6100));
+    expect(context).toContain("Semantic context truncated at 6000 characters");
+  });
+
+  test("parses Serena stdio command from JSON array and shell-like string", () => {
+    expect(parseSerenaCommand('["uvx","--from","git+https://github.com/oraios/serena","serena-mcp-server"]')).toEqual({
+      command: "uvx",
+      args: ["--from", "git+https://github.com/oraios/serena", "serena-mcp-server"],
+    });
+
+    expect(parseSerenaCommand("serena-mcp-server --transport stdio")).toEqual({
+      command: "serena-mcp-server",
+      args: ["--transport", "stdio"],
+    });
+  });
+
+  test("serena-direct provider falls back cleanly when no Serena command is configured", async () => {
+    const previousProvider = process.env.CODE_ASSISTANT_PEERS_CONTEXT_PROVIDER;
+    const previousCommand = process.env.CODE_ASSISTANT_PEERS_SERENA_COMMAND;
+    process.env.CODE_ASSISTANT_PEERS_CONTEXT_PROVIDER = "serena-direct";
+    delete process.env.CODE_ASSISTANT_PEERS_SERENA_COMMAND;
+    try {
+      const context = await buildSemanticContext(process.cwd(), []);
+      expect(context).toContain("Serena direct context unavailable");
+      expect(context).toContain("CODE_ASSISTANT_PEERS_SERENA_COMMAND is not set");
+    } finally {
+      if (previousProvider === undefined) delete process.env.CODE_ASSISTANT_PEERS_CONTEXT_PROVIDER;
+      else process.env.CODE_ASSISTANT_PEERS_CONTEXT_PROVIDER = previousProvider;
+      if (previousCommand === undefined) delete process.env.CODE_ASSISTANT_PEERS_SERENA_COMMAND;
+      else process.env.CODE_ASSISTANT_PEERS_SERENA_COMMAND = previousCommand;
+    }
+  });
+
+  test("serena-direct requires activate_project before project-scoped symbol queries", () => {
+    expect(validateSerenaToolSet(["get_symbols_overview", "find_symbol"])).toContain("activate_project");
+    expect(validateSerenaToolSet(["activate_project", "get_symbols_overview"])).toBeNull();
+  });
+
+  test("serena-direct uses current Serena find_symbol argument names", () => {
+    expect(buildSerenaFindSymbolArgs({
+      file: "shared/semantic.ts",
+      line: 18,
+      kind: "function",
+      name: "buildSemanticContext",
+    })).toMatchObject({
+      name_path_pattern: "buildSemanticContext",
+      relative_path: "shared/semantic.ts",
+      include_body: false,
+    });
+  });
+
+  test("serena-direct adapts reference arguments to Serena name path schema", () => {
+    const hint = {
+      file: "shared/semantic.ts",
+      line: 19,
+      kind: "function",
+      name: "buildSemanticContext",
+    };
+
+    expect(buildSerenaNamePathArgs({ properties: { name_path: {} } }, hint)).toMatchObject({
+      name_path: "buildSemanticContext",
+      relative_path: "shared/semantic.ts",
+    });
+    expect(buildSerenaNamePathArgs({ properties: { name_path_pattern: {} } }, hint)).toMatchObject({
+      name_path_pattern: "buildSemanticContext",
+      relative_path: "shared/semantic.ts",
+    });
+  });
+
+  test("serena-auto skips small source changes", async () => {
+    const decision = await decideSerenaAuto(process.cwd(), ["shared/types.ts"], {
+      diffLength: 100,
+      diffBudget: 4000,
+    });
+    expect(decision.useSerena).toBe(false);
+    expect(decision.sourceFileCount).toBe(1);
+  });
+
+  test("serena-auto uses Serena when diff is truncated", async () => {
+    const decision = await decideSerenaAuto(process.cwd(), ["shared/types.ts"], {
+      diffLength: 5000,
+      diffBudget: 4000,
+    });
+    expect(decision.useSerena).toBe(true);
+    expect(decision.reasons).toContain("diff_truncated");
+  });
+
+  test("serena-auto uses Serena for risky source paths", async () => {
+    const decision = await decideSerenaAuto(process.cwd(), ["src/checkout.ts"], {
+      diffLength: 100,
+      diffBudget: 4000,
+    });
+    expect(decision.useSerena).toBe(true);
+    expect(decision.reasons).toContain("risk_path");
+  });
+
   test("review prompt uses CODE_ASSISTANT_PEERS_REVIEW_FOCUS env default", async () => {
     const previous = process.env.CODE_ASSISTANT_PEERS_REVIEW_FOCUS;
     process.env.CODE_ASSISTANT_PEERS_REVIEW_FOCUS = "migration rollback risk";
@@ -328,6 +526,29 @@ describe("review prompt shaping", () => {
       if (previous === undefined) delete process.env.CODE_ASSISTANT_PEERS_REVIEW_FOCUS;
       else process.env.CODE_ASSISTANT_PEERS_REVIEW_FOCUS = previous;
     }
+  });
+
+  test("review prompt includes injected Serena-style semantic context", async () => {
+    const task: PeerTask = {
+      id: "test-task",
+      host: "codex",
+      peer: "claude",
+      prompt: "review semantic context",
+      cwd: process.cwd(),
+      git_root: null,
+      baseline_status: [],
+      baseline_diff: "",
+      created_at: new Date(0).toISOString(),
+      updated_at: new Date(0).toISOString(),
+      status: "open",
+    };
+
+    const { prompt } = await buildReviewPrompt(task, {
+      semantic_context: "Serena references: buildReviewPrompt -> runCollaborativeReviewTool",
+    });
+    expect(prompt).toContain("Semantic context:");
+    expect(prompt).toContain("External semantic context:");
+    expect(prompt).toContain("Serena references: buildReviewPrompt -> runCollaborativeReviewTool");
   });
 
   test("review focus truncation is visible", () => {

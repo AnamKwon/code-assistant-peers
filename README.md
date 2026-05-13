@@ -1,10 +1,60 @@
 # mcp-code-assistant-peers
 
-MCP server for cross-review workflows between CLI-based coding assistants.
+Turn your coding agents into peer reviewers.
 
 Translations: [한국어](docs/README.ko.md) | [日本語](docs/README.ja.md) | [中文](docs/README.zh-CN.md)
 
-The host assistant implements the requested change, then this server asks a configured peer assistant to review the resulting diff. Claude Code and Codex work out of the box, and additional CLIs such as Gemini, GLM, or DeepSeek can be registered through adapter configuration. Review rounds, findings, and task state are persisted locally so later rounds can verify whether earlier findings were addressed.
+`mcp-code-assistant-peers` is an MCP review gate for CLI coding agents. Claude Code can implement a change, Codex can review it, findings are saved locally, and the host assistant is prompted to run a post-edit review gate before the final answer.
+
+The GitHub repository is named `code-assistant-peers`; the package name remains `mcp-code-assistant-peers`.
+
+Claude Code and Codex work out of the box. Gemini, GLM, DeepSeek, and other prompt-capable CLIs can be registered through adapter configuration.
+
+![mcp-code-assistant-peers architecture](docs/assets/architecture.svg)
+
+```text
+User request
+   |
+   v
+Host assistant edits code
+   |
+   v
+mcp-code-assistant-peers MCP gate
+   |
+   +--> Peer reviewer CLI checks the diff
+   +--> SQLite stores rounds, findings, status
+   +--> Host fixes blocking findings before final response
+```
+
+## Why This Exists
+
+Single-agent coding workflows are fast, but the same model that wrote the patch can miss its own assumptions. This project makes review a local, repeatable workflow:
+
+- one assistant writes the code,
+- another assistant reviews the diff,
+- findings are persisted across rounds,
+- long reviews can run asynchronously,
+- multiple peer CLIs can review the same change through `PEER_ASSISTANTS`.
+
+## Demo Scenario
+
+Use this flow for a short demo video or terminal recording:
+
+1. Ask Claude Code to implement a small feature with an intentional edge-case bug.
+2. Claude calls `must_call_after_code_changes`.
+3. Codex reviews the diff and reports a concrete finding.
+4. Claude fixes the bug.
+5. A second review passes with no blocking findings.
+
+The smallest useful terminal demo is:
+
+```bash
+bun install
+bun run setup
+bun cli.ts doctor
+```
+
+Then, inside Claude Code or Codex, make a code change and ask the assistant to verify it with the MCP review gate.
 
 ## Features
 
@@ -17,6 +67,17 @@ The host assistant implements the requested change, then this server asks a conf
 - Async review flow for long reviews that may exceed MCP host tool-call timeouts.
 - Setup helpers for MCP registration and local assistant checks.
 - Project rule installer for `CLAUDE.md` and `AGENTS.md`.
+
+## Differentiators
+
+Unlike single-model review plugins, this project is built as a local MCP workflow:
+
+- **Bidirectional**: Claude can review Codex work, and Codex can review Claude work.
+- **Extensible**: any CLI that accepts prompts through stdin or argv can be registered.
+- **Persistent**: review rounds, findings, and task state are saved in SQLite.
+- **Gate-oriented**: tools are described as mandatory post-edit gates for coding assistants.
+- **Multi-peer**: `PEER_ASSISTANTS=claude,codex,gemini` fans review out to available peers.
+- **Async-ready**: long reviews can be started, polled, and resumed through MCP tools.
 
 ## Requirements
 
@@ -82,12 +143,28 @@ bun cli.ts setup both --workflow=peer_fix --mode=gate
 # Configure multi-peer review. Each host removes itself from this list at runtime.
 bun cli.ts setup both --peers=claude,codex,gemini --mode=adversarial
 
+# Auto-enable Serena semantic context when serena or uvx is available
+bun cli.ts setup both --serena=auto
+
+# Force the standard diff/changed-files review flow
+bun cli.ts setup both --serena=off
+
 # Also install project rules into the current project
 bun cli.ts setup both --install-rules
 
 # Print the commands without changing local CLI config
 bun cli.ts setup both --dry-run
 ```
+
+`setup` uses `--serena=auto` by default. If it detects a local `serena` executable or `uvx`, it registers the MCP server with Serena available at review time:
+
+- `CODE_ASSISTANT_PEERS_CONTEXT_PROVIDER=serena-auto`
+- `CODE_ASSISTANT_PEERS_DIFF_BUDGET=4000`
+- `CODE_ASSISTANT_PEERS_SERENA_CONTEXT_BUDGET=8000`
+
+`serena-auto` does not call Serena for every review. At review time it checks the changed source file count, changed source byte size, diff truncation, and risky path names. The byte-size trigger uses filesystem metadata (`stat`) rather than reading full file contents. Small changes stay on the standard diff/symbol path; large or high-risk changes use Serena symbol/reference context. Lightweight symbol hints may still read changed source files to extract function/class names.
+
+If Serena is not detected, setup leaves these variables unset and the review uses the standard changed-files/diff flow. Use `--serena=off` to force the standard flow, or `--serena=on --serena-command='["serena","start-mcp-server","--project-from-cwd"]'` to force a custom Serena command.
 
 After setup, restart Claude Code/Codex and call `code_assistant_peers_setup` from the MCP client to verify runtime availability.
 
@@ -295,6 +372,61 @@ The reviewer prompt is aligned with Codex-style review heuristics:
 
 `gate` mode keeps the first line as `ALLOW:` or `BLOCK:` and then asks the reviewer for a compact JSON summary containing findings, priority, confidence, and overall correctness. This keeps final gates easy to parse while preserving enough context for humans.
 
+## Semantic Context
+
+The default review context is still git-first: the server collects status, changed files, and diff. To reduce token waste and make reviews more impact-aware, the prompt can also include semantic context inspired by Serena's symbol-level workflow.
+
+Current behavior:
+
+1. `getReviewDiff` collects the changed files and diff.
+2. `buildSemanticContext` scans only changed TypeScript/JavaScript source files to identify likely changed symbols.
+3. `extractSymbolHints` finds lightweight symbol hints such as classes, interfaces, functions, methods, and exported arrow functions.
+4. If `serena-direct` is enabled, the server starts a Serena MCP stdio server and asks for targeted symbol overviews, definitions, references, and implementations for the changed files and symbols.
+5. The review prompt receives a compact `Semantic context` section before the raw diff.
+
+This is intentionally a targeted hint layer, not a full dependency graph. Reviewers should use it to decide where to inspect next, while still relying on the diff and repository reads for final findings. `serena-direct` is designed to avoid inefficient full-file loading for large repositories; it asks Serena for the smallest useful code context first and falls back to local symbol hints if Serena is unavailable.
+
+The setup flow treats Serena as an optimization, not a hard dependency. With Serena enabled, the reviewer receives smaller diffs plus symbol/reference context. Without Serena, the reviewer receives the normal diff and changed-file list and can inspect files directly.
+
+You can inject richer Serena-style context yourself:
+
+```text
+semantic_context: "Changed symbol: PaymentService.calculateFee\nReferences: CheckoutController.createOrder, RefundService.estimateRefund"
+```
+
+or through an environment variable:
+
+```bash
+CODE_ASSISTANT_PEERS_SEMANTIC_CONTEXT="Changed symbols and references collected from Serena"
+```
+
+Set a provider mode:
+
+```bash
+CODE_ASSISTANT_PEERS_CONTEXT_PROVIDER=symbols  # default lightweight symbol hints
+CODE_ASSISTANT_PEERS_CONTEXT_PROVIDER=serena   # add Serena lookup guidance to reviewer prompt
+CODE_ASSISTANT_PEERS_CONTEXT_PROVIDER=serena-auto  # call Serena only for large/truncated/risky reviews
+CODE_ASSISTANT_PEERS_CONTEXT_PROVIDER=serena-direct  # call a Serena MCP stdio server directly
+CODE_ASSISTANT_PEERS_CONTEXT_PROVIDER=off      # disable semantic hints
+```
+
+For direct Serena calls, point the provider at the command that starts your Serena MCP server:
+
+```bash
+CODE_ASSISTANT_PEERS_CONTEXT_PROVIDER=serena-direct
+CODE_ASSISTANT_PEERS_SERENA_COMMAND='["serena-mcp-server"]'
+```
+
+Use the exact command for your Serena installation. JSON array form is recommended because it avoids shell quoting ambiguity. The direct provider performs this sequence:
+
+1. starts Serena over stdio,
+2. calls `activate_project` with the repository root,
+3. calls `get_symbols_overview` for changed source files,
+4. calls `find_symbol`, `find_referencing_symbols`, and `find_implementations` for changed symbols when those tools are available,
+5. compacts the result to the configured context budget.
+
+If Serena is missing, too slow, or lacks a specific tool, the review continues with local symbol hints and a short availability note instead of failing the MCP review.
+
 Compared with similar review plugins and MCP servers, this project now includes:
 
 - local `doctor` diagnostics for setup drift and Codex timeout issues,
@@ -394,6 +526,13 @@ CODE_ASSISTANT_PEERS_HOME=/path/to/store
 | `CODE_ASSISTANT_PEERS_WORKFLOW` | `review_only` | `review_only` or `peer_fix`. |
 | `CODE_ASSISTANT_PEERS_REVIEW_MODE` | `normal` | `normal`, `adversarial`, `gate`, or `collaborative`. |
 | `CODE_ASSISTANT_PEERS_REVIEW_FOCUS` | unset | Optional default review focus, such as security, data loss, migration risk, UI regressions, or performance. |
+| `CODE_ASSISTANT_PEERS_CONTEXT_PROVIDER` | `symbols` | Semantic context mode: `symbols`, `serena`, `serena-auto`, `serena-direct`, or `off`. |
+| `CODE_ASSISTANT_PEERS_SEMANTIC_CONTEXT` | unset | Optional precomputed Serena-style context injected into review prompts. |
+| `CODE_ASSISTANT_PEERS_SERENA_COMMAND` | unset | JSON array or command string used by `serena-direct` to start a Serena MCP stdio server. |
+| `CODE_ASSISTANT_PEERS_SERENA_TIMEOUT_MS` | `90000` | Per-request timeout for direct Serena MCP calls. |
+| `CODE_ASSISTANT_PEERS_SERENA_CONTEXT_BUDGET` | `8000` | Character budget for direct Serena semantic context. |
+| `CODE_ASSISTANT_PEERS_SERENA_AUTO_SOURCE_BYTES` | `32768` | Changed source byte threshold for `serena-auto`. The threshold check uses `stat`; lightweight symbol hints may still read source files. |
+| `CODE_ASSISTANT_PEERS_SERENA_AUTO_SOURCE_FILES` | `4` | Changed source file count threshold for `serena-auto`. |
 | `CODE_ASSISTANT_PEERS_HOME` | `~/.mcp-code-assistant-peers` | SQLite and task mirror directory. |
 | `CODE_ASSISTANT_PEERS_DIFF_BUDGET` | `12000` | Character budget for included diffs. |
 | `CODE_ASSISTANT_PEERS_REVIEW_OUTPUT_BUDGET` | `6000` | Character budget for tool responses. |

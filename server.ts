@@ -105,6 +105,10 @@ const TOOLS = [
           type: "string" as const,
           description: "Optional review focus, such as security, data loss, performance, migration risk, UI regressions, or a specific concern from the user.",
         },
+        semantic_context: {
+          type: "string" as const,
+          description: "Optional Serena-style semantic context to include in the review prompt, such as changed symbols, references, implementations, or diagnostics.",
+        },
         workflow: {
           type: "string" as const,
           enum: ["review_only", "peer_fix"],
@@ -139,6 +143,10 @@ const TOOLS = [
         focus: {
           type: "string" as const,
           description: "Optional review focus, such as security, data loss, performance, migration risk, UI regressions, or a specific concern from the user.",
+        },
+        semantic_context: {
+          type: "string" as const,
+          description: "Optional Serena-style semantic context to include in the review prompt, such as changed symbols, references, implementations, or diagnostics.",
         },
         mode: {
           type: "string" as const,
@@ -184,6 +192,10 @@ const TOOLS = [
           type: "string" as const,
           description: "Optional review focus, such as security, data loss, performance, migration risk, UI regressions, or a specific concern from the user.",
         },
+        semantic_context: {
+          type: "string" as const,
+          description: "Optional Serena-style semantic context to include in the review prompt, such as changed symbols, references, implementations, or diagnostics.",
+        },
         mode: {
           type: "string" as const,
           enum: ["normal", "adversarial", "gate", "collaborative"],
@@ -228,6 +240,10 @@ const TOOLS = [
           type: "string" as const,
           description: "Optional review focus, such as security, data loss, performance, migration risk, UI regressions, or a specific concern from the user.",
         },
+        semantic_context: {
+          type: "string" as const,
+          description: "Optional Serena-style semantic context to include in the review prompt, such as changed symbols, references, implementations, or diagnostics.",
+        },
         mode: {
           type: "string" as const,
           enum: ["normal", "adversarial", "gate", "collaborative"],
@@ -271,6 +287,10 @@ const TOOLS = [
         focus: {
           type: "string" as const,
           description: "Optional review focus, such as security, data loss, performance, migration risk, UI regressions, or a specific concern from the user.",
+        },
+        semantic_context: {
+          type: "string" as const,
+          description: "Optional Serena-style semantic context to include in the review prompt, such as changed symbols, references, implementations, or diagnostics.",
         },
         mode: {
           type: "string" as const,
@@ -1051,6 +1071,9 @@ function parseReviewOptions(args: unknown): ReviewRequestOptions {
     focus: obj.focus === undefined || obj.focus === null
       ? normalizeReviewFocus(process.env.CODE_ASSISTANT_PEERS_REVIEW_FOCUS)
       : normalizeReviewFocus(String(obj.focus)),
+    semantic_context: obj.semantic_context === undefined || obj.semantic_context === null
+      ? null
+      : String(obj.semantic_context),
   };
 }
 

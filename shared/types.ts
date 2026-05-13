@@ -73,6 +73,14 @@ export interface ReviewRequestOptions {
   files_changed?: string[];
   workflow?: PeerWorkflow;
   focus?: string | null;
+  semantic_context?: string | null;
+}
+
+export interface SemanticSymbolHint {
+  file: string;
+  line: number;
+  kind: string;
+  name: string;
 }
 
 export interface AssistantAdapter {

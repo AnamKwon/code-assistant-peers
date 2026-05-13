@@ -1,4 +1,90 @@
 const MCP_SERVER_NAME = "code-assistant-peers";
+const DEFAULT_SERENA_UVX_COMMAND = [
+  "uvx",
+  "--from",
+  "git+https://github.com/oraios/serena",
+  "serena",
+  "start-mcp-server",
+  "--project-from-cwd",
+  "--enable-web-dashboard",
+  "false",
+  "--open-web-dashboard",
+  "false",
+  "--log-level",
+  "ERROR",
+];
+
+export interface SerenaSetupConfig {
+  enabled: boolean;
+  command: string[] | null;
+  reason: string;
+}
+
+export function buildSerenaEnv(config: SerenaSetupConfig): string[] {
+  if (!config.enabled || !config.command) return [];
+  return [
+    "CODE_ASSISTANT_PEERS_CONTEXT_PROVIDER=serena-auto",
+    `CODE_ASSISTANT_PEERS_SERENA_COMMAND=${JSON.stringify(config.command)}`,
+    "CODE_ASSISTANT_PEERS_DIFF_BUDGET=4000",
+    "CODE_ASSISTANT_PEERS_SERENA_CONTEXT_BUDGET=8000",
+    "CODE_ASSISTANT_PEERS_SERENA_TIMEOUT_MS=90000",
+  ];
+}
+
+export function resolveSerenaSetupConfig(options: {
+  mode: "auto" | "on" | "off";
+  explicitCommand?: string | null;
+  hasSerenaBinary?: boolean;
+  hasUvx?: boolean;
+}): SerenaSetupConfig {
+  if (options.mode === "off") {
+    return { enabled: false, command: null, reason: "disabled by --serena=off" };
+  }
+
+  if (options.explicitCommand?.trim()) {
+    return {
+      enabled: true,
+      command: parseCommandForSetup(options.explicitCommand),
+      reason: "using --serena-command",
+    };
+  }
+
+  if (options.hasSerenaBinary) {
+    return {
+      enabled: true,
+      command: [
+        "serena",
+        "start-mcp-server",
+        "--project-from-cwd",
+        "--enable-web-dashboard",
+        "false",
+        "--open-web-dashboard",
+        "false",
+        "--log-level",
+        "ERROR",
+      ],
+      reason: "detected serena executable",
+    };
+  }
+
+  if (options.hasUvx) {
+    return {
+      enabled: true,
+      command: DEFAULT_SERENA_UVX_COMMAND,
+      reason: "detected uvx; Serena will run through uvx",
+    };
+  }
+
+  if (options.mode === "on") {
+    throw new Error("Serena was requested with --serena=on, but neither serena nor uvx was found. Install Serena/uv or pass --serena-command.");
+  }
+
+  return {
+    enabled: false,
+    command: null,
+    reason: "Serena not detected; using standard diff/changed-files review",
+  };
+}
 
 export function upsertCodexMcpTimeoutConfig(current: string, serverPath: string, timeoutSec: number): string {
   const header = `[mcp_servers.${MCP_SERVER_NAME}]`;
@@ -34,6 +120,33 @@ export function upsertCodexMcpTimeoutConfig(current: string, serverPath: string,
   const withToolTimeout = upsertTomlKey(withStartupTimeout, "tool_timeout_sec", String(timeoutSec));
   const updated = [...lines.slice(0, start), ...withToolTimeout, ...lines.slice(end)].join("\n");
   return updated.endsWith("\n") ? updated : `${updated}\n`;
+}
+
+function parseCommandForSetup(value: string): string[] {
+  const trimmed = value.trim();
+  if (trimmed.startsWith("[")) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch (error) {
+      throw new Error(`Invalid --serena-command JSON: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (!Array.isArray(parsed) || parsed.length === 0 || parsed.some((part) => typeof part !== "string" || part.length === 0)) {
+      throw new Error("--serena-command JSON must be a non-empty string array");
+    }
+    return parsed;
+  }
+  return splitCommandLine(trimmed);
+}
+
+function splitCommandLine(value: string): string[] {
+  const parts: string[] = [];
+  const pattern = /"([^"]*)"|'([^']*)'|[^\s]+/g;
+  for (const match of value.matchAll(pattern)) {
+    parts.push(match[1] ?? match[2] ?? match[0]);
+  }
+  if (parts.length === 0) throw new Error("--serena-command must not be empty");
+  return parts;
 }
 
 function upsertTomlKey(lines: string[], key: string, value: string): string[] {
