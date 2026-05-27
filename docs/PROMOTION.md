@@ -71,6 +71,174 @@ Use `code-assistant-peers` as the primary command in setup instructions. `mcp-co
 - Be clear that the current npm package uses Bun at runtime.
 - For `setup`, recommend global npm install or source checkout, not `npx`, because MCP registration needs a stable server path.
 
+## Expanded Campaign Message: English
+
+Use this longer message when a community expects more context than a short launch post. It is designed for LinkedIn, Reddit, GitHub Discussions, Discord announcements, and blog-style posts.
+
+```text
+I built mcp-code-assistant-peers because local AI coding workflows are getting fast enough that review is becoming the bottleneck.
+
+Claude Code, Codex, Gemini CLI, and similar tools can produce useful patches quickly. The problem is that the assistant that wrote the patch is often the least reliable reviewer of its own assumptions. It may miss an edge case, skip a migration detail, forget a test path, or explain a change more confidently than the evidence supports.
+
+mcp-code-assistant-peers adds a local peer-review gate for that workflow.
+
+The loop is:
+
+1. one coding assistant edits the code,
+2. another assistant reviews the diff or workspace context,
+3. review findings are stored locally in SQLite,
+4. the host assistant fixes blocking issues,
+5. the host workflow is instructed to handle the review gate before giving the final answer.
+
+It is not trying to replace human review. It is meant to catch issues earlier, especially in the messy local phase before a PR exists.
+
+What it supports:
+
+- Claude Code and Codex out of the box
+- Gemini-style and custom CLI adapters
+- async review gates, so long reviews do not block the MCP host
+- SQLite review memory across review rounds
+- multi-peer review
+- normal, adversarial, gate, and collaborative review modes
+- non-git workspace fallback context when a normal git diff is unavailable
+
+The most useful moment is simple: your assistant finishes a code change, then another assistant gets a chance to say, "this condition is wrong", "this migration path is missing", or "this install step will fail for users who only have one client installed."
+
+That second opinion is not perfect, but it is structured, repeatable, and saved locally.
+
+Install:
+
+Choose one setup path.
+
+For Codex:
+
+curl -fsSL https://bun.sh/install | bash
+export BUN_INSTALL="$HOME/.bun"
+export PATH="$BUN_INSTALL/bin:$PATH"
+npm install -g mcp-code-assistant-peers
+code-assistant-peers setup codex --peers=auto
+
+For Claude Code:
+
+curl -fsSL https://bun.sh/install | bash
+export BUN_INSTALL="$HOME/.bun"
+export PATH="$BUN_INSTALL/bin:$PATH"
+npm install -g mcp-code-assistant-peers
+code-assistant-peers setup claude --peers=auto
+
+Then restart the configured MCP client, Codex or Claude Code, and call `code_assistant_peers_setup` from that client to verify the registered server.
+
+GitHub:
+https://github.com/AnamKwon/code-assistant-peers
+
+npm:
+https://www.npmjs.com/package/mcp-code-assistant-peers
+
+I would like feedback from developers already using more than one coding agent locally. The most useful feedback is: where did setup break, what did the reviewer catch, and where did it produce noise?
+```
+
+## Expanded Campaign Message: Korean Translation
+
+This is the Korean translation of the message above. Use it to understand the English copy, or post it directly in Korean communities.
+
+```text
+로컬 AI 코딩 워크플로우가 충분히 빨라지면서, 이제 병목은 코드 작성보다 리뷰 쪽에 가까워지고 있다고 느껴서 mcp-code-assistant-peers를 만들었습니다.
+
+Claude Code, Codex, Gemini CLI 같은 도구들은 유용한 패치를 빠르게 만들어냅니다. 문제는 그 패치를 작성한 같은 어시스턴트가 자기 자신의 가정을 리뷰할 때 가장 취약할 수 있다는 점입니다. 엣지 케이스를 놓치거나, 마이그레이션 경로를 빠뜨리거나, 테스트 경로를 확인하지 않거나, 실제 근거보다 더 확신 있게 변경을 설명할 수 있습니다.
+
+mcp-code-assistant-peers는 이 워크플로우에 로컬 peer-review gate를 추가합니다.
+
+흐름은 다음과 같습니다.
+
+1. 한 코딩 어시스턴트가 코드를 수정합니다.
+2. 다른 어시스턴트가 diff 또는 workspace context를 리뷰합니다.
+3. 리뷰 finding은 로컬 SQLite에 저장됩니다.
+4. host assistant가 blocking issue를 수정합니다.
+5. host workflow는 최종 답변 전에 review gate를 처리하도록 안내됩니다.
+
+이 도구는 사람의 코드 리뷰를 대체하려는 것이 아닙니다. PR이 만들어지기 전, 로컬에서 빠르게 수정하고 검토하는 지저분한 단계에서 문제를 더 일찍 잡기 위한 도구입니다.
+
+지원하는 것:
+
+- Claude Code와 Codex 기본 지원
+- Gemini 스타일 CLI와 custom CLI adapter
+- 긴 리뷰가 MCP host를 막지 않도록 하는 async review gate
+- 리뷰 라운드 간 finding을 저장하는 SQLite review memory
+- multi-peer review
+- normal, adversarial, gate, collaborative review mode
+- 일반 git diff가 없을 때 사용하는 non-git workspace fallback context
+
+가장 유용한 순간은 단순합니다. 어시스턴트가 코드 변경을 끝낸 뒤, 다른 어시스턴트가 한 번 더 보고 "이 조건이 틀렸다", "이 마이그레이션 경로가 빠졌다", "한쪽 클라이언트만 설치한 사용자에게 이 설치 단계는 실패한다"라고 말해주는 것입니다.
+
+그 두 번째 의견이 완벽한 것은 아니지만, 구조화되어 있고 반복 가능하며 로컬에 기록됩니다.
+
+설치:
+
+아래 중 하나만 선택하세요.
+
+Codex를 쓰는 경우:
+
+curl -fsSL https://bun.sh/install | bash
+export BUN_INSTALL="$HOME/.bun"
+export PATH="$BUN_INSTALL/bin:$PATH"
+npm install -g mcp-code-assistant-peers
+code-assistant-peers setup codex --peers=auto
+
+Claude Code를 쓰는 경우:
+
+curl -fsSL https://bun.sh/install | bash
+export BUN_INSTALL="$HOME/.bun"
+export PATH="$BUN_INSTALL/bin:$PATH"
+npm install -g mcp-code-assistant-peers
+code-assistant-peers setup claude --peers=auto
+
+그다음 설정한 MCP 클라이언트, Codex 또는 Claude Code를 재시작하고, 해당 클라이언트에서 `code_assistant_peers_setup`을 호출해 등록된 서버를 확인하면 됩니다.
+
+GitHub:
+https://github.com/AnamKwon/code-assistant-peers
+
+npm:
+https://www.npmjs.com/package/mcp-code-assistant-peers
+
+로컬에서 여러 코딩 에이전트를 함께 쓰고 있는 개발자들의 피드백을 받고 싶습니다. 특히 어디서 설치가 막혔는지, reviewer가 실제로 무엇을 잡았는지, 어디서 노이즈가 발생했는지가 가장 도움이 됩니다.
+```
+
+## Product Story Angles
+
+Use one of these angles depending on the community.
+
+### English
+
+```text
+Angle 1: Review before the PR
+Most AI coding mistakes are cheapest to catch before a pull request exists. mcp-code-assistant-peers adds a local review gate right after the assistant edits code.
+
+Angle 2: Do not let one model grade its own homework
+The assistant that wrote the patch can miss its own assumptions. This tool lets another coding assistant review the change and stores the findings locally.
+
+Angle 3: Practical multi-agent workflow
+This is not a demo of agents talking in circles. It is a narrow workflow: edit, review, fix, verify, then answer.
+
+Angle 4: Local-first review memory
+Review rounds and findings are saved in local SQLite, so follow-up review gates can check whether earlier findings were actually addressed.
+```
+
+### Korean Translation
+
+```text
+관점 1: PR 전에 리뷰하기
+AI 코딩 실수는 PR을 만들기 전에 잡는 것이 가장 비용이 적습니다. mcp-code-assistant-peers는 어시스턴트가 코드를 수정한 직후 로컬 review gate를 추가합니다.
+
+관점 2: 한 모델이 자기 숙제를 채점하게 두지 않기
+패치를 작성한 어시스턴트는 자기 자신의 가정을 놓칠 수 있습니다. 이 도구는 다른 코딩 어시스턴트가 변경사항을 리뷰하게 하고 finding을 로컬에 저장합니다.
+
+관점 3: 실용적인 multi-agent workflow
+이것은 에이전트들이 의미 없이 대화하는 데모가 아닙니다. edit, review, fix, verify, answer로 이어지는 좁고 실용적인 워크플로우입니다.
+
+관점 4: Local-first review memory
+리뷰 라운드와 finding은 로컬 SQLite에 저장됩니다. 그래서 이후 review gate가 이전 finding이 실제로 해결됐는지 확인할 수 있습니다.
+```
+
 ## Copy-Paste: Short Tagline
 
 ```text
