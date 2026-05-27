@@ -101,17 +101,23 @@ Run local checks:
 bun run check
 ```
 
-For registry-based usage after publishing:
+For registry-based usage after publishing, install Bun first because the package binaries run through `#!/usr/bin/env bun`:
 
 ```bash
-bun add -g mcp-code-assistant-peers
+curl -fsSL https://bun.sh/install | bash
+```
+
+Then install the package globally before running `setup`, so MCP registration points to a stable package path:
+
+```bash
+npm install -g mcp-code-assistant-peers
 code-assistant-peers status
 ```
 
-One-shot usage is also possible:
+One-shot usage is also possible for read-only commands such as `status`, but do not use `npx` for `setup` because MCP registration needs a stable installed server path:
 
 ```bash
-bunx mcp-code-assistant-peers status
+npx mcp-code-assistant-peers status
 ```
 
 ## Quick Start
@@ -643,8 +649,9 @@ test/                  Bun test suite
 
 ## Packaging Notes
 
-This package exposes two binaries:
+This package exposes three binaries:
 
+- `mcp-code-assistant-peers`: package-name management CLI alias
 - `code-assistant-peers`: management CLI
 - `code-assistant-peers-server`: MCP stdio server
 
