@@ -101,10 +101,14 @@ Run local checks:
 bun run check
 ```
 
-For registry-based usage after publishing, install Bun first because the package binaries run through `#!/usr/bin/env bun`:
+## Install From Npm
+
+The package is published as `mcp-code-assistant-peers` on npm. Install Bun first because the package binaries run through `#!/usr/bin/env bun`:
 
 ```bash
 curl -fsSL https://bun.sh/install | bash
+export BUN_INSTALL="$HOME/.bun"
+export PATH="$BUN_INSTALL/bin:$PATH"
 ```
 
 Then install the package globally before running `setup`, so MCP registration points to a stable package path:
@@ -113,6 +117,22 @@ Then install the package globally before running `setup`, so MCP registration po
 npm install -g mcp-code-assistant-peers
 code-assistant-peers status
 ```
+
+Configure one MCP client with the npm-installed package. Choose only the block for the client you use.
+
+For Codex:
+
+```bash
+code-assistant-peers setup codex --peers=auto
+```
+
+For Claude Code:
+
+```bash
+code-assistant-peers setup claude --peers=auto
+```
+
+Then restart the configured MCP client and call `code_assistant_peers_setup` from that client to verify the registered server.
 
 One-shot usage is also possible for read-only commands such as `status`, but do not use `npx` for `setup` because MCP registration needs a stable installed server path:
 
