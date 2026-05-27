@@ -23,6 +23,10 @@ Claude Code and Codex work out of the box, and other prompt-capable CLIs can be 
 
 ## Demo Script
 
+Use the checked-in demo asset in announcements or release notes:
+
+![Peer review gate demo](assets/peer-review-demo.gif)
+
 Record a 60-90 second terminal demo:
 
 1. Run setup:
@@ -116,7 +120,7 @@ Repo: https://github.com/AnamKwon/code-assistant-peers
 - [ ] Package dry-run includes docs. Use the pack command supported by your Bun version.
 - [ ] `bun cli.ts doctor` passes on the maintainer machine.
 - [ ] GitHub topics are set.
-- [ ] A demo GIF or asciinema recording is attached.
+- [ ] `docs/assets/architecture.svg` and `docs/assets/peer-review-demo.gif` render in GitHub Markdown.
 - [ ] `v0.1.0` GitHub release is created.
 - [ ] Issues labeled `good first issue` are created.
 

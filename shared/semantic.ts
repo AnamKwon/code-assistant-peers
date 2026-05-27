@@ -53,8 +53,9 @@ export async function buildSemanticContext(
     : null;
 
   let skipLocalSymbolHints = false;
+  let serenaContext: SerenaContextResult | null = null;
   if (provider === "serena-direct" || autoDecision?.useSerena) {
-    const serenaContext = await buildSerenaDirectContext(cwd, changedFiles, hints);
+    serenaContext = await buildSerenaDirectContext(cwd, changedFiles, hints);
     if (serenaContext.text) {
       parts.push(serenaContext.text);
       skipLocalSymbolHints = serenaContext.rich;
@@ -74,7 +75,42 @@ export async function buildSemanticContext(
     ].join("\n"));
   }
 
-  return parts.join("\n\n");
+  return [
+    `Semantic context status:\n${buildSemanticContextStatus(provider, autoDecision, serenaContext).map((line) => `- ${line}`).join("\n")}`,
+    ...parts,
+  ].join("\n\n");
+}
+
+function buildSemanticContextStatus(
+  provider: string,
+  autoDecision: SerenaAutoDecision | null,
+  serenaContext: SerenaContextResult | null,
+): string[] {
+  const statusLines = [`Provider: ${provider}`];
+  if (autoDecision) {
+    if (!autoDecision.useSerena) {
+      statusLines.push(`Serena optimization: skipped (source_files=${autoDecision.sourceFileCount}, source_bytes=${autoDecision.changedSourceBytes})`);
+    } else if (serenaContext?.rich) {
+      statusLines.push(`Serena optimization: used (${autoDecision.reasons.join(", ")})`);
+    } else if (serenaContext?.text?.includes("Serena direct context unavailable")) {
+      statusLines.push(`Serena optimization: unavailable (${autoDecision.reasons.join(", ")})`);
+    } else {
+      statusLines.push(`Serena optimization: attempted (${autoDecision.reasons.join(", ")})`);
+    }
+  } else if (provider === "serena-direct") {
+    if (serenaContext?.rich) {
+      statusLines.push("Serena optimization: used.");
+    } else if (serenaContext?.text?.includes("Serena direct context unavailable")) {
+      statusLines.push("Serena optimization: unavailable.");
+    } else {
+      statusLines.push("Serena optimization: direct provider requested.");
+    }
+  } else if (provider === "serena") {
+    statusLines.push("Serena optimization: reviewer lookup guidance requested; no host-side Serena MCP call will be made.");
+  } else {
+    statusLines.push("Serena optimization: not requested; using local symbol hints when available.");
+  }
+  return statusLines;
 }
 
 export async function decideSerenaAuto(

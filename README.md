@@ -33,10 +33,12 @@ Single-agent coding workflows are fast, but the same model that wrote the patch 
 - one assistant writes the code,
 - another assistant reviews the diff,
 - findings are persisted across rounds,
-- long reviews can run asynchronously,
+- review gates always run asynchronously to avoid MCP host timeout failures,
 - multiple peer CLIs can review the same change through `PEER_ASSISTANTS`.
 
 ## Demo Scenario
+
+![Peer review gate demo](docs/assets/peer-review-demo.gif)
 
 Use this flow for a short demo video or terminal recording:
 
@@ -64,7 +66,7 @@ Then, inside Claude Code or Codex, make a code change and ask the assistant to v
 - Review modes: `normal`, `adversarial`, `gate`, and `collaborative`.
 - Optional `peer_fix` workflow where the reviewer proposes concrete fixes without editing files.
 - SQLite-backed task memory, review rounds, findings, and async status.
-- Async review flow for long reviews that may exceed MCP host tool-call timeouts.
+- Async-first review flow that avoids long blocking MCP tool calls.
 - Setup helpers for MCP registration and local assistant checks.
 - Project rule installer for `CLAUDE.md` and `AGENTS.md`.
 
@@ -77,7 +79,7 @@ Unlike single-model review plugins, this project is built as a local MCP workflo
 - **Persistent**: review rounds, findings, and task state are saved in SQLite.
 - **Gate-oriented**: tools are described as mandatory post-edit gates for coding assistants.
 - **Multi-peer**: `PEER_ASSISTANTS=claude,codex,gemini` fans review out to available peers.
-- **Async-ready**: long reviews can be started, polled, and resumed through MCP tools.
+- **Async-first**: post-edit gates start background reviews, then hosts poll SQLite status before the final answer.
 
 ## Requirements
 
@@ -129,6 +131,31 @@ sh scripts/setup.sh
 
 By default this registers the MCP server for both Claude Code and Codex with `review_only`, `normal` mode, and a 600 second Codex MCP tool timeout.
 
+For a web-friendly one-line setup that also verifies Serena registration and patches Codex's MCP timeout, use:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/AnamKwon/code-assistant-peers/main/scripts/web-setup.sh | sh
+```
+
+The web setup script clones the project into `~/mcp-code-assistant-peers` when needed, runs `bun install`, registers Codex by default, enables `serena-auto` when Serena or `uvx` is available, patches Codex to a 30 minute MCP timeout, and prints the relevant config lines. Useful variants:
+
+```bash
+# Use an existing checkout and set Codex MCP timeout to 30 minutes
+sh scripts/web-setup.sh --dir /path/to/mcp-code-assistant-peers --timeout=1800
+
+# Register both Claude Code and Codex when both CLIs are installed
+sh scripts/web-setup.sh --target=both --timeout=1800
+
+# Patch only Codex
+sh scripts/web-setup.sh --target=codex --timeout=1800
+
+# Detect installed peer CLIs and configure the available reviewers
+sh scripts/web-setup.sh --target=codex --peers=auto
+
+# Force Serena on, failing if neither serena nor uvx is available
+sh scripts/web-setup.sh --serena=on
+```
+
 The built-in Claude setup command uses the POSIX `env` command, so the one-step setup flow is intended for macOS/Linux shells. Windows users should manually register the server with equivalent environment variables.
 
 Common variants:
@@ -142,6 +169,11 @@ bun cli.ts setup both --workflow=peer_fix --mode=gate
 
 # Configure multi-peer review. Each host removes itself from this list at runtime.
 bun cli.ts setup both --peers=claude,codex,gemini --mode=adversarial
+
+# Let setup detect available Claude/Codex/Gemini reviewers.
+# Gemini auto-selection requires GEMINI_API_KEY/GOOGLE_API_KEY.
+# Use --peers=gemini to opt into Gemini CLI OAuth or Vertex credentials.
+bun cli.ts setup codex --peers=auto
 
 # Auto-enable Serena semantic context when serena or uvx is available
 bun cli.ts setup both --serena=auto
@@ -209,15 +241,16 @@ You can also run local diagnostics without opening an MCP client:
 bun cli.ts doctor
 ```
 
-`doctor` checks Bun, Claude CLI, Codex CLI, local review storage, and the recommended Codex MCP timeout.
+`doctor` checks Bun, Claude CLI, Codex CLI, Gemini CLI, local review storage, and the recommended Codex MCP timeout.
 
 ## Assistant Adapters
 
-Claude and Codex are built in:
+Claude, Codex, and Gemini are built in:
 
 ```text
 claude -> claude -p --permission-mode plan ...
 codex  -> codex exec --sandbox read-only --skip-git-repo-check -
+gemini -> gemini --skip-trust --approval-mode plan -p ""  # prompt over stdin
 ```
 
 For other CLIs, set `CODE_ASSISTANT_PEERS_ASSISTANTS` to a JSON object. Each adapter needs:
@@ -230,11 +263,6 @@ Example:
 
 ```bash
 export CODE_ASSISTANT_PEERS_ASSISTANTS='{
-  "gemini": {
-    "command": ["gemini", "-p"],
-    "prompt_transport": "argv",
-    "description": "Gemini CLI prompt mode"
-  },
   "glm": {
     "command": ["glm", "chat"],
     "prompt_transport": "stdin"
@@ -253,7 +281,7 @@ HOST_ASSISTANT=gemini PEER_ASSISTANT=codex code-assistant-peers-server
 HOST_ASSISTANT=codex PEER_ASSISTANT=gemini code-assistant-peers-server
 ```
 
-If `PEER_ASSISTANT` is omitted, `claude` pairs with `codex`, `codex` pairs with `claude`, and custom hosts use the first other registered adapter.
+If `PEER_ASSISTANT` is omitted, `claude` pairs with `codex`, `codex` pairs with `claude` and `gemini`, and custom hosts use the first other registered adapter.
 
 For multi-peer review, set `PEER_ASSISTANTS` to a comma-separated list. When this variable is present, it takes precedence over `PEER_ASSISTANT`. The server removes the host from the list, checks which peer CLIs are available, sends reviews to the available peers, and stores one review round per reviewer plus a final aggregate round.
 
@@ -267,9 +295,9 @@ Multi-peer outcomes:
 - `partial_failed`: at least one peer was skipped or failed, but at least one review succeeded.
 - `review_failed`: no peer review succeeded, or the aggregate pass failed.
 
-Custom adapters cannot override built-in ids (`claude` and `codex`). Use a distinct id such as `claude-custom` when experimenting with a different command.
+Custom adapters cannot override built-in ids (`claude`, `codex`, or `gemini`). For backwards compatibility, a legacy custom `gemini` entry is ignored and the safer built-in Gemini adapter is used. Use a distinct id such as `gemini-custom` when experimenting with a different command.
 
-Prefer `stdin` transport for code review CLIs when possible. Review prompts can include large diffs; `argv` transport is convenient for prompt flags such as `gemini -p`, but it is subject to operating-system argument length limits. The server refuses argv prompts above `CODE_ASSISTANT_PEERS_ARGV_PROMPT_BUDGET` to fail with a clear error instead of an opaque process spawn failure.
+Prefer `stdin` transport for code review CLIs when possible. Review prompts can include large diffs and sensitive source context. The built-in Gemini adapter uses `-p ""` plus stdin because Gemini appends stdin to the prompt flag. `argv` transport is still available for custom CLIs, but it is subject to process-list exposure and operating-system argument length limits. The server refuses argv prompts above `CODE_ASSISTANT_PEERS_ARGV_PROMPT_BUDGET` to fail with a clear error instead of an opaque process spawn failure.
 
 ## Recommended Codex Timeout
 
@@ -296,16 +324,23 @@ The setup command writes this timeout automatically for Codex:
 bun cli.ts setup codex --timeout=600
 ```
 
+To patch timeout and verify Serena registration in one step:
+
+```bash
+sh scripts/web-setup.sh --target=codex --timeout=1800
+```
+
 ## Workflow
 
 1. The host assistant calls `begin_peer_task` before editing when feasible.
 2. The host assistant implements the requested change.
 3. The host assistant calls `must_call_after_code_changes` before the final answer.
-4. The server runs the opposite reviewer:
+4. The server starts or reuses an async peer review job:
    - Claude host uses Codex in read-only exec mode.
-   - Codex host uses Claude print mode with read-only tools.
+   - Codex host uses Claude Code and Gemini CLI in multi-peer mode, skipping unavailable peers.
    - Custom hosts use the configured `PEER_ASSISTANT` adapter.
-5. The host assistant reports the peer review result and fixes any blocking findings.
+5. The host assistant calls `wait_for_peer_review` or `get_peer_review_status` until the task reaches `reviewed`, `partial_failed`, or `review_failed`.
+6. The host assistant reports the peer review result and fixes any blocking findings.
 
 MCP cannot technically force every final answer through a tool call. For stronger behavior, install project rules:
 
@@ -321,10 +356,10 @@ bun cli.ts rules
 
 ## Async Reviews
 
-Use async review tools when a review may exceed the host MCP timeout:
+All post-edit review gates are async-first. This avoids Codex/Claude MCP host timeouts and prevents duplicate reviewer processes when the same task is already `queued` or `running`:
 
-1. `start_peer_review_async` stores the task as `queued`, starts the review in the background, and returns immediately.
-2. The background review updates SQLite to `running`, then `reviewed` or `review_failed`.
+1. `must_call_after_code_changes`, `finalize_code_changes_with_peer_review`, `verify_code_changes_after_edit`, `request_peer_review`, and `start_peer_review_async` store the task as `queued`, start the review in the background, and return immediately.
+2. The background review updates SQLite to `running`, then `reviewed`, `partial_failed`, or `review_failed`.
 3. `wait_for_peer_review` polls for a bounded time. Repeat it until the task reaches a terminal state.
 4. `get_peer_review_status` returns the current task status, latest round preview, and open findings.
 
@@ -360,6 +395,40 @@ or set a default:
 CODE_ASSISTANT_PEERS_REVIEW_FOCUS="migration and rollback risk"
 ```
 
+## Token Cost Control
+
+Peer review can use a lot of tokens because the MCP server sends a full review prompt to each configured reviewer subprocess. In `normal` and `adversarial` modes, a Codex host may also run Codex self-review and then run an aggregate pass that merges the peer outputs. With multiple peers, one code change can therefore become several model calls.
+
+Main cost drivers:
+
+- `PEER_ASSISTANTS=claude,codex,gemini` fans out one review prompt per available peer.
+- Codex host self-review adds another Codex pass in `normal` and `adversarial` modes.
+- The aggregate pass receives peer outputs plus repository/task context.
+- `CODE_ASSISTANT_PEERS_DIFF_BUDGET` controls how much raw diff is included. The default is `12000` characters.
+- `serena-auto` may add semantic context. `CODE_ASSISTANT_PEERS_SERENA_CONTEXT_BUDGET` defaults to `8000` characters.
+- Reviewers are allowed to inspect the repository directly when the included diff is insufficient, so Claude print mode or Codex exec may read additional files.
+- Previous review memory is included in later rounds so reviewers can verify earlier findings.
+
+Low-token recommended setup:
+
+```bash
+# Single external peer, compact gate output
+bun cli.ts setup codex --peers=claude --mode=gate
+
+# Or use Gemini explicitly as the only peer
+bun cli.ts setup codex --peers=gemini --mode=gate
+```
+
+For tighter prompt budgets:
+
+```bash
+CODE_ASSISTANT_PEERS_DIFF_BUDGET=4000
+CODE_ASSISTANT_PEERS_SERENA_CONTEXT_BUDGET=2000
+CODE_ASSISTANT_PEERS_CONTEXT_PROVIDER=off
+```
+
+Use `normal`, `adversarial`, `collaborative`, multi-peer review, and Serena-rich context when you want deeper review coverage and are willing to spend more tokens. Use `gate` mode and a single peer for routine final-response checks.
+
 ## Review Quality Model
 
 The reviewer prompt is aligned with Codex-style review heuristics:
@@ -376,13 +445,15 @@ The reviewer prompt is aligned with Codex-style review heuristics:
 
 The default review context is still git-first: the server collects status, changed files, and diff. To reduce token waste and make reviews more impact-aware, the prompt can also include semantic context inspired by Serena's symbol-level workflow.
 
+Reviewer CLIs are launched as separate subprocesses from the host assistant's MCP session. They should not assume access to the host's MCP tools or task tools. Serena support therefore works primarily by having the host MCP server collect optional semantic context before the review prompt is sent, then passing that compact context through the normal `semantic_context` prompt field. When a reviewer runtime is explicitly configured with its own Serena MCP command, it may use those read-only tools as an extra inspection path, but reviews must remain correct without that capability.
+
 Current behavior:
 
 1. `getReviewDiff` collects the changed files and diff.
 2. `buildSemanticContext` scans only changed TypeScript/JavaScript source files to identify likely changed symbols.
 3. `extractSymbolHints` finds lightweight symbol hints such as classes, interfaces, functions, methods, and exported arrow functions.
-4. If `serena-direct` is enabled, the server starts a Serena MCP stdio server and asks for targeted symbol overviews, definitions, references, and implementations for the changed files and symbols.
-5. The review prompt receives a compact `Semantic context` section before the raw diff.
+4. If `serena-auto` decides the change is large, truncated, or risky, or if `serena-direct` is enabled, the server starts a Serena MCP stdio server and asks for targeted symbol overviews, definitions, references, and implementations for the changed files and symbols.
+5. The review prompt receives a compact `Semantic context` section before the raw diff, including a status line that says whether Serena was used, skipped, or unavailable.
 
 This is intentionally a targeted hint layer, not a full dependency graph. Reviewers should use it to decide where to inspect next, while still relying on the diff and repository reads for final findings. `serena-direct` is designed to avoid inefficient full-file loading for large repositories; it asks Serena for the smallest useful code context first and falls back to local symbol hints if Serena is unavailable.
 
@@ -464,16 +535,13 @@ bun cli.ts reinstall-command codex review_only gate
 
 ## Tools
 
-Primary workflow tools:
+Primary async workflow tools:
 
 - `begin_peer_task`
 - `must_call_after_code_changes`
 - `finalize_code_changes_with_peer_review`
 - `verify_code_changes_after_edit`
 - `request_peer_review`
-
-Async workflow tools:
-
 - `start_peer_review_async`
 - `wait_for_peer_review`
 - `get_peer_review_status`
@@ -536,6 +604,7 @@ CODE_ASSISTANT_PEERS_HOME=/path/to/store
 | `CODE_ASSISTANT_PEERS_HOME` | `~/.mcp-code-assistant-peers` | SQLite and task mirror directory. |
 | `CODE_ASSISTANT_PEERS_DIFF_BUDGET` | `12000` | Character budget for included diffs. |
 | `CODE_ASSISTANT_PEERS_REVIEW_OUTPUT_BUDGET` | `6000` | Character budget for tool responses. |
+| `CODE_ASSISTANT_PEERS_REVIEW_TIMEOUT_MS` | adapter default, otherwise `600000` | Hard timeout for each reviewer CLI process. Built-in Gemini defaults to `180000`. |
 | `CODE_ASSISTANT_PEERS_ARGV_PROMPT_BUDGET` | `60000` | Maximum prompt size for custom adapters using `prompt_transport: "argv"`. |
 | `CODE_ASSISTANT_PEERS_INCLUDE_SUCCESS_STDERR` | unset | Set `1` to include successful reviewer stderr in MCP responses. |
 

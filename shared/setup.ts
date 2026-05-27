@@ -20,6 +20,16 @@ export interface SerenaSetupConfig {
   reason: string;
 }
 
+export type AssistantSetupAvailability = Record<string, { ok: boolean; detail: string } | undefined>;
+
+export interface AutoPeerSetupResult {
+  peers: string;
+  selected: string[];
+  skipped: Array<{ id: string; reason: string }>;
+}
+
+const BUILTIN_SETUP_ASSISTANTS = ["claude", "codex", "gemini"] as const;
+
 export function buildSerenaEnv(config: SerenaSetupConfig): string[] {
   if (!config.enabled || !config.command) return [];
   return [
@@ -86,6 +96,61 @@ export function resolveSerenaSetupConfig(options: {
   };
 }
 
+export function resolveAutoPeerSetupConfig(
+  targets: readonly string[],
+  availability: AssistantSetupAvailability,
+): AutoPeerSetupResult {
+  const targetSet = new Set(targets);
+  const selected = BUILTIN_SETUP_ASSISTANTS.filter((id) => {
+    if (targets.length === 1 && targetSet.has(id)) return false;
+    return Boolean(availability[id]?.ok);
+  });
+  const skipped = BUILTIN_SETUP_ASSISTANTS
+    .filter((id) => !selected.includes(id))
+    .map((id) => ({
+      id,
+      reason: targetSet.has(id) && targets.length === 1
+        ? "same as the only setup target"
+        : availability[id]?.detail ?? "not checked",
+    }));
+
+  if (selected.length === 0) {
+    const details = BUILTIN_SETUP_ASSISTANTS
+      .map((id) => `${id}: ${availability[id]?.detail ?? "not checked"}`)
+      .join("; ");
+    throw new Error(`--peers=auto could not find an available peer assistant different from the setup target. ${details}`);
+  }
+  for (const target of targets) {
+    if (selected.filter((id) => id !== target).length > 0) continue;
+    const details = BUILTIN_SETUP_ASSISTANTS
+      .map((id) => `${id}: ${availability[id]?.detail ?? "not checked"}`)
+      .join("; ");
+    throw new Error(`--peers=auto could not find an available peer assistant for HOST_ASSISTANT=${target}. ${details}`);
+  }
+
+  return {
+    peers: selected.join(","),
+    selected,
+    skipped,
+  };
+}
+
+export function resolveGeminiAutoPeerReadiness(env: NodeJS.ProcessEnv): { ok: boolean; detail: string } {
+  if (isTruthySetupEnv(env.GOOGLE_GENAI_USE_VERTEXAI)) {
+    return {
+      ok: false,
+      detail: "gemini found, but --peers=auto does not select Gemini in Vertex AI mode. Use --peers=gemini to opt into Vertex credentials.",
+    };
+  }
+  if (env.GEMINI_API_KEY?.trim() || env.GOOGLE_API_KEY?.trim()) {
+    return { ok: true, detail: "gemini found and API key environment is set" };
+  }
+  return {
+    ok: false,
+    detail: "gemini found, but --peers=auto only selects Gemini when GEMINI_API_KEY/GOOGLE_API_KEY is set. Use --peers=gemini to opt into Gemini CLI OAuth or Vertex credentials.",
+  };
+}
+
 export function upsertCodexMcpTimeoutConfig(current: string, serverPath: string, timeoutSec: number): string {
   const header = `[mcp_servers.${MCP_SERVER_NAME}]`;
   const escapedServerPath = serverPath.replaceAll("\\", "\\\\").replaceAll("\"", "\\\"");
@@ -120,6 +185,10 @@ export function upsertCodexMcpTimeoutConfig(current: string, serverPath: string,
   const withToolTimeout = upsertTomlKey(withStartupTimeout, "tool_timeout_sec", String(timeoutSec));
   const updated = [...lines.slice(0, start), ...withToolTimeout, ...lines.slice(end)].join("\n");
   return updated.endsWith("\n") ? updated : `${updated}\n`;
+}
+
+function isTruthySetupEnv(value: string | undefined): boolean {
+  return ["1", "true", "yes", "on"].includes(value?.trim().toLowerCase() ?? "");
 }
 
 function parseCommandForSetup(value: string): string[] {

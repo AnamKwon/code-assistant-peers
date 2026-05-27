@@ -6,6 +6,17 @@
 
 主助手完成代码修改后，本服务器会把 diff 发送给已配置的 peer 助手进行审查。Claude Code 和 Codex 内置支持，也可以通过 adapter 配置接入 Gemini、GLM、DeepSeek 等 CLI。审查轮次、findings 和 task 状态会保存在本地 SQLite 中，后续轮次可以验证之前的问题是否已经解决。
 
+![mcp-code-assistant-peers architecture](assets/architecture.svg)
+
+## 使用流程
+
+![peer review gate demo](assets/peer-review-demo.gif)
+
+1. 主助手修改代码。
+2. MCP gate 将 diff 和 context 发送给 peer reviewer CLI。
+3. reviewer findings 和状态保存到 SQLite。
+4. 主助手修复 blocking findings，再次通过 gate 后给出最终回复。
+
 ## 功能
 
 - 内置 Claude Code / Codex adapter
@@ -14,7 +25,7 @@
 - `normal`, `adversarial`, `gate`, `collaborative` 审查模式
 - `peer_fix` workflow：reviewer 只提出修复建议，不直接编辑文件
 - SQLite 持久化 task memory、review rounds、findings、async status
-- 面向长时间审查的 async review flow
+- 用于避免 MCP host timeout 的 async-first review flow
 - 用于 MCP 注册和本地诊断的 `setup`, `doctor`
 - `CLAUDE.md` 和 `AGENTS.md` project rule installer
 
@@ -75,7 +86,7 @@ bun cli.ts setup both --dry-run
 bun cli.ts doctor
 ```
 
-`doctor` 会检查 Bun、Claude CLI、Codex CLI、本地 review storage 和 Codex MCP timeout。
+`doctor` 会检查 Bun、Claude CLI、Codex CLI、Gemini CLI、本地 review storage 和 Codex MCP timeout。
 
 ## 手动注册
 
@@ -105,19 +116,19 @@ codex mcp add code-assistant-peers --env HOST_ASSISTANT=codex -- code-assistant-
 ```text
 claude -> claude -p --permission-mode plan ...
 codex  -> codex exec --sandbox read-only --skip-git-repo-check -
+gemini -> gemini --skip-trust --approval-mode plan -p ""  # 提示词通过 stdin 传入
 ```
 
 其他 CLI 可以通过 `CODE_ASSISTANT_PEERS_ASSISTANTS` 注册：
 
 ```bash
 export CODE_ASSISTANT_PEERS_ASSISTANTS='{
-  "gemini": {
-    "command": ["gemini", "-p"],
-    "prompt_transport": "argv",
-    "description": "Gemini CLI prompt mode"
-  },
   "glm": {
     "command": ["glm", "chat"],
+    "prompt_transport": "stdin"
+  },
+  "deepseek": {
+    "command": ["deepseek", "chat"],
     "prompt_transport": "stdin"
   }
 }'
@@ -170,8 +181,9 @@ bun cli.ts setup codex --timeout=600
 1. 尽可能在修改前调用 `begin_peer_task`
 2. host assistant 修改代码
 3. 最终回答前调用 `must_call_after_code_changes`
-4. server 运行 peer reviewer
-5. host 汇报审查结果，并修复 blocking findings
+4. server 启动 async peer review job，或复用正在运行的 job
+5. 通过 `wait_for_peer_review` 或 `get_peer_review_status` 等到 terminal 状态
+6. host 汇报审查结果，并修复 blocking findings
 
 如果希望更强约束，可以安装 project rules：
 
@@ -181,12 +193,12 @@ bun cli.ts install-rules /path/to/project
 
 ## Async Reviews
 
-当审查可能超过 MCP host timeout 时：
+所有 post-edit review gate 都是 async-first。这样可以避免长审查触发 MCP host timeout；如果同一个 task 已经是 `queued` 或 `running`，也不会启动重复的 reviewer process。
 
-1. `start_peer_review_async`
-2. `wait_for_peer_review`
-3. 必要时重复 polling
-4. `get_peer_review_status`
+1. `must_call_after_code_changes`、`finalize_code_changes_with_peer_review`、`verify_code_changes_after_edit`、`request_peer_review`、`start_peer_review_async` 会把 task 保存为 `queued`，并启动 background review。
+2. background review 会把 SQLite 状态更新为 `running`，随后更新为 `reviewed`/`partial_failed`/`review_failed`。
+3. 使用 `wait_for_peer_review` 进行 bounded polling。
+4. 使用 `get_peer_review_status` 查看状态、最新 round 和 open findings。
 
 当 task 仍是 `queued` 或 `running` 时，host assistant 不应给出最终回答。
 
@@ -241,6 +253,7 @@ review prompt 与 Codex 风格的 review heuristic 对齐：
 | `CODE_ASSISTANT_PEERS_HOME` | `~/.mcp-code-assistant-peers` | SQLite storage |
 | `CODE_ASSISTANT_PEERS_DIFF_BUDGET` | `12000` | diff 字符预算 |
 | `CODE_ASSISTANT_PEERS_REVIEW_OUTPUT_BUDGET` | `6000` | tool response 字符预算 |
+| `CODE_ASSISTANT_PEERS_REVIEW_TIMEOUT_MS` | adapter default, otherwise `600000` | reviewer CLI process hard timeout. Built-in Gemini uses `180000` |
 | `CODE_ASSISTANT_PEERS_ARGV_PROMPT_BUDGET` | `60000` | argv transport prompt 限制 |
 | `CODE_ASSISTANT_PEERS_INCLUDE_SUCCESS_STDERR` | unset | 设置为 `1` 时，在 MCP response 中包含成功 reviewer 的 stderr |
 

@@ -1,4 +1,5 @@
-import type { GitStatusEntry, ReviewScope } from "./types.ts";
+import type { GitStatusEntry, ReviewScope, WorkspaceSnapshot } from "./types.ts";
+import { diffWorkspaceSnapshot } from "./workspace-snapshot.ts";
 
 export async function getGitRoot(cwd: string): Promise<string | null> {
   const result = await runGit(["rev-parse", "--show-toplevel"], cwd);
@@ -45,10 +46,27 @@ export async function getChangedFiles(cwd: string): Promise<string[]> {
 
 export async function getReviewDiff(
   cwd: string,
-  options: { scope?: ReviewScope; base?: string | null } = {},
+  options: { scope?: ReviewScope; base?: string | null; baselineWorkspaceSnapshot?: WorkspaceSnapshot | null } = {},
 ): Promise<{ label: string; diff: string; changedFiles: string[]; warning?: string }> {
   const scope = options.scope ?? "auto";
   const base = options.base?.trim() || null;
+  const gitRoot = await getGitRoot(cwd);
+
+  if (!gitRoot) {
+    if (options.baselineWorkspaceSnapshot) {
+      const snapshotDiff = await diffWorkspaceSnapshot(cwd, options.baselineWorkspaceSnapshot);
+      return {
+        label: "non-git workspace snapshot diff",
+        ...snapshotDiff,
+      };
+    }
+    return {
+      label: "non-git workspace snapshot diff",
+      diff: "",
+      changedFiles: [],
+      warning: "Git metadata is not available for this task cwd, and no baseline workspace snapshot was captured. Pass change_summary/files_changed or call begin_peer_task before editing so non-git changes can be reviewed.",
+    };
+  }
 
   if (base || scope === "branch") {
     const resolvedBase = base ?? await detectDefaultBranch(cwd);

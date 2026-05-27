@@ -1,4 +1,5 @@
 import type { AssistantAdapter, AssistantHost } from "./types.ts";
+import { homedir } from "node:os";
 
 export const BUILTIN_ASSISTANTS: Record<string, AssistantAdapter> = {
   codex: {
@@ -6,6 +7,16 @@ export const BUILTIN_ASSISTANTS: Record<string, AssistantAdapter> = {
     command: ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check", "-"],
     prompt_transport: "stdin",
     description: "OpenAI Codex CLI in read-only exec mode.",
+    env_allowlist: [
+      "PATH",
+      "HOME",
+      "USER",
+      "SHELL",
+      "TERM",
+      "TMPDIR",
+      "OPENAI_API_KEY",
+      "CODEX_HOME",
+    ],
   },
   claude: {
     id: "claude",
@@ -17,12 +28,72 @@ export const BUILTIN_ASSISTANTS: Record<string, AssistantAdapter> = {
       "--system-prompt",
       "{system_prompt}",
       "--allowedTools",
-      "Read,Grep,Glob,Bash(git status:*),Bash(git diff:*),Bash(git show:*),Bash(git ls-files:*),mcp__code-assistant-peers__get_peer_task_context,mcp__code-assistant-peers__list_peer_review_rounds,mcp__code-assistant-peers__get_peer_review_round,mcp__code-assistant-peers__get_open_findings,mcp__code-assistant-peers__record_peer_review",
+      [
+        "Read",
+        "Grep",
+        "Glob",
+        "Bash(git status:*)",
+        "Bash(git diff:*)",
+        "Bash(git show:*)",
+        "Bash(git ls-files:*)",
+        "mcp__serena__get_symbols_overview",
+        "mcp__serena__find_symbol",
+        "mcp__serena__find_referencing_symbols",
+        "mcp__serena__find_implementations",
+        "mcp__serena__get_diagnostics_for_file",
+      ].join(","),
       "--disallowedTools",
-      "Edit,Write,MultiEdit,NotebookEdit",
+      [
+        "Edit",
+        "Write",
+        "MultiEdit",
+        "NotebookEdit",
+        "mcp__serena__create_text_file",
+        "mcp__serena__delete_memory",
+        "mcp__serena__edit_memory",
+        "mcp__serena__insert_after_symbol",
+        "mcp__serena__insert_before_symbol",
+        "mcp__serena__replace_content",
+        "mcp__serena__replace_symbol_body",
+        "mcp__serena__rename_symbol",
+        "mcp__serena__safe_delete_symbol",
+        "mcp__serena__write_memory",
+      ].join(","),
     ],
     prompt_transport: "stdin",
     description: "Claude Code print mode with read-only review tools.",
+    env_allowlist: [
+      "PATH",
+      "HOME",
+      "USER",
+      "SHELL",
+      "TERM",
+      "TMPDIR",
+      "ANTHROPIC_API_KEY",
+      "CLAUDE_CONFIG_DIR",
+      "CODE_ASSISTANT_PEERS_SERENA_COMMAND",
+    ],
+  },
+  gemini: {
+    id: "gemini",
+    command: ["gemini", "--skip-trust", "--approval-mode", "plan", "-p", ""],
+    prompt_transport: "stdin",
+    description: "Gemini CLI headless review mode.",
+    timeout_ms: 180000,
+    env_allowlist: [
+      "PATH",
+      "HOME",
+      "USER",
+      "SHELL",
+      "TERM",
+      "TMPDIR",
+      "GEMINI_API_KEY",
+      "GOOGLE_API_KEY",
+      "GOOGLE_GENAI_USE_VERTEXAI",
+      "GOOGLE_CLOUD_PROJECT",
+      "GOOGLE_CLOUD_LOCATION",
+      "GOOGLE_APPLICATION_CREDENTIALS",
+    ],
   },
 };
 
@@ -88,7 +159,10 @@ export function peersFor(
   }
 
   if (host === "claude" && registry.codex) return ["codex"];
-  if (host === "codex" && registry.claude) return ["claude"];
+  if (host === "codex") {
+    const defaultPeers = ["claude", "gemini"].filter((id) => Boolean(registry[id]));
+    if (defaultPeers.length > 0) return defaultPeers;
+  }
 
   const fallback = Object.keys(registry).find((id) => id !== host);
   if (!fallback) throw new Error("At least two assistant adapters are required, or PEER_ASSISTANT must be set.");
@@ -126,6 +200,7 @@ function parseCustomAssistants(value: string | undefined): Record<string, Assist
     const id = normalizeAssistantId(rawId);
     if (!id) throw new Error(`Invalid assistant id: ${rawId}`);
     if (BUILTIN_ASSISTANTS[id]) {
+      if (id === "gemini") continue;
       throw new Error(`Custom assistant '${id}' would override a built-in adapter. Use a distinct id such as '${id}-custom'.`);
     }
     if (!rawConfig || typeof rawConfig !== "object" || Array.isArray(rawConfig)) {
@@ -142,9 +217,104 @@ function parseCustomAssistants(value: string | undefined): Record<string, Assist
       command,
       prompt_transport: promptTransport,
       description: config.description === undefined ? undefined : String(config.description),
+      timeout_ms: parseOptionalTimeoutMs(id, config.timeout_ms),
+      env_allowlist: parseOptionalEnvAllowlist(id, config.env_allowlist),
     };
   }
   return result;
+}
+
+function parseOptionalEnvAllowlist(id: string, value: unknown): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || !item.trim())) {
+    throw new Error(`Assistant '${id}' env_allowlist must be an array of non-empty strings.`);
+  }
+  return value.map((item) => item.trim());
+}
+
+function parseOptionalTimeoutMs(id: string, value: unknown): number | undefined {
+  if (value === undefined) return undefined;
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(`Assistant '${id}' timeout_ms must be a positive number.`);
+  }
+  return Math.floor(parsed);
+}
+
+export async function getGeminiAuthReadiness(
+  env: NodeJS.ProcessEnv = process.env,
+  credentialFiles = defaultGeminiCredentialFiles(),
+  vertexCredentialFiles = defaultVertexCredentialFiles(env),
+): Promise<{ ok: boolean; detail: string }> {
+  if (isTruthyEnv(env.GOOGLE_GENAI_USE_VERTEXAI)) {
+    if (!hasNonBlankEnv(env.GOOGLE_CLOUD_PROJECT)) {
+      return {
+        ok: false,
+        detail: "gemini found, but Vertex AI mode requires GOOGLE_CLOUD_PROJECT.",
+      };
+    }
+    if (!hasNonBlankEnv(env.GOOGLE_CLOUD_LOCATION)) {
+      return {
+        ok: false,
+        detail: "gemini found, but Vertex AI mode requires GOOGLE_CLOUD_LOCATION.",
+      };
+    }
+    for (const file of vertexCredentialFiles) {
+      if (await hasNonEmptyFile(file)) {
+        return { ok: true, detail: `gemini found and Vertex AI credentials detected at ${file}` };
+      }
+    }
+    return {
+      ok: false,
+      detail: "gemini found, but Vertex AI mode requires GOOGLE_APPLICATION_CREDENTIALS or gcloud application-default credentials.",
+    };
+  }
+  if (hasNonBlankEnv(env.GEMINI_API_KEY) || hasNonBlankEnv(env.GOOGLE_API_KEY)) {
+    return { ok: true, detail: "gemini found and API key environment is set" };
+  }
+
+  for (const file of credentialFiles) {
+    if (await hasNonEmptyFile(file)) {
+      return { ok: true, detail: `gemini found and credentials detected at ${file}` };
+    }
+  }
+
+  return {
+    ok: false,
+    detail: "gemini found, but no Gemini credentials were detected. Run `gemini` once to authenticate, or set GEMINI_API_KEY/GOOGLE_API_KEY before starting the MCP server.",
+  };
+}
+
+function defaultGeminiCredentialFiles(): string[] {
+  const geminiHome = `${homedir()}/.gemini`;
+  return [
+    `${geminiHome}/oauth_creds.json`,
+    `${geminiHome}/google_accounts.json`,
+  ];
+}
+
+function defaultVertexCredentialFiles(env: NodeJS.ProcessEnv): string[] {
+  return [
+    env.GOOGLE_APPLICATION_CREDENTIALS?.trim(),
+    `${homedir()}/.config/gcloud/application_default_credentials.json`,
+  ].filter((path): path is string => Boolean(path));
+}
+
+export function isTruthyEnv(value: string | undefined): boolean {
+  return ["1", "true", "yes", "on"].includes(value?.trim().toLowerCase() ?? "");
+}
+
+export function hasNonBlankEnv(value: string | undefined): boolean {
+  return Boolean(value?.trim());
+}
+
+async function hasNonEmptyFile(path: string): Promise<boolean> {
+  try {
+    const file = Bun.file(path);
+    return await file.exists() && file.size > 0;
+  } catch {
+    return false;
+  }
 }
 
 function normalizeAssistantId(value: string | undefined): string | null {

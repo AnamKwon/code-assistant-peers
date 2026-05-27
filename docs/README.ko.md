@@ -6,6 +6,17 @@ CLI 기반 코딩 어시스턴트끼리 서로 코드를 검토하게 만드는 
 
 호스트 어시스턴트가 코드를 수정하면, 이 서버가 설정된 peer 어시스턴트에게 diff 리뷰를 요청합니다. Claude Code와 Codex는 기본 지원하며, Gemini, GLM, DeepSeek 같은 CLI도 adapter 설정으로 추가할 수 있습니다. 리뷰 라운드, finding, task 상태는 SQLite에 로컬 저장되어 이후 라운드에서 이전 지적이 해결됐는지 확인할 수 있습니다.
 
+![mcp-code-assistant-peers 구조](assets/architecture.svg)
+
+## 사용 흐름
+
+![peer review gate 데모](assets/peer-review-demo.gif)
+
+1. 호스트 어시스턴트가 코드를 수정합니다.
+2. MCP gate가 peer reviewer CLI에 diff와 context를 전달합니다.
+3. reviewer finding과 상태가 SQLite에 저장됩니다.
+4. 호스트가 blocking finding을 수정하고 다시 gate를 통과한 뒤 최종 답변합니다.
+
 ## 주요 기능
 
 - Claude Code/Codex 기본 adapter
@@ -14,7 +25,7 @@ CLI 기반 코딩 어시스턴트끼리 서로 코드를 검토하게 만드는 
 - `normal`, `adversarial`, `gate`, `collaborative` 리뷰 모드
 - reviewer가 직접 파일을 수정하지 않고 수정 제안만 하는 `peer_fix` workflow
 - SQLite 기반 task memory, review rounds, findings, async status
-- 긴 리뷰를 위한 async review flow
+- MCP host timeout을 피하기 위한 async-first review flow
 - MCP 등록과 상태 확인을 위한 `setup`, `doctor`
 - `CLAUDE.md`, `AGENTS.md` project rule 설치
 
@@ -60,6 +71,10 @@ bun cli.ts setup both --workflow=peer_fix --mode=gate
 # multi-peer review 설정
 bun cli.ts setup both --peers=claude,codex,gemini --mode=adversarial
 
+# 설치된 Claude/Codex/Gemini reviewer 자동 감지
+# Gemini 자동 선택은 GEMINI_API_KEY/GOOGLE_API_KEY가 있을 때만 사용합니다.
+bun cli.ts setup codex --peers=auto
+
 # 현재 프로젝트에 CLAUDE.md / AGENTS.md rule 설치
 bun cli.ts setup both --install-rules
 
@@ -75,7 +90,7 @@ bun cli.ts setup both --dry-run
 bun cli.ts doctor
 ```
 
-`doctor`는 Bun, Claude CLI, Codex CLI, local review storage, Codex MCP timeout 설정을 확인합니다.
+`doctor`는 Bun, Claude CLI, Codex CLI, Gemini CLI, local review storage, Codex MCP timeout 설정을 확인합니다.
 
 ## 수동 등록
 
@@ -105,19 +120,19 @@ codex mcp add code-assistant-peers --env HOST_ASSISTANT=codex -- code-assistant-
 ```text
 claude -> claude -p --permission-mode plan ...
 codex  -> codex exec --sandbox read-only --skip-git-repo-check -
+gemini -> gemini --skip-trust --approval-mode plan -p ""  # 프롬프트는 stdin으로 전달
 ```
 
 다른 CLI는 `CODE_ASSISTANT_PEERS_ASSISTANTS`에 JSON으로 등록합니다.
 
 ```bash
 export CODE_ASSISTANT_PEERS_ASSISTANTS='{
-  "gemini": {
-    "command": ["gemini", "-p"],
-    "prompt_transport": "argv",
-    "description": "Gemini CLI prompt mode"
-  },
   "glm": {
     "command": ["glm", "chat"],
+    "prompt_transport": "stdin"
+  },
+  "deepseek": {
+    "command": ["deepseek", "chat"],
     "prompt_transport": "stdin"
   }
 }'
@@ -170,8 +185,9 @@ bun cli.ts setup codex --timeout=600
 1. 가능하면 수정 전에 `begin_peer_task` 호출
 2. 호스트 어시스턴트가 코드 수정
 3. 최종 답변 전 `must_call_after_code_changes` 호출
-4. 서버가 peer reviewer 실행
-5. 호스트가 리뷰 결과를 보고하고 blocking finding을 수정
+4. 서버가 async peer review job을 시작하거나 이미 실행 중인 job을 재사용
+5. `wait_for_peer_review` 또는 `get_peer_review_status`로 terminal 상태까지 확인
+6. 호스트가 리뷰 결과를 보고하고 blocking finding을 수정
 
 MCP는 모든 최종 답변을 기술적으로 강제할 수는 없습니다. 더 강한 동작을 원하면 project rules를 설치하세요.
 
@@ -181,12 +197,12 @@ bun cli.ts install-rules /path/to/project
 
 ## Async Reviews
 
-리뷰가 MCP host timeout을 넘을 수 있으면 async 도구를 사용합니다.
+모든 post-edit review gate는 async-first입니다. 긴 리뷰로 MCP host timeout이 발생하는 것을 피하고, 같은 task가 이미 `queued` 또는 `running`이면 중복 reviewer process를 시작하지 않습니다.
 
-1. `start_peer_review_async`
-2. `wait_for_peer_review`
-3. 필요하면 반복 polling
-4. `get_peer_review_status`로 상태 확인
+1. `must_call_after_code_changes`, `finalize_code_changes_with_peer_review`, `verify_code_changes_after_edit`, `request_peer_review`, `start_peer_review_async`가 task를 `queued`로 저장하고 background review를 시작합니다.
+2. background review가 SQLite 상태를 `running`, 이후 `reviewed`/`partial_failed`/`review_failed`로 갱신합니다.
+3. `wait_for_peer_review`로 bounded polling을 수행합니다.
+4. `get_peer_review_status`로 상태, 최신 round, open finding을 확인합니다.
 
 호스트 어시스턴트는 async task가 `queued` 또는 `running`인 동안 최종 답변을 하면 안 됩니다.
 
@@ -215,6 +231,40 @@ focus: "security and data loss only"
 CODE_ASSISTANT_PEERS_REVIEW_FOCUS="migration and rollback risk"
 ```
 
+## Token Cost Control
+
+peer review는 설정에 따라 토큰을 많이 사용할 수 있습니다. MCP 서버가 구성된 reviewer subprocess마다 전체 review prompt를 전달하고, Codex host의 `normal`/`adversarial` 모드에서는 Codex self-review와 aggregate pass가 추가될 수 있기 때문입니다.
+
+주요 비용 원인:
+
+- `PEER_ASSISTANTS=claude,codex,gemini`는 사용 가능한 peer마다 review prompt를 한 번씩 보냅니다.
+- Codex host self-review는 `normal`/`adversarial` 모드에서 Codex pass를 하나 더 추가합니다.
+- aggregate pass는 peer output과 repository/task context를 다시 받아 최종 결과를 합칩니다.
+- `CODE_ASSISTANT_PEERS_DIFF_BUDGET`은 raw diff 포함량을 제어합니다. 기본값은 `12000`자입니다.
+- `serena-auto`는 semantic context를 추가할 수 있습니다. `CODE_ASSISTANT_PEERS_SERENA_CONTEXT_BUDGET` 기본값은 `8000`자입니다.
+- reviewer는 diff만으로 부족하면 repository를 직접 inspect할 수 있으므로 Claude print mode나 Codex exec가 추가 파일을 읽을 수 있습니다.
+- 이전 review round memory가 후속 round prompt에 포함되어, 반복 리뷰일수록 prompt가 커질 수 있습니다.
+
+저비용 권장 설정:
+
+```bash
+# single external peer + compact gate output
+bun cli.ts setup codex --peers=claude --mode=gate
+
+# Gemini만 명시적으로 사용할 때
+bun cli.ts setup codex --peers=gemini --mode=gate
+```
+
+prompt 예산을 더 줄이고 싶을 때:
+
+```bash
+CODE_ASSISTANT_PEERS_DIFF_BUDGET=4000
+CODE_ASSISTANT_PEERS_SERENA_CONTEXT_BUDGET=2000
+CODE_ASSISTANT_PEERS_CONTEXT_PROVIDER=off
+```
+
+깊은 검토가 필요할 때는 `normal`, `adversarial`, `collaborative`, multi-peer, Serena-rich context를 사용하세요. 일상적인 최종 응답 gate에는 `gate` 모드와 single peer 조합이 더 적합합니다.
+
 ## Review Quality Model
 
 리뷰 프롬프트는 Codex 스타일 review heuristic에 맞춰져 있습니다.
@@ -241,6 +291,7 @@ CODE_ASSISTANT_PEERS_REVIEW_FOCUS="migration and rollback risk"
 | `CODE_ASSISTANT_PEERS_HOME` | `~/.mcp-code-assistant-peers` | SQLite 저장 위치 |
 | `CODE_ASSISTANT_PEERS_DIFF_BUDGET` | `12000` | diff 포함 문자 예산 |
 | `CODE_ASSISTANT_PEERS_REVIEW_OUTPUT_BUDGET` | `6000` | tool response 문자 예산 |
+| `CODE_ASSISTANT_PEERS_REVIEW_TIMEOUT_MS` | adapter default, otherwise `600000` | reviewer CLI process hard timeout. 기본 Gemini는 `180000` |
 | `CODE_ASSISTANT_PEERS_ARGV_PROMPT_BUDGET` | `60000` | argv transport prompt 최대 크기 |
 | `CODE_ASSISTANT_PEERS_INCLUDE_SUCCESS_STDERR` | unset | `1`로 설정하면 성공한 reviewer stderr도 MCP 응답에 포함 |
 
