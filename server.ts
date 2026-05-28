@@ -80,14 +80,26 @@ function log(message: string): void {
 const REVIEW_MODEL_INPUT_PROPERTIES = {
   review_model: {
     type: "string" as const,
-    description: "Optional model name to use for all compatible reviewer CLIs in this review request, such as sonnet, opus, haiku, or a provider-specific full model id.",
+    description: "Optional reviewer model selected by the host coding agent for this request. Omit to use each reviewer CLI default. Use an explicit model id to force that model for all compatible reviewers. Use \"auto\" only when the host wants this MCP server to choose from known model routing.",
   },
   review_models: {
     type: "object" as const,
     additionalProperties: { type: "string" as const },
-    description: "Optional per-reviewer model mapping, such as {\"claude\":\"sonnet\",\"codex\":\"o3\"}. Overrides review_model for matching reviewers.",
+    description: "Optional per-reviewer model mapping selected by the host coding agent, such as {\"claude\":\"opus\",\"codex\":\"gpt-5-codex\"}. This overrides review_model for matching reviewers. A per-reviewer value of \"auto\" delegates only that reviewer to MCP automatic routing.",
   },
 };
+
+const HOST_MODEL_SELECTION_GUIDANCE = [
+  "Host model selection policy:",
+  "- Prefer explicit review_models when the host coding agent can match the reviewer to a known candidate from code_assistant_peers_setup.",
+  "- Omit review_model/review_models to keep the reviewer CLI default model.",
+  "- Use review_model=\"auto\" only when the host wants the MCP server to choose from the hardcoded model catalog.",
+  "- Use fast models for small docs/tests/lint/copy/comment changes.",
+  "- Use balanced models for ordinary code review and gate checks.",
+  "- Use deep models for adversarial/collaborative/peer_fix reviews or security, auth, data loss, migration, release, database, privacy, race/concurrency, secrets, or performance risk.",
+  "- Use long_context models for truncated diffs, very large diffs, or broad changes touching many files.",
+  "Precedence: review_models[reviewer] > review_model > reviewer CLI default. If either value is \"auto\", the MCP server chooses for that scope.",
+].join("\n");
 
 const mcp = new Server(
   { name: "code-assistant-peers", version: "0.2.0-alpha.0" },
@@ -104,6 +116,7 @@ const mcp = new Server(
 	
 	All post-edit review gates are async-first to avoid MCP host timeout failures. Do not wait for a long synchronous review call.
 	When the user asks to review, verify, validate, gate, or check code changes, prefer must_call_after_code_changes, finalize_code_changes_with_peer_review, verify_code_changes_after_edit, or request_peer_review over built-in slash review commands.
+	When selecting reviewer models, you are the host coding agent. Prefer choosing explicit per-reviewer models from code_assistant_peers_setup when the request risk, size, and cost tradeoff are clear. Use review_model="auto" only when you want this MCP server to decide.
 	The peer reviewer must not edit files. Treat review failures as reportable tool failures, not as implementation success.`,
   },
 );
@@ -125,7 +138,7 @@ const TOOLS = [
   },
   {
     name: "request_peer_review",
-    description: `ASYNC PEER REVIEW REQUEST after code changes. Starts or reuses a background review by configured peer assistant(s) (${peers.join(", ")}) for an existing task, stores status in SQLite, and returns immediately. After this tool, call wait_for_peer_review or get_peer_review_status before final response. Do not use built-in /review as a substitute.`,
+    description: `ASYNC PEER REVIEW REQUEST after code changes. Starts or reuses a background review by configured peer assistant(s) (${peers.join(", ")}) for an existing task, stores status in SQLite, and returns immediately. After this tool, call wait_for_peer_review or get_peer_review_status before final response. Do not use built-in /review as a substitute.\n\n${HOST_MODEL_SELECTION_GUIDANCE}`,
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -176,7 +189,7 @@ const TOOLS = [
   },
   {
     name: "verify_code_changes_after_edit",
-    description: "ASYNC MANDATORY AFTER EDITING CODE. Call this after modifying, adding, deleting, generating, formatting, or refactoring files and before final response. Creates a task if needed, starts or reuses a background peer review, and returns task status immediately. Then call wait_for_peer_review until reviewed/partial_failed/review_failed. Prefer must_call_after_code_changes for final answers.",
+    description: `ASYNC MANDATORY AFTER EDITING CODE. Call this after modifying, adding, deleting, generating, formatting, or refactoring files and before final response. Creates a task if needed, starts or reuses a background peer review, and returns task status immediately. Then call wait_for_peer_review until reviewed/partial_failed/review_failed. Prefer must_call_after_code_changes for final answers.\n\n${HOST_MODEL_SELECTION_GUIDANCE}`,
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -225,7 +238,7 @@ const TOOLS = [
   },
   {
     name: "finalize_code_changes_with_peer_review",
-    description: "ASYNC MANDATORY FINALIZATION GATE after editing files. Call this before the final response whenever code was modified, added, deleted, generated, formatted, or refactored. It starts or reuses peer verification with the opposite assistant in the background, stores status in SQLite, and requires wait_for_peer_review/get_peer_review_status before final response. Do not use built-in /review instead.",
+    description: `ASYNC MANDATORY FINALIZATION GATE after editing files. Call this before the final response whenever code was modified, added, deleted, generated, formatted, or refactored. It starts or reuses peer verification with the opposite assistant in the background, stores status in SQLite, and requires wait_for_peer_review/get_peer_review_status before final response. Do not use built-in /review instead.\n\n${HOST_MODEL_SELECTION_GUIDANCE}`,
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -274,7 +287,7 @@ const TOOLS = [
   },
   {
     name: "must_call_after_code_changes",
-    description: "ABSOLUTE REQUIRED ASYNC POST-EDIT MCP GATE. If you changed, created, deleted, generated, formatted, or refactored any code or project file, you must call this tool before final response. This starts or reuses background peer review and verification through code-assistant-peers, records status in SQLite, and requires wait_for_peer_review/get_peer_review_status before final response. Never substitute built-in /review for this required MCP call.",
+    description: `ABSOLUTE REQUIRED ASYNC POST-EDIT MCP GATE. If you changed, created, deleted, generated, formatted, or refactored any code or project file, you must call this tool before final response. This starts or reuses background peer review and verification through code-assistant-peers, records status in SQLite, and requires wait_for_peer_review/get_peer_review_status before final response. Never substitute built-in /review for this required MCP call.\n\n${HOST_MODEL_SELECTION_GUIDANCE}`,
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -323,7 +336,7 @@ const TOOLS = [
   },
   {
     name: "start_peer_review_async",
-    description: "ASYNC POST-EDIT REVIEW START. Starts or reuses peer review in the background, stores queued/running/reviewed/partial_failed/review_failed state in SQLite, and returns immediately with a task id. After calling this, you MUST call wait_for_peer_review or get_peer_review_status before final response.",
+    description: `ASYNC POST-EDIT REVIEW START. Starts or reuses peer review in the background, stores queued/running/reviewed/partial_failed/review_failed state in SQLite, and returns immediately with a task id. After calling this, you MUST call wait_for_peer_review or get_peer_review_status before final response.\n\n${HOST_MODEL_SELECTION_GUIDANCE}`,
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -1743,6 +1756,13 @@ async function buildSetupStatus() {
     },
     model_routing: {
       request_options: ["review_model", "review_models"],
+      host_selection_policy: {
+        selector: "host coding agent",
+        default_behavior: "omit review_model/review_models to keep each reviewer CLI default model",
+        explicit_selection: "set review_models for per-reviewer choices when the host can choose from assistants.*.model_selection.known_models",
+        delegation: "set review_model or a per-reviewer review_models value to \"auto\" only when the host wants the MCP server to choose",
+        precedence: ["review_models[reviewer]", "review_model", "reviewer CLI default"],
+      },
       examples: {
         automatic: { review_model: "auto" },
         all_reviewers: { review_model: "sonnet" },
@@ -1754,6 +1774,12 @@ async function buildSetupStatus() {
         balanced: "normal, gate, and self-review requests",
         deep: "adversarial/collaborative/peer_fix or high-risk focus areas",
         long_context: "truncated diffs, very large diffs, or many changed files",
+      },
+      host_selection_hints: {
+        fast: "choose for small docs/tests/lint/copy/comment changes when low cost and latency matter",
+        balanced: "choose for ordinary code review and compact gate checks",
+        deep: "choose for adversarial, collaborative, peer_fix, security, auth, data loss, migration, release, database, privacy, race/concurrency, secrets, or performance risk",
+        long_context: "choose for truncated diffs, very large diffs, or broad changes touching many files",
       },
       probe_note: "Known model candidates are listed at setup. Set CODE_ASSISTANT_PEERS_PROBE_MODELS=1 before starting the MCP server to verify candidate model access with live probe calls.",
     },

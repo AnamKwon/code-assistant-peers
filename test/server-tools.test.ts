@@ -22,6 +22,11 @@ describe("server tool descriptions", () => {
     expect(source).toContain("queued/running/reviewed/partial_failed/review_failed");
     expect(source).toContain("runMultiPeerReviewTool");
     expect(source).toContain("areConfiguredAssistantsReady");
+    expect(source).toContain("Host model selection policy:");
+    expect(source).toContain("selector: \"host coding agent\"");
+    expect(source).toContain("review_models[reviewer]");
+    expect(source).toContain("Use review_model=\\\"auto\\\" only when the host wants the MCP server to choose");
+    expect(source).toContain("review_models for per-reviewer choices");
   });
 
   test("keeps installed project rules aligned with async-first review gates", async () => {

@@ -321,7 +321,31 @@ codex  -> -m <model>       # known candidates: gpt-5.3-codex, gpt-5.2-codex, gpt
 gemini -> --model <model>  # known candidates: auto, pro, flash, flash-lite, gemini-3-pro-preview, gemini-3-flash-preview, gemini-2.5-pro, gemini-2.5-flash, gemini-2.5-flash-lite
 ```
 
-Use automatic model routing:
+The host coding agent that calls the MCP review tool should choose the reviewer model when it has enough context. The MCP server exposes the known candidates in `code_assistant_peers_setup`, including `quality`, `cost`, `latency`, and `routing` metadata.
+
+Selection precedence:
+
+```text
+review_models[reviewer] > review_model > reviewer CLI default
+```
+
+If neither `review_model` nor `review_models` is provided, the reviewer CLI default model is used.
+
+Pick explicit per-reviewer models when the host can make a clear cost/quality tradeoff:
+
+```json
+{
+  "task_id": "...",
+  "mode": "adversarial",
+  "focus": "security and migration risk",
+  "review_models": {
+    "claude": "opus",
+    "codex": "gpt-5.3-codex"
+  }
+}
+```
+
+Use automatic model routing only when the host wants to delegate the choice to this MCP server:
 
 ```json
 {
