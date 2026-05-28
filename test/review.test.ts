@@ -1277,12 +1277,13 @@ describe("review prompt shaping", () => {
     };
 
     const { prompt } = await buildReviewPrompt(task, { mode: "gate" });
+    const promptInstructions = prompt.split("\nIncluded uncommitted diff for review:")[0];
     expect(prompt).toContain("ALLOW: <short reason>");
     expect(prompt).toContain('"overall_correctness"');
     expect(prompt).toContain('"priority"');
     expect(prompt).toContain('"confidence": 0.8');
     expect(prompt).toContain('"overall_confidence": 0.8');
-    expect(prompt).not.toContain("Start with findings.");
+    expect(promptInstructions).not.toContain("Start with findings.");
     expect(prompt.indexOf("ALLOW: <short reason>")).toBeLessThan(prompt.indexOf("Finding selection rules:"));
   });
 
@@ -1426,9 +1427,10 @@ describe("review prompt shaping", () => {
     };
 
     const { prompt } = await buildReviewPrompt(task, { self_review: true, workflow: "peer_fix" });
+    const promptInstructions = prompt.split("\nIncluded uncommitted diff for review:")[0];
     expect(prompt).toContain("Review mode: normal");
-    expect(prompt).not.toContain("proposing fixes as a peer assistant");
-    expect(prompt).not.toContain(PEER_FIX_PROMPT);
+    expect(promptInstructions).not.toContain("proposing fixes as a peer assistant");
+    expect(promptInstructions).not.toContain(PEER_FIX_PROMPT);
   });
 
   test("rejects gate and collaborative modes for Codex self-review prompts", async () => {
