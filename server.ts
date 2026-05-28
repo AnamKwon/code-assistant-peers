@@ -85,7 +85,7 @@ const REVIEW_MODEL_INPUT_PROPERTIES = {
   review_models: {
     type: "object" as const,
     additionalProperties: { type: "string" as const },
-    description: "Optional per-reviewer model mapping selected by the host coding agent, such as {\"claude\":\"opus\",\"codex\":\"gpt-5-codex\"}. This overrides review_model for matching reviewers. A per-reviewer value of \"auto\" delegates only that reviewer to MCP automatic routing.",
+    description: "Optional per-reviewer model mapping selected by the host coding agent, such as {\"claude\":\"opus\",\"codex\":\"gpt-5.5\"}. This overrides review_model for matching reviewers. A per-reviewer value of \"auto\" delegates only that reviewer to MCP automatic routing.",
   },
 };
 
@@ -1766,8 +1766,8 @@ async function buildSetupStatus() {
       examples: {
         automatic: { review_model: "auto" },
         all_reviewers: { review_model: "sonnet" },
-        automatic_for_one_reviewer: { review_models: { claude: "auto", codex: "gpt-5-codex" } },
-        per_reviewer: { review_models: { claude: "opus", codex: "o3" } },
+        automatic_for_one_reviewer: { review_models: { claude: "auto", codex: "gpt-5.4" } },
+        per_reviewer: { review_models: { claude: "opus", codex: "gpt-5.5" } },
       },
       auto_strategy: {
         fast: "small docs/tests/lint/copy/comment changes",

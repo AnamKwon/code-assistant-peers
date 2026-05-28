@@ -317,7 +317,7 @@ Built-in model flags:
 
 ```text
 claude -> --model <model>  # known candidates: haiku, sonnet, opus, best, sonnet[1m], opus[1m], opusplan
-codex  -> -m <model>       # known candidates: gpt-5.3-codex, gpt-5.2-codex, gpt-5.1-codex-max, gpt-5-codex, gpt-5.1-codex, gpt-5.1-codex-mini, codex-mini-latest, o3
+codex  -> -m <model>       # known candidates: gpt-5.5, gpt-5.4, gpt-5.3-codex, gpt-5.4-mini, gpt-5.4-nano
 gemini -> --model <model>  # known candidates: auto, pro, flash, flash-lite, gemini-3-pro-preview, gemini-3-flash-preview, gemini-2.5-pro, gemini-2.5-flash, gemini-2.5-flash-lite
 ```
 
@@ -340,7 +340,7 @@ Pick explicit per-reviewer models when the host can make a clear cost/quality tr
   "focus": "security and migration risk",
   "review_models": {
     "claude": "opus",
-    "codex": "gpt-5.3-codex"
+    "codex": "gpt-5.5"
   }
 }
 ```
@@ -377,7 +377,7 @@ Or pick models per reviewer:
   "task_id": "...",
   "review_models": {
     "claude": "opus",
-    "codex": "o3"
+    "codex": "gpt-5.4"
   }
 }
 ```

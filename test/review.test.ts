@@ -490,7 +490,7 @@ describe("review command construction", () => {
       "sonnet",
       "--strict-mcp-config",
     ]);
-    expect(buildReviewCommand("codex", "o3")).toEqual([
+    expect(buildReviewCommand("codex", "gpt-5.5")).toEqual([
       "codex",
       "exec",
       "--ignore-user-config",
@@ -499,7 +499,7 @@ describe("review command construction", () => {
       "read-only",
       "--skip-git-repo-check",
       "-m",
-      "o3",
+      "gpt-5.5",
       "-",
     ]);
     expect(buildReviewCommand("gemini", "flash")).toEqual([
@@ -530,7 +530,7 @@ describe("review command construction", () => {
     expect(selectAutoReviewerModel("claude", { diffLength: 1000, changedFileCount: 1, focus: "docs" })).toBe("haiku");
     expect(selectAutoReviewerModel("claude", { focus: "security and data loss", diffLength: 1000 })).toBe("opus");
     expect(selectAutoReviewerModel("claude", { diffWasTruncated: true })).toBe("sonnet[1m]");
-    expect(selectAutoReviewerModel("codex", { mode: "adversarial" })).toBe("gpt-5.3-codex");
+    expect(selectAutoReviewerModel("codex", { mode: "adversarial" })).toBe("gpt-5.5");
     expect(selectAutoReviewerModel("gemini", { diffLength: 1000, changedFileCount: 1, focus: "tests" })).toBe("flash");
   });
 
@@ -540,8 +540,8 @@ describe("review command construction", () => {
     }, { focus: "auth migration", diffLength: 5000 })).toBe("opus");
     expect(resolveReviewerModel("codex", {
       review_model: "auto",
-      review_models: { codex: "gpt-5-codex" },
-    }, { mode: "adversarial" })).toBe("gpt-5-codex");
+      review_models: { codex: "gpt-5.4" },
+    }, { mode: "adversarial" })).toBe("gpt-5.4");
     expect(resolveReviewerModel("gemini", {
       review_model: "sonnet",
       review_models: { gemini: "auto" },
