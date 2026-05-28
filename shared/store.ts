@@ -32,36 +32,8 @@ export async function saveTask(task: PeerTask): Promise<void> {
   initDb();
   const now = new Date().toISOString();
   task.updated_at = task.updated_at || now;
-  database()
-    .prepare(`
-      INSERT INTO tasks (id, host, peer, prompt, cwd, git_root, status, created_at, updated_at, task_json)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET
-        host = excluded.host,
-        peer = excluded.peer,
-        prompt = excluded.prompt,
-        cwd = excluded.cwd,
-        git_root = excluded.git_root,
-        status = excluded.status,
-        updated_at = excluded.updated_at,
-        task_json = excluded.task_json
-    `)
-    .run(
-      task.id,
-      task.host,
-      task.peer,
-      task.prompt,
-      task.cwd,
-      task.git_root,
-      task.status,
-      task.created_at,
-      task.updated_at,
-      JSON.stringify(task),
-    );
-
-  // Keep a JSON mirror for easy manual inspection and backward compatibility.
-  await mkdir(join(STORE_DIR, "tasks"), { recursive: true });
-  await Bun.write(taskPath(task.id), `${JSON.stringify(task, null, 2)}\n`);
+  upsertTaskRow(task);
+  await writeTaskMirror(task);
 }
 
 export async function loadTask(id: string): Promise<PeerTask | null> {
@@ -87,42 +59,58 @@ export async function listTasks(): Promise<PeerTask[]> {
   return rows.map((row) => JSON.parse(row.task_json) as PeerTask);
 }
 
+export async function claimStaleReviewRecovery(
+  taskId: string,
+  expectedSignature: string,
+  staleBeforeIso: string,
+): Promise<PeerTask | null> {
+  initDb();
+  const claimed = database().transaction(() => {
+    const row = database()
+      .query("SELECT task_json FROM tasks WHERE id = ?")
+      .get(taskId) as { task_json: string } | null;
+    if (!row) return null;
+    const task = JSON.parse(row.task_json) as PeerTask;
+    if (task.review_signature !== expectedSignature) return null;
+    if (task.status !== "queued" && task.status !== "running") return null;
+    if (Date.parse(task.updated_at) > Date.parse(staleBeforeIso)) return null;
+
+    task.status = "queued";
+    task.updated_at = new Date().toISOString();
+    upsertTaskRow(task);
+    return task;
+  })();
+
+  if (claimed) await writeTaskMirror(claimed);
+  return claimed;
+}
+
 export async function appendReviewRound(
   task: PeerTask,
   review: PeerReviewResult,
   prompt: string,
 ): Promise<PeerReviewRound> {
   initDb();
-  const nextRound = getNextRound(task.id);
-  const result = database()
-    .prepare(`
-      INSERT INTO review_rounds (
-        task_id, round, reviewer, command_json, exit_code, stdout, stderr,
-        prompt, warning, started_at, completed_at
-      )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `)
-    .run(
-      task.id,
-      nextRound,
-      review.reviewer,
-      JSON.stringify(review.command),
-      review.exit_code,
-      review.stdout,
-      review.stderr,
-      prompt,
-      review.warning ?? null,
-      review.started_at,
-      review.completed_at,
-    );
+  const round = insertReviewRound(task, review, prompt);
+  task.updated_at = review.completed_at;
+  upsertTaskRow(task);
+  await writeTaskMirror(task);
+  return round;
+}
 
-  return {
-    id: Number(result.lastInsertRowid),
-    task_id: task.id,
-    round: nextRound,
-    prompt,
-    ...review,
-  };
+export async function appendReviewRoundAndSaveTask(
+  task: PeerTask,
+  review: PeerReviewResult,
+  prompt: string,
+): Promise<PeerReviewRound> {
+  initDb();
+  const round = database().transaction(() => {
+    const inserted = insertReviewRound(task, review, prompt);
+    upsertTaskRow(task);
+    return inserted;
+  })();
+  await writeTaskMirror(task);
+  return round;
 }
 
 export async function listReviewRounds(taskId: string): Promise<PeerReviewRound[]> {
@@ -302,6 +290,76 @@ function database(): Database {
   return db!;
 }
 
+function upsertTaskRow(task: PeerTask): void {
+  database()
+    .prepare(`
+      INSERT INTO tasks (id, host, peer, prompt, cwd, git_root, status, created_at, updated_at, task_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        host = excluded.host,
+        peer = excluded.peer,
+        prompt = excluded.prompt,
+        cwd = excluded.cwd,
+        git_root = excluded.git_root,
+        status = excluded.status,
+        updated_at = excluded.updated_at,
+        task_json = excluded.task_json
+    `)
+    .run(
+      task.id,
+      task.host,
+      task.peer,
+      task.prompt,
+      task.cwd,
+      task.git_root,
+      task.status,
+      task.created_at,
+      task.updated_at,
+      JSON.stringify(task),
+    );
+}
+
+async function writeTaskMirror(task: PeerTask): Promise<void> {
+  // Keep a JSON mirror for easy manual inspection and backward compatibility.
+  await mkdir(join(STORE_DIR, "tasks"), { recursive: true });
+  await Bun.write(taskPath(task.id), `${JSON.stringify(task, null, 2)}\n`);
+}
+
+function insertReviewRound(
+  task: PeerTask,
+  review: PeerReviewResult,
+  prompt: string,
+): PeerReviewRound {
+  const result = database()
+    .prepare(`
+      INSERT INTO review_rounds (
+        task_id, round, reviewer, command_json, exit_code, stdout, stderr,
+        prompt, warning, started_at, completed_at
+      )
+      SELECT ?, COALESCE(MAX(round), 0) + 1, ?, ?, ?, ?, ?, ?, ?, ?, ?
+      FROM review_rounds
+      WHERE task_id = ?
+    `)
+    .run(
+      task.id,
+      review.reviewer,
+      JSON.stringify(review.command),
+      review.exit_code,
+      review.stdout,
+      review.stderr,
+      prompt,
+      review.warning ?? null,
+      review.started_at,
+      review.completed_at,
+      task.id,
+    );
+  const inserted = database()
+    .query("SELECT * FROM review_rounds WHERE id = ?")
+    .get(Number(result.lastInsertRowid)) as ReviewRoundRow;
+
+  return toReviewRound(inserted);
+}
+
 async function migrateJsonTasks(): Promise<void> {
   const tasksDir = join(STORE_DIR, "tasks");
   if (!existsSync(tasksDir)) return;
@@ -315,18 +373,11 @@ async function migrateJsonTasks(): Promise<void> {
   }
 }
 
-function getNextRound(taskId: string): number {
-  const row = database()
-    .query("SELECT COALESCE(MAX(round), 0) + 1 AS next_round FROM review_rounds WHERE task_id = ?")
-    .get(taskId) as { next_round: number };
-  return row.next_round;
-}
-
 interface ReviewRoundRow {
   id: number;
   task_id: string;
   round: number;
-  reviewer: "claude" | "codex";
+  reviewer: string;
   command_json: string;
   exit_code: number | null;
   stdout: string;

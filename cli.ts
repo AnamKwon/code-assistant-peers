@@ -12,8 +12,16 @@ import {
   listTasks,
   loadTask,
 } from "./shared/store.ts";
-import { loadAssistantRegistry } from "./shared/assistants.ts";
-import { upsertCodexMcpTimeoutConfig } from "./shared/setup.ts";
+import { getGeminiAuthReadiness, loadAssistantRegistry } from "./shared/assistants.ts";
+import {
+  buildSerenaEnv,
+  resolveAutoPeerSetupConfig,
+  resolveGeminiAutoPeerReadiness,
+  resolveSerenaSetupConfig,
+  upsertCodexMcpTimeoutConfig,
+  type AssistantSetupAvailability,
+  type SerenaSetupConfig,
+} from "./shared/setup.ts";
 
 const cmd = process.argv[2];
 const SERVER_PATH = new URL("./server.ts", import.meta.url).pathname;
@@ -26,7 +34,8 @@ Required workflow:
 1. Call \`begin_peer_task\` before editing when feasible.
 2. Make the requested code changes.
 3. Before the final response, call \`must_call_after_code_changes\`.
-4. Report the peer review result, including any blocking findings or fix proposals.
+4. Call \`wait_for_peer_review\` or \`get_peer_review_status\` until the task reaches \`reviewed\`, \`partial_failed\`, or \`review_failed\`.
+5. Report the peer review result, including any blocking findings or fix proposals.
 
 Do not use built-in \`/review\` as a substitute for this MCP peer review. Built-in review may be used only as an extra check after the MCP peer review.
 <!-- code-assistant-peers:end -->`;
@@ -201,7 +210,7 @@ switch (cmd) {
   case "setup": {
     const target = process.argv[3] ?? "both";
     if (target !== "claude" && target !== "codex" && target !== "both") {
-      console.error("Usage: bun cli.ts setup [claude|codex|both] [--workflow=review_only|peer_fix] [--mode=normal|adversarial|gate|collaborative] [--peers=codex,gemini] [--timeout=600] [--install-rules[=dir]] [--dry-run]");
+      console.error("Usage: bun cli.ts setup [claude|codex|both] [--workflow=review_only|peer_fix] [--mode=normal|adversarial|gate|collaborative] [--peers=auto|codex,gemini] [--timeout=600] [--serena=auto|on|off] [--serena-command='[...]'] [--install-rules[=dir]] [--dry-run]");
       process.exit(1);
     }
     const options = parseSetupOptions(process.argv.slice(4));
@@ -236,7 +245,7 @@ Usage:
   bun cli.ts reinstall-command <claude|codex> [workflow] [mode]
   bun cli.ts mode-command <claude|codex|both> <mode> [workflow]
   bun cli.ts apply-mode <claude|codex|both> <mode> [workflow]
-  bun cli.ts setup [claude|codex|both] [--workflow=review_only|peer_fix] [--mode=normal|adversarial|gate|collaborative] [--peers=a,b] [--timeout=600] [--install-rules[=dir]] [--dry-run]
+  bun cli.ts setup [claude|codex|both] [--workflow=review_only|peer_fix] [--mode=normal|adversarial|gate|collaborative] [--peers=auto|a,b] [--timeout=600] [--serena=auto|on|off] [--serena-command='[...]'] [--install-rules[=dir]] [--dry-run]
   bun cli.ts rules                                Print project instruction block
   bun cli.ts install-rules [project-dir]          Add/update CLAUDE.md and AGENTS.md
 
@@ -275,13 +284,15 @@ function buildEnvPrefix(
   workflow: "review_only" | "peer_fix",
   mode: "normal" | "adversarial" | "gate" | "collaborative",
   peers?: string | null,
+  extraEnv: string[] = [],
 ): string {
   return [
     `HOST_ASSISTANT=${host}`,
     `CODE_ASSISTANT_PEERS_WORKFLOW=${workflow}`,
     `CODE_ASSISTANT_PEERS_REVIEW_MODE=${mode}`,
     peers ? `PEER_ASSISTANTS=${peers}` : null,
-  ].filter(Boolean).join(" ");
+    ...extraEnv,
+  ].filter((value): value is string => Boolean(value)).map((value) => shellQuote(value)).join(" ");
 }
 
 function buildInstallCommand(
@@ -289,9 +300,10 @@ function buildInstallCommand(
   workflow: "review_only" | "peer_fix",
   mode: "normal" | "adversarial" | "gate" | "collaborative",
   peers?: string | null,
+  extraEnv: string[] = [],
 ): string {
   if (target === "claude") {
-    return `claude mcp add --scope user --transport stdio code-assistant-peers -- env ${buildEnvPrefix("claude", workflow, mode, peers)} bun ${shellQuote(SERVER_PATH)}`;
+    return `claude mcp add --scope user --transport stdio code-assistant-peers -- env ${buildEnvPrefix("claude", workflow, mode, peers, extraEnv)} bun ${shellQuote(SERVER_PATH)}`;
   }
   return [
     "codex mcp add code-assistant-peers",
@@ -299,6 +311,7 @@ function buildInstallCommand(
     `--env CODE_ASSISTANT_PEERS_WORKFLOW=${workflow}`,
     `--env CODE_ASSISTANT_PEERS_REVIEW_MODE=${mode}`,
     peers ? `--env PEER_ASSISTANTS=${peers}` : null,
+    ...extraEnv.flatMap((value) => ["--env", shellQuote(value)]),
     `-- bun ${shellQuote(SERVER_PATH)}`,
   ].filter(Boolean).join(" ");
 }
@@ -313,10 +326,11 @@ async function reinstallMcp(
   workflow: "review_only" | "peer_fix",
   mode: "normal" | "adversarial" | "gate" | "collaborative",
   peers?: string | null,
+  extraEnv: string[] = [],
 ): Promise<void> {
   await runCommand(buildRemoveArgs(target), true);
-  await runCommand(buildInstallArgs(target, workflow, mode, peers), false);
-  console.log(`Updated ${target} MCP config: workflow=${workflow}, review_mode=${mode}${peers ? `, peers=${peers}` : ""}`);
+  await runCommand(buildInstallArgs(target, workflow, mode, peers, extraEnv), false);
+  console.log(`Updated ${target} MCP config: workflow=${workflow}, review_mode=${mode}${peers ? `, peers=${peers}` : ""}${extraEnv.length ? ", serena=enabled" : ""}`);
 }
 
 function buildRemoveArgs(target: "claude" | "codex"): string[] {
@@ -331,6 +345,7 @@ function buildInstallArgs(
   workflow: "review_only" | "peer_fix",
   mode: "normal" | "adversarial" | "gate" | "collaborative",
   peers?: string | null,
+  extraEnv: string[] = [],
 ): string[] {
   if (target === "claude") {
     const envArgs = [
@@ -338,6 +353,7 @@ function buildInstallArgs(
       `CODE_ASSISTANT_PEERS_WORKFLOW=${workflow}`,
       `CODE_ASSISTANT_PEERS_REVIEW_MODE=${mode}`,
       peers ? `PEER_ASSISTANTS=${peers}` : null,
+      ...extraEnv,
     ].filter((value): value is string => Boolean(value));
     return [
       "claude",
@@ -368,6 +384,7 @@ function buildInstallArgs(
     `CODE_ASSISTANT_PEERS_REVIEW_MODE=${mode}`,
   ];
   if (peers) args.push("--env", `PEER_ASSISTANTS=${peers}`);
+  for (const value of extraEnv) args.push("--env", value);
   args.push("--", "bun", SERVER_PATH);
   return args;
 }
@@ -376,9 +393,12 @@ type SetupOptions = {
   workflow: "review_only" | "peer_fix";
   mode: "normal" | "adversarial" | "gate" | "collaborative";
   peers: string | null;
+  autoPeers: boolean;
   timeoutSec: number;
   installRulesDir: string | null;
   dryRun: boolean;
+  serenaMode: "auto" | "on" | "off";
+  serenaCommand: string | null;
 };
 
 function parseSetupOptions(args: string[]): SetupOptions {
@@ -386,9 +406,12 @@ function parseSetupOptions(args: string[]): SetupOptions {
     workflow: "review_only",
     mode: "normal",
     peers: null,
+    autoPeers: false,
     timeoutSec: 600,
     installRulesDir: null,
     dryRun: false,
+    serenaMode: "auto",
+    serenaCommand: null,
   };
   for (const arg of args) {
     if (arg === "--dry-run") {
@@ -402,7 +425,14 @@ function parseSetupOptions(args: string[]): SetupOptions {
     } else if (arg.startsWith("--mode=")) {
       options.mode = normalizeModeArg(arg.slice("--mode=".length));
     } else if (arg.startsWith("--peers=")) {
-      options.peers = normalizePeersArg(arg.slice("--peers=".length));
+      const peers = arg.slice("--peers=".length).trim().toLowerCase();
+      if (peers === "auto") {
+        options.autoPeers = true;
+        options.peers = null;
+      } else {
+        options.autoPeers = false;
+        options.peers = normalizePeersArg(peers);
+      }
     } else if (arg.startsWith("--timeout=")) {
       const timeout = Number(arg.slice("--timeout=".length));
       if (!Number.isInteger(timeout) || timeout < 30) {
@@ -410,12 +440,22 @@ function parseSetupOptions(args: string[]): SetupOptions {
         process.exit(1);
       }
       options.timeoutSec = timeout;
+    } else if (arg.startsWith("--serena=")) {
+      options.serenaMode = normalizeSerenaModeArg(arg.slice("--serena=".length));
+    } else if (arg.startsWith("--serena-command=")) {
+      options.serenaCommand = arg.slice("--serena-command=".length);
     } else {
       console.error(`Unknown setup option: ${arg}`);
       process.exit(1);
     }
   }
   return options;
+}
+
+function normalizeSerenaModeArg(value: string): "auto" | "on" | "off" {
+  if (value === "auto" || value === "on" || value === "off") return value;
+  console.error("Unsupported Serena mode. Use --serena=auto|on|off");
+  process.exit(1);
 }
 
 function normalizePeersArg(value: string): string {
@@ -439,16 +479,22 @@ function normalizePeersArg(value: string): string {
 }
 
 async function setupMcp(targets: readonly ("claude" | "codex")[], options: SetupOptions): Promise<void> {
-  validateSetupPeers(targets, options.peers);
+  const setupAvailability = await detectAssistantSetupAvailability();
+  if (!options.dryRun) validateSetupTargetsAvailable(targets, setupAvailability);
+  const peers = options.autoPeers ? resolveAutoPeersForSetup(targets, buildAutoPeerSetupAvailability(setupAvailability)) : options.peers;
+  validateSetupPeers(targets, peers);
+  const serena = await detectSerenaSetup(options);
+  const extraEnv = [...buildSerenaEnv(serena), ...buildCustomAssistantEnv()];
   console.log(`Setting up code-assistant-peers for ${targets.join(", ")}`);
-  console.log(`workflow=${options.workflow}, mode=${options.mode}, timeout=${options.timeoutSec}s${options.peers ? `, peers=${options.peers}` : ""}`);
+  console.log(`workflow=${options.workflow}, mode=${options.mode}, timeout=${options.timeoutSec}s${peers ? `, peers=${peers}` : ""}`);
+  console.log(`serena=${serena.enabled ? "enabled" : "disabled"} - ${serena.reason}`);
 
   for (const target of targets) {
     if (options.dryRun) {
       console.log(buildRemoveArgs(target).join(" ") + " || true");
-      console.log(buildInstallCommand(target, options.workflow, options.mode, options.peers));
+      console.log(buildInstallCommand(target, options.workflow, options.mode, peers, extraEnv));
     } else {
-      await reinstallMcp(target, options.workflow, options.mode, options.peers);
+      await reinstallMcp(target, options.workflow, options.mode, peers, extraEnv);
     }
   }
 
@@ -471,6 +517,43 @@ async function setupMcp(targets: readonly ("claude" | "codex")[], options: Setup
   }
 
   console.log("Setup complete. Restart the MCP client, then call code_assistant_peers_setup from Claude/Codex to verify runtime availability.");
+}
+
+function buildCustomAssistantEnv(): string[] {
+  const customAssistants = process.env.CODE_ASSISTANT_PEERS_ASSISTANTS?.trim();
+  return customAssistants ? [`CODE_ASSISTANT_PEERS_ASSISTANTS=${customAssistants}`] : [];
+}
+
+function resolveAutoPeersForSetup(
+  targets: readonly ("claude" | "codex")[],
+  availability: AssistantSetupAvailability,
+): string {
+  try {
+    const result = resolveAutoPeerSetupConfig(targets, availability);
+    console.log(`auto peers=${result.peers}`);
+    const skipped = result.skipped
+      .filter((item) => !result.selected.includes(item.id) && item.reason !== "same as the only setup target")
+      .map((item) => `${item.id}: ${item.reason}`);
+    if (skipped.length > 0) console.log(`auto peer skips: ${skipped.join("; ")}`);
+    return result.peers;
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exit(1);
+  }
+}
+
+async function detectSerenaSetup(options: SetupOptions): Promise<SerenaSetupConfig> {
+  try {
+    return resolveSerenaSetupConfig({
+      mode: options.serenaMode,
+      explicitCommand: options.serenaCommand ?? process.env.CODE_ASSISTANT_PEERS_SERENA_COMMAND,
+      hasSerenaBinary: await commandExists("serena"),
+      hasUvx: await commandExists("uvx"),
+    });
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exit(1);
+  }
 }
 
 async function upsertCodexTimeout(timeoutSec: number): Promise<string> {
@@ -500,6 +583,18 @@ function validateSetupPeers(targets: readonly ("claude" | "codex")[], peers: str
   }
 }
 
+function validateSetupTargetsAvailable(
+  targets: readonly ("claude" | "codex")[],
+  availability: AssistantSetupAvailability,
+): void {
+  const missing = targets.filter((target) => !availability[target]?.ok);
+  if (missing.length === 0) return;
+  for (const target of missing) {
+    console.error(`Cannot register ${target}: ${availability[target]?.detail ?? "not checked"}`);
+  }
+  process.exit(1);
+}
+
 async function runCommand(args: string[], allowFailure: boolean): Promise<void> {
   console.log(`$ ${args.join(" ")}`);
   const proc = Bun.spawn(args, {
@@ -523,14 +618,27 @@ async function runDoctor(): Promise<void> {
     detail: Bun.version,
     fatal: true,
   });
-  const [claudeOk, claudeDetail] = await binaryCheck("claude");
-  const [codexOk, codexDetail] = await binaryCheck("codex");
-  checks.push({ name: "Claude CLI", passed: claudeOk, detail: claudeDetail, fatal: false });
-  checks.push({ name: "Codex CLI", passed: codexOk, detail: codexDetail, fatal: false });
+  const setupAvailability = await detectAssistantSetupAvailability();
+  const autoAvailability = buildAutoPeerSetupAvailability(setupAvailability);
+  const serena = await detectSerenaSetup({
+    workflow: "review_only",
+    mode: "normal",
+    peers: null,
+    autoPeers: false,
+    timeoutSec: 600,
+    installRulesDir: null,
+    dryRun: false,
+    serenaMode: "auto",
+    serenaCommand: null,
+  });
+  checks.push({ name: "Claude CLI", passed: Boolean(setupAvailability.claude?.ok), detail: setupAvailability.claude?.detail ?? "not checked", fatal: false });
+  checks.push({ name: "Codex CLI", passed: Boolean(setupAvailability.codex?.ok), detail: setupAvailability.codex?.detail ?? "not checked", fatal: false });
+  checks.push({ name: "Gemini CLI", passed: Boolean(setupAvailability.gemini?.ok), detail: setupAvailability.gemini?.detail ?? "not checked", fatal: false });
+  checks.push({ name: "Serena semantic context", passed: serena.enabled, detail: serena.reason, fatal: false });
   checks.push({
     name: "Codex MCP timeout",
-    passed: !codexOk || await codexTimeoutOk(),
-    detail: codexOk ? "tool_timeout_sec >= 600 recommended" : "skipped because Codex CLI was not found",
+    passed: !setupAvailability.codex?.ok || await codexTimeoutOk(),
+    detail: setupAvailability.codex?.ok ? "tool_timeout_sec >= 600 recommended" : "skipped because Codex CLI was not found",
     fatal: false,
   });
 
@@ -540,15 +648,61 @@ async function runDoctor(): Promise<void> {
     const label = check.passed ? "OK " : check.fatal ? "ERR" : "WARN";
     console.log(`${label} ${check.name}${check.detail ? ` - ${check.detail}` : ""}`);
   }
-  if (!claudeOk && !codexOk) {
+  if (!setupAvailability.claude?.ok && !setupAvailability.codex?.ok && !setupAvailability.gemini?.ok) {
     ok = false;
     console.log("ERR At least one assistant CLI is required.");
   }
+  printAutoPeerRecommendation(autoAvailability);
   console.log(`Store: ${getStoreDir()}`);
   console.log(`Database: ${getDatabasePath()}`);
   if (!ok) {
     console.log("Run: bun cli.ts setup both --timeout=600");
     process.exit(1);
+  }
+}
+
+async function detectAssistantSetupAvailability(): Promise<AssistantSetupAvailability> {
+  const [[claudeOk, claudeDetail], [codexOk, codexDetail], [geminiOk, geminiDetail]] = await Promise.all([
+    binaryCheck("claude"),
+    binaryCheck("codex"),
+    binaryCheck("gemini"),
+  ]);
+  const availability: AssistantSetupAvailability = {
+    claude: { ok: claudeOk, detail: claudeDetail || "command 'claude' not found" },
+    codex: { ok: codexOk, detail: codexDetail || "command 'codex' not found" },
+    gemini: { ok: geminiOk, detail: geminiDetail || "command 'gemini' not found" },
+  };
+  if (geminiOk) {
+    const geminiAuth = await getGeminiAuthReadiness(process.env);
+    availability.gemini = geminiAuth.ok
+      ? { ok: true, detail: geminiDetail || geminiAuth.detail }
+      : geminiAuth;
+  }
+  return availability;
+}
+
+function buildAutoPeerSetupAvailability(availability: AssistantSetupAvailability): AssistantSetupAvailability {
+  const autoAvailability = { ...availability };
+  const geminiDetail = availability.gemini?.detail ?? "";
+  if (availability.gemini?.ok || geminiDetail.startsWith("gemini found")) {
+    autoAvailability.gemini = getGeminiSetupAutoReadiness(process.env);
+  }
+  return autoAvailability;
+}
+
+function getGeminiSetupAutoReadiness(env: NodeJS.ProcessEnv): { ok: boolean; detail: string } {
+  return resolveGeminiAutoPeerReadiness(env);
+}
+
+function printAutoPeerRecommendation(availability: AssistantSetupAvailability): void {
+  for (const target of ["claude", "codex"] as const) {
+    if (!availability[target]?.ok) continue;
+    try {
+      const result = resolveAutoPeerSetupConfig([target], availability);
+      console.log(`Recommended ${target} setup: bun cli.ts setup ${target} --peers=auto  # PEER_ASSISTANTS=${result.peers}`);
+    } catch {
+      // The explicit WARN lines above already explain which CLIs are missing.
+    }
   }
 }
 
@@ -572,6 +726,11 @@ async function binaryCheck(command: string): Promise<[boolean, string]> {
   } catch (error) {
     return [false, error instanceof Error ? error.message : String(error)];
   }
+}
+
+async function commandExists(command: string): Promise<boolean> {
+  const [ok] = await binaryCheck(command);
+  return ok;
 }
 
 async function codexTimeoutOk(): Promise<boolean> {

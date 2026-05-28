@@ -1,25 +1,29 @@
 {
   "name": "mcp-code-assistant-peers",
-  "version": "0.1.0",
-  "description": "MCP server that coordinates peer review workflows between Claude Code and Codex",
+  "version": "0.2.0-alpha.0",
+  "description": "MCP review gate that lets Claude Code, Codex, Gemini, and other CLI coding agents review each other",
   "type": "module",
   "license": "MIT",
-  "author": "mcp-code-assistant-peers contributors",
-  "homepage": "https://github.com/anamkwon/mcp-code-assistant-peers#readme",
+  "author": "AnamKwon and contributors",
+  "homepage": "https://github.com/AnamKwon/code-assistant-peers#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/anamkwon/mcp-code-assistant-peers.git"
+    "url": "git+https://github.com/AnamKwon/code-assistant-peers.git"
   },
   "bugs": {
-    "url": "https://github.com/anamkwon/mcp-code-assistant-peers/issues"
+    "url": "https://github.com/AnamKwon/code-assistant-peers/issues"
   },
   "keywords": [
     "mcp",
     "model-context-protocol",
     "codex",
     "claude-code",
+    "gemini",
+    "ai-agents",
+    "multi-agent",
     "code-review",
-    "peer-review"
+    "peer-review",
+    "review-gate"
   ],
   "bin": {
     "code-assistant-peers": "./cli.ts",
@@ -43,6 +47,7 @@
     "server": "bun server.ts",
     "cli": "bun cli.ts",
     "setup": "bun cli.ts setup both",
+    "web-setup": "sh scripts/web-setup.sh",
     "test": "bun test",
     "typecheck": "bun ./node_modules/typescript/bin/tsc --noEmit",
     "check": "bun run typecheck && bun test"

@@ -10,6 +10,23 @@ export interface GitStatusEntry {
   path: string;
 }
 
+export interface FileSnapshotEntry {
+  fingerprint: string;
+  sha256?: string;
+  size: number;
+  text?: string;
+  binary?: boolean;
+  sensitive?: boolean;
+  omitted?: string;
+}
+
+export interface WorkspaceSnapshot {
+  captured_at: string;
+  files: Record<string, FileSnapshotEntry>;
+  truncated?: boolean;
+  warning?: string;
+}
+
 export interface PeerTask {
   id: string;
   host: AssistantHost;
@@ -20,10 +37,12 @@ export interface PeerTask {
   git_root: string | null;
   baseline_status: GitStatusEntry[];
   baseline_diff: string;
+  baseline_workspace_snapshot?: WorkspaceSnapshot | null;
   created_at: string;
   updated_at: string;
   status: TaskStatus;
   review?: PeerReviewResult;
+  review_signature?: string;
 }
 
 export interface PeerReviewResult {
@@ -73,6 +92,15 @@ export interface ReviewRequestOptions {
   files_changed?: string[];
   workflow?: PeerWorkflow;
   focus?: string | null;
+  semantic_context?: string | null;
+  self_review?: boolean;
+}
+
+export interface SemanticSymbolHint {
+  file: string;
+  line: number;
+  kind: string;
+  name: string;
 }
 
 export interface AssistantAdapter {
@@ -80,4 +108,6 @@ export interface AssistantAdapter {
   command: string[];
   prompt_transport: "stdin" | "argv";
   description?: string;
+  timeout_ms?: number;
+  env_allowlist?: string[];
 }

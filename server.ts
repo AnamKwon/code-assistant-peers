@@ -1,15 +1,30 @@
 #!/usr/bin/env bun
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { createHash } from "node:crypto";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { formatStatus, getGitRoot, getStatusEntries, getUncommittedDiff } from "./shared/git.ts";
-import { COLLABORATIVE_REVIEW_PROMPT, buildReviewPrompt, normalizeHost, normalizeReviewFocus, peerFor, runReviewCommand, truncateForReview } from "./shared/review.ts";
+import { formatStatus, getGitRoot, getReviewDiff, getStatusEntries, getUncommittedDiff } from "./shared/git.ts";
+import { captureWorkspaceSnapshot, emptyWorkspaceSnapshot } from "./shared/workspace-snapshot.ts";
+import {
+  COLLABORATIVE_REVIEW_PROMPT,
+  buildReviewPromptFromSnapshot,
+  formatMultiPeerReviewOutputs,
+  normalizeHost,
+  normalizeReviewFocus,
+  peerFor,
+  prepareReviewPromptSnapshot,
+  runReviewCommand,
+  truncateForReview,
+  type ReviewPromptSnapshotSeed,
+} from "./shared/review.ts";
 import {
   addFindings,
   appendReviewRound,
+  appendReviewRoundAndSaveTask,
+  claimStaleReviewRecovery,
   compactTaskHistory,
   gcStore,
   getReviewRound,
@@ -18,8 +33,8 @@ import {
   loadTask,
   saveTask,
 } from "./shared/store.ts";
-import { getAssistantAdapter, loadAssistantRegistry, peersFor } from "./shared/assistants.ts";
-import { areConfiguredAssistantsReady, resolveMultiPeerTaskStatus } from "./shared/multi-peer.ts";
+import { getAssistantAdapter, getGeminiAuthReadiness, loadAssistantRegistry, peersFor } from "./shared/assistants.ts";
+import { areConfiguredAssistantsReady, resolveMultiPeerTaskStatus, shouldRunCodexSelfReview, summarizeMultiPeerAvailability } from "./shared/multi-peer.ts";
 import type { AssistantHost, NewPeerReviewFinding, PeerReviewResult, PeerTask, PeerWorkflow, ReviewMode, ReviewRequestOptions, ReviewScope } from "./shared/types.ts";
 
 const assistantRegistry = loadAssistantRegistry();
@@ -30,13 +45,30 @@ const REVIEW_OUTPUT_BUDGET = parseInt(process.env.CODE_ASSISTANT_PEERS_REVIEW_OU
 const INCLUDE_SUCCESS_STDERR = process.env.CODE_ASSISTANT_PEERS_INCLUDE_SUCCESS_STDERR === "1";
 const DEFAULT_WORKFLOW = normalizeWorkflow(process.env.CODE_ASSISTANT_PEERS_WORKFLOW);
 const DEFAULT_REVIEW_MODE = normalizeDefaultReviewMode(process.env.CODE_ASSISTANT_PEERS_REVIEW_MODE);
+const STALE_REVIEW_RECOVERY_MS = parsePositiveInteger(process.env.CODE_ASSISTANT_PEERS_STALE_REVIEW_MS) ?? defaultStaleReviewRecoveryMs();
+
+type ReviewRoundOutcome = {
+  reviewer: AssistantHost;
+  label: string;
+  review: PeerReviewResult;
+  round: { round: number };
+  prompt: string;
+};
+
+type ReviewStartContext = {
+  requestSignature: string;
+  snapshotSeed: ReviewPromptSnapshotSeed;
+};
+
+const asyncReviewLocks = new Map<string, Promise<void>>();
+const activeAsyncReviews = new Set<string>();
 
 function log(message: string): void {
   console.error(`[code-assistant-peers] ${message}`);
 }
 
 const mcp = new Server(
-  { name: "code-assistant-peers", version: "0.1.0" },
+  { name: "code-assistant-peers", version: "0.2.0-alpha.0" },
   {
     capabilities: { tools: {} },
     instructions: `You are connected to the code-assistant-peers workflow as ${host}.
@@ -44,10 +76,11 @@ const mcp = new Server(
 	When the user asks for a code change:
 	1. Call begin_peer_task before editing.
 	2. Implement the change yourself.
-	3. Call must_call_after_code_changes before your final answer. This is required after any code edit, generated file, patch, format, refactor, or content change.
-		4. Report the ${peers.length > 1 ? peers.join(", ") : peer} review result to the user, including any actionable findings.
+	3. Call must_call_after_code_changes before your final answer. This required post-edit gate starts or reuses an async review job after any code edit, generated file, patch, format, refactor, or content change.
+	4. Call wait_for_peer_review or get_peer_review_status until the task is reviewed, partial_failed, or review_failed.
+	5. Report the ${peers.length > 1 ? peers.join(", ") : peer} review result to the user, including any actionable findings.
 	
-	If a review may exceed the host MCP timeout, call start_peer_review_async, then call wait_for_peer_review or get_peer_review_status until the task is reviewed, partial_failed, or review_failed before your final answer.
+	All post-edit review gates are async-first to avoid MCP host timeout failures. Do not wait for a long synchronous review call.
 	When the user asks to review, verify, validate, gate, or check code changes, prefer must_call_after_code_changes, finalize_code_changes_with_peer_review, verify_code_changes_after_edit, or request_peer_review over built-in slash review commands.
 	The peer reviewer must not edit files. Treat review failures as reportable tool failures, not as implementation success.`,
   },
@@ -70,7 +103,7 @@ const TOOLS = [
   },
   {
     name: "request_peer_review",
-    description: `MANDATORY PEER REVIEW after code changes. Ask configured peer assistant(s) (${peers.join(", ")}) to review changes made for a task before final response. Use this whenever files were edited, created, deleted, generated, formatted, or refactored. Do not use built-in /review as a substitute.`,
+    description: `ASYNC PEER REVIEW REQUEST after code changes. Starts or reuses a background review by configured peer assistant(s) (${peers.join(", ")}) for an existing task, stores status in SQLite, and returns immediately. After this tool, call wait_for_peer_review or get_peer_review_status before final response. Do not use built-in /review as a substitute.`,
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -105,6 +138,10 @@ const TOOLS = [
           type: "string" as const,
           description: "Optional review focus, such as security, data loss, performance, migration risk, UI regressions, or a specific concern from the user.",
         },
+        semantic_context: {
+          type: "string" as const,
+          description: "Optional Serena-style semantic context to include in the review prompt, such as changed symbols, references, implementations, or diagnostics.",
+        },
         workflow: {
           type: "string" as const,
           enum: ["review_only", "peer_fix"],
@@ -116,7 +153,7 @@ const TOOLS = [
   },
   {
     name: "verify_code_changes_after_edit",
-    description: "MANDATORY AFTER EDITING CODE. Call this after modifying, adding, deleting, generating, formatting, or refactoring files and before final response. Creates a task if needed, runs peer review on current changes, and returns a compact result. Prefer must_call_after_code_changes for final answers.",
+    description: "ASYNC MANDATORY AFTER EDITING CODE. Call this after modifying, adding, deleting, generating, formatting, or refactoring files and before final response. Creates a task if needed, starts or reuses a background peer review, and returns task status immediately. Then call wait_for_peer_review until reviewed/partial_failed/review_failed. Prefer must_call_after_code_changes for final answers.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -139,6 +176,10 @@ const TOOLS = [
         focus: {
           type: "string" as const,
           description: "Optional review focus, such as security, data loss, performance, migration risk, UI regressions, or a specific concern from the user.",
+        },
+        semantic_context: {
+          type: "string" as const,
+          description: "Optional Serena-style semantic context to include in the review prompt, such as changed symbols, references, implementations, or diagnostics.",
         },
         mode: {
           type: "string" as const,
@@ -160,7 +201,7 @@ const TOOLS = [
   },
   {
     name: "finalize_code_changes_with_peer_review",
-    description: "MANDATORY FINALIZATION GATE after editing files. Call this before the final response whenever code was modified, added, deleted, generated, formatted, or refactored. It verifies current changes with the opposite assistant and returns the peer review result. Do not use built-in /review instead.",
+    description: "ASYNC MANDATORY FINALIZATION GATE after editing files. Call this before the final response whenever code was modified, added, deleted, generated, formatted, or refactored. It starts or reuses peer verification with the opposite assistant in the background, stores status in SQLite, and requires wait_for_peer_review/get_peer_review_status before final response. Do not use built-in /review instead.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -183,6 +224,10 @@ const TOOLS = [
         focus: {
           type: "string" as const,
           description: "Optional review focus, such as security, data loss, performance, migration risk, UI regressions, or a specific concern from the user.",
+        },
+        semantic_context: {
+          type: "string" as const,
+          description: "Optional Serena-style semantic context to include in the review prompt, such as changed symbols, references, implementations, or diagnostics.",
         },
         mode: {
           type: "string" as const,
@@ -204,7 +249,7 @@ const TOOLS = [
   },
   {
     name: "must_call_after_code_changes",
-    description: "ABSOLUTE REQUIRED POST-EDIT MCP GATE. If you changed, created, deleted, generated, formatted, or refactored any code or project file, you must call this tool before final response. This runs peer review and verification through code-assistant-peers. Never substitute built-in /review for this required MCP call.",
+    description: "ABSOLUTE REQUIRED ASYNC POST-EDIT MCP GATE. If you changed, created, deleted, generated, formatted, or refactored any code or project file, you must call this tool before final response. This starts or reuses background peer review and verification through code-assistant-peers, records status in SQLite, and requires wait_for_peer_review/get_peer_review_status before final response. Never substitute built-in /review for this required MCP call.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -227,6 +272,10 @@ const TOOLS = [
         focus: {
           type: "string" as const,
           description: "Optional review focus, such as security, data loss, performance, migration risk, UI regressions, or a specific concern from the user.",
+        },
+        semantic_context: {
+          type: "string" as const,
+          description: "Optional Serena-style semantic context to include in the review prompt, such as changed symbols, references, implementations, or diagnostics.",
         },
         mode: {
           type: "string" as const,
@@ -248,7 +297,7 @@ const TOOLS = [
   },
   {
     name: "start_peer_review_async",
-    description: "ASYNC POST-EDIT REVIEW START. Use this when a peer review may exceed the MCP host timeout. Starts peer review in the background, stores queued/running/reviewed/partial_failed/review_failed state in SQLite, and returns immediately with a task id. After calling this, you MUST call wait_for_peer_review or get_peer_review_status before final response.",
+    description: "ASYNC POST-EDIT REVIEW START. Starts or reuses peer review in the background, stores queued/running/reviewed/partial_failed/review_failed state in SQLite, and returns immediately with a task id. After calling this, you MUST call wait_for_peer_review or get_peer_review_status before final response.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -271,6 +320,10 @@ const TOOLS = [
         focus: {
           type: "string" as const,
           description: "Optional review focus, such as security, data loss, performance, migration risk, UI regressions, or a specific concern from the user.",
+        },
+        semantic_context: {
+          type: "string" as const,
+          description: "Optional Serena-style semantic context to include in the review prompt, such as changed symbols, references, implementations, or diagnostics.",
         },
         mode: {
           type: "string" as const,
@@ -475,19 +528,19 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       const taskId = String((args as { task_id?: unknown }).task_id ?? "").trim();
       const task = await loadTask(taskId);
       if (!task) return textResult(`Task not found: ${taskId}`, true);
-      return await runPeerReviewTool(task, parseReviewOptions(args));
+      return await startOrReuseAsyncPeerReview(task, parseReviewOptions(args), "Requested async peer review");
     }
 
     case "verify_code_changes_after_edit": {
-      return await runAutoReviewTool(args, "Code changes require peer review");
+      return await runAsyncReviewGateTool(args, "Code changes require peer review");
     }
 
     case "finalize_code_changes_with_peer_review": {
-      return await runAutoReviewTool(args, "Code changes require final peer review");
+      return await runAsyncReviewGateTool(args, "Code changes require final peer review");
     }
 
     case "must_call_after_code_changes": {
-      return await runAutoReviewTool(args, "Code changes require mandatory peer review");
+      return await runAsyncReviewGateTool(args, "Code changes require mandatory peer review");
     }
 
     case "start_peer_review_async": {
@@ -515,24 +568,29 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       if (!task) return textResult(`Task not found: ${taskId}`, true);
       const rounds = await listReviewRounds(taskId);
       const findings = await listFindings(taskId);
-      return textResult(JSON.stringify({ task, rounds, findings }, null, 2));
+      return textResult(JSON.stringify({ task: redactTaskForToolResult(task), rounds, findings }, null, 2));
     }
 
     case "get_peer_task_context": {
       const taskId = String((args as { task_id?: unknown }).task_id ?? "").trim();
       const task = await loadTask(taskId);
       if (!task) return textResult(`Task not found: ${taskId}`, true);
-      const [currentStatus, currentDiff, rounds, openFindings] = await Promise.all([
+      const [currentStatus, currentReviewContext, rounds, openFindings] = await Promise.all([
         getStatusEntries(task.cwd),
-        getUncommittedDiff(task.cwd),
+        getReviewDiff(task.cwd, {
+          baselineWorkspaceSnapshot: task.baseline_workspace_snapshot
+            ?? (task.git_root === null
+              ? emptyWorkspaceSnapshot("No pre-edit baseline snapshot was captured; current non-git files are reported as added for review.")
+              : null),
+        }),
         listReviewRounds(taskId),
         listFindings(taskId, "open"),
       ]);
       return textResult(JSON.stringify({
-        task,
+        task: redactTaskForToolResult(task),
         baseline_status: formatStatus(task.baseline_status),
         current_status: formatStatus(currentStatus),
-        current_diff: truncateForReview(currentDiff, 30_000),
+        current_diff: truncateForReview(currentReviewContext.diff, 30_000),
         prior_rounds: rounds.map((round) => ({
           id: round.id,
           round: round.round,
@@ -631,11 +689,162 @@ function textResult(text: string, isError = false) {
   };
 }
 
-async function createPeerTask(prompt: string): Promise<PeerTask> {
+function buildFailureReviewResult(reviewer: AssistantHost, failureMessage: string): PeerReviewResult {
+  const now = new Date().toISOString();
+  return {
+    reviewer,
+    command: ["async-peer-review-preflight"],
+    exit_code: 1,
+    stdout: "",
+    stderr: failureMessage,
+    started_at: now,
+    completed_at: now,
+    warning: failureMessage,
+  };
+}
+
+async function withAsyncReviewLock<T>(taskId: string, action: () => Promise<T>): Promise<T> {
+  const previousLock = asyncReviewLocks.get(taskId) ?? Promise.resolve();
+  let releaseLock: (() => void) | undefined;
+  const currentLock = new Promise<void>((resolve) => {
+    releaseLock = resolve;
+  });
+  const chainedLock = previousLock.then(() => currentLock);
+  asyncReviewLocks.set(taskId, chainedLock);
+
+  await previousLock.catch(() => undefined);
+  try {
+    return await action();
+  } finally {
+    releaseLock?.();
+    if (asyncReviewLocks.get(taskId) === chainedLock) {
+      asyncReviewLocks.delete(taskId);
+    }
+  }
+}
+
+function buildReviewRequestSignatureFromState(
+  task: PeerTask,
+  options: ReviewRequestOptions,
+  reviewState: { statusEntries: PeerTask["baseline_status"]; diff: string },
+): string {
+  const payload = {
+    cwd: task.cwd,
+    host: task.host,
+    peer: task.peer,
+    peers: task.peers ?? [task.peer],
+    prompt: task.prompt,
+    mode: options.mode ?? "normal",
+    scope: options.scope ?? "auto",
+    base: options.base ?? null,
+    change_summary: options.change_summary ?? null,
+    files_changed: options.files_changed ?? [],
+    workflow: options.workflow ?? "review_only",
+    focus: normalizeReviewFocus(options.focus ?? process.env.CODE_ASSISTANT_PEERS_REVIEW_FOCUS),
+    semantic_context: options.semantic_context ?? null,
+    self_review: options.self_review ?? false,
+    git_status: reviewState.statusEntries,
+    git_diff: reviewState.diff,
+  };
+  return createHash("sha256").update(JSON.stringify(payload)).digest("hex");
+}
+
+async function captureReviewStartContext(task: PeerTask, options: ReviewRequestOptions): Promise<ReviewStartContext> {
+  const [statusEntries, reviewContext] = await Promise.all([
+    getStatusEntries(task.cwd),
+    getReviewDiff(task.cwd, {
+      scope: options.scope,
+      base: options.base,
+      baselineWorkspaceSnapshot: task.baseline_workspace_snapshot
+        ?? (task.git_root === null
+          ? emptyWorkspaceSnapshot("No pre-edit baseline snapshot was captured; current non-git files are reported as added for review.")
+          : null),
+    }),
+  ]);
+  return {
+    requestSignature: buildReviewRequestSignatureFromState(task, options, {
+      statusEntries,
+      diff: reviewContext.diff,
+    }),
+    snapshotSeed: {
+      currentStatus: statusEntries,
+      reviewContext,
+    },
+  };
+}
+
+function buildLegacyReviewRequestSignature(task: PeerTask, options: ReviewRequestOptions): string {
+  return buildReviewRequestSignatureFromState(task, options, {
+    statusEntries: task.baseline_status,
+    diff: task.baseline_diff,
+  });
+}
+
+async function recordReviewFailure(task: PeerTask, reviewer: AssistantHost, failureMessage: string): Promise<void> {
+  task.review = buildFailureReviewResult(reviewer, failureMessage);
+  task.status = "review_failed";
+  task.updated_at = task.review.completed_at;
+  try {
+    await appendReviewRoundAndSaveTask(task, task.review, failureMessage);
+  } catch (error) {
+    const message = error instanceof Error ? error.stack || error.message : String(error);
+    log(`Could not append synthetic failure round for task ${task.id}: ${message}`);
+  }
+}
+
+async function canFinalizeReview(taskId: string, expectedSignature?: string): Promise<boolean> {
+  if (!expectedSignature) return true;
+  const current = await loadTask(taskId);
+  return Boolean(current && current.status === "running" && current.review_signature === expectedSignature);
+}
+
+async function withReviewCommitLock<T>(
+  taskId: string,
+  expectedSignature: string | undefined,
+  action: (current: PeerTask) => Promise<T>,
+): Promise<T | null> {
+  return await withAsyncReviewLock(taskId, async () => {
+    const current = await loadTask(taskId);
+    if (!current || !(expectedSignature ? current.review_signature === expectedSignature && current.status === "running" : true)) {
+      return null;
+    }
+    return await action(current);
+  });
+}
+
+async function withReviewFailureCommitLock<T>(
+  taskId: string,
+  expectedSignature: string | undefined,
+  action: (current: PeerTask) => Promise<T>,
+): Promise<T | null> {
+  return await withAsyncReviewLock(taskId, async () => {
+    if (!expectedSignature) {
+      const current = await loadTask(taskId);
+      if (!current) return null;
+      return await action(current);
+    }
+    const current = await loadTask(taskId);
+    if (!current || current.review_signature !== expectedSignature || (current.status !== "queued" && current.status !== "running")) {
+      return null;
+    }
+    return await action(current);
+  });
+}
+
+async function createPeerTask(
+  prompt: string,
+  seed?: ReviewPromptSnapshotSeed,
+  options: { persist?: boolean; nonGitBaseline?: "snapshot" | "empty" } = {},
+): Promise<PeerTask> {
   const cwd = process.cwd();
   const gitRoot = await getGitRoot(cwd);
-  const baselineStatus = await getStatusEntries(cwd);
-  const baselineDiff = await getUncommittedDiff(cwd);
+  const baselineStatus = seed?.currentStatus ?? await getStatusEntries(cwd);
+  const baselineDiff = seed?.reviewContext.diff ?? await getUncommittedDiff(cwd);
+  const baselineWorkspaceSnapshot = gitRoot
+    ? null
+    : options.nonGitBaseline === "empty"
+      ? emptyWorkspaceSnapshot("No pre-edit baseline snapshot was captured; current non-git files are reported as added for review.")
+      : await captureWorkspaceSnapshot(cwd);
   const now = new Date().toISOString();
   const task: PeerTask = {
     id: crypto.randomUUID(),
@@ -647,22 +856,25 @@ async function createPeerTask(prompt: string): Promise<PeerTask> {
     git_root: gitRoot,
     baseline_status: baselineStatus,
     baseline_diff: baselineDiff,
+    baseline_workspace_snapshot: baselineWorkspaceSnapshot,
     created_at: now,
     updated_at: now,
     status: "open",
   };
-  await saveTask(task);
+  if (options.persist !== false) {
+    await saveTask(task);
+  }
   return task;
 }
 
-async function runAutoReviewTool(args: unknown, defaultPrompt: string) {
+async function runAsyncReviewGateTool(args: unknown, defaultPrompt: string) {
   const parsed = args as { task_id?: unknown; prompt?: unknown };
   const taskId = String(parsed.task_id ?? "").trim();
   const task = taskId
     ? await loadTask(taskId)
-    : await createPeerTask(String(parsed.prompt ?? defaultPrompt).trim());
+    : await createPeerTask(String(parsed.prompt ?? defaultPrompt).trim(), undefined, { nonGitBaseline: "empty" });
   if (!task) return textResult(`Task not found: ${taskId}`, true);
-  return await runPeerReviewTool(task, parseReviewOptions(args));
+  return await startOrReuseAsyncPeerReview(task, parseReviewOptions(args), "Mandatory async peer review gate");
 }
 
 async function startAsyncReviewTool(args: unknown, defaultPrompt: string) {
@@ -670,33 +882,157 @@ async function startAsyncReviewTool(args: unknown, defaultPrompt: string) {
   const taskId = String(parsed.task_id ?? "").trim();
   const task = taskId
     ? await loadTask(taskId)
-    : await createPeerTask(String(parsed.prompt ?? defaultPrompt).trim());
+    : await createPeerTask(String(parsed.prompt ?? defaultPrompt).trim(), undefined, { nonGitBaseline: "empty" });
   if (!task) return textResult(`Task not found: ${taskId}`, true);
-  if (task.status === "queued" || task.status === "running") {
-    return textResult(`Peer review is already ${task.status} for task ${task.id}. Call wait_for_peer_review or get_peer_review_status.`);
-  }
-
-  task.status = "queued";
-  task.updated_at = new Date().toISOString();
-  await saveTask(task);
-  const options = parseReviewOptions(args);
-  void runAsyncPeerReview(task, options);
-
-  return textResult([
-    `Started async peer review for task ${task.id}.`,
-    "Status is stored in SQLite as queued/running/reviewed/partial_failed/review_failed.",
-    "Call wait_for_peer_review with this task_id before your final response.",
-  ].join("\n"));
+  return await startOrReuseAsyncPeerReview(task, parseReviewOptions(args), "Started async peer review");
 }
 
-async function runAsyncPeerReview(initialTask: PeerTask, options: ReviewRequestOptions): Promise<void> {
+function redactTaskForToolResult(task: PeerTask): PeerTask {
+  const redacted = structuredClone(task);
+  const snapshot = redacted.baseline_workspace_snapshot;
+  if (!snapshot) return redacted;
+  for (const entry of Object.values(snapshot.files)) {
+    if (!entry.sensitive) continue;
+    entry.fingerprint = "[redacted sensitive fingerprint]";
+    if (entry.sha256) entry.sha256 = "[redacted sensitive fingerprint]";
+  }
+  return redacted;
+}
+
+function startBackgroundAsyncReview(
+  task: PeerTask,
+  options: ReviewRequestOptions,
+  expectedSignature?: string,
+  promptSnapshotSeed?: ReviewPromptSnapshotSeed,
+): void {
+  activeAsyncReviews.add(task.id);
+  void runAsyncPeerReview(task, options, expectedSignature, promptSnapshotSeed);
+}
+
+async function startOrReuseAsyncPeerReview(task: PeerTask, options: ReviewRequestOptions, label: string) {
+  return await withAsyncReviewLock(task.id, async () => {
+    const current = await loadTask(task.id) ?? task;
+    const startContext = await captureReviewStartContext(current, options);
+    const requestSignature = startContext.requestSignature;
+    const currentSignature = current.review_signature ?? buildLegacyReviewRequestSignature(current, options);
+    const hasSensitivePossibleChange = startContext.snapshotSeed.reviewContext.diff.includes("sensitive path");
+    const hasNoNonGitBaseline = current.git_root === null && !current.baseline_workspace_snapshot;
+
+    if (currentSignature === requestSignature && isTerminalReviewStatus(current.status) && !hasSensitivePossibleChange && !hasNoNonGitBaseline) {
+      return textResult([
+        `Peer review already completed for task ${current.id}.`,
+        "The repository state and review options match the latest recorded review.",
+        "Call wait_for_peer_review with this task_id before your final response.",
+        await buildReviewStatusJson(current),
+      ].join("\n\n"));
+    }
+
+    if (current.status === "queued" || current.status === "running") {
+      if (currentSignature === requestSignature) {
+        if (!activeAsyncReviews.has(current.id) && isStaleReviewState(current)) {
+          const staleStatus = current.status;
+          const claimed = await claimStaleReviewRecovery(
+            current.id,
+            requestSignature,
+            new Date(Date.now() - STALE_REVIEW_RECOVERY_MS).toISOString(),
+          );
+          if (!claimed) {
+            const refreshed = await loadTask(current.id) ?? current;
+            return textResult([
+              `Peer review is already ${refreshed.status} for task ${refreshed.id}.`,
+              "Another MCP server process appears to have claimed or refreshed this review state.",
+              "No duplicate reviewer process was started.",
+              "Call wait_for_peer_review with this task_id before your final response.",
+              await buildReviewStatusJson(refreshed),
+            ].join("\n\n"));
+          }
+          startBackgroundAsyncReview(claimed, options, requestSignature, startContext.snapshotSeed);
+          return textResult([
+            `${label} for task ${claimed.id}.`,
+            `Recovered stale ${staleStatus} review state: no active reviewer job exists in this MCP server process, so a fresh background review was started for the same snapshot.`,
+            "Status is stored in SQLite as queued/running/reviewed/partial_failed/review_failed.",
+            "Call wait_for_peer_review with this task_id before your final response.",
+            await buildReviewStatusJson(claimed),
+          ].join("\n\n"));
+        }
+        if (current.review_signature !== requestSignature) {
+          current.review_signature = requestSignature;
+          current.updated_at = new Date().toISOString();
+          await saveTask(current);
+        }
+        return textResult([
+          `Peer review is already ${current.status} for task ${current.id}.`,
+          "No duplicate reviewer process was started.",
+          "Call wait_for_peer_review with this task_id before your final response.",
+          await buildReviewStatusJson(current),
+        ].join("\n\n"));
+      }
+
+      const failureMessage = [
+        `Peer review task ${current.id} was superseded because the repository state changed while it was ${current.status}.`,
+        "A fresh review task was started with the newer repository snapshot.",
+      ].join("\n");
+      await recordReviewFailure(current, current.host, failureMessage);
+
+      const replacement = await createPeerTask(current.prompt, startContext.snapshotSeed, { persist: false });
+      replacement.host = current.host;
+      replacement.peer = current.peer;
+      replacement.peers = current.peers;
+      replacement.cwd = current.cwd;
+      replacement.git_root = current.git_root;
+      replacement.status = "queued";
+      replacement.review_signature = requestSignature;
+      replacement.updated_at = new Date().toISOString();
+      await saveTask(replacement);
+      startBackgroundAsyncReview(replacement, options, requestSignature, startContext.snapshotSeed);
+
+      return textResult([
+        `${label} for task ${replacement.id}.`,
+        `The previous task ${current.id} was marked review_failed because it became stale while running.`,
+        "Status is stored in SQLite as queued/running/reviewed/partial_failed/review_failed.",
+        "Call wait_for_peer_review with this task_id before your final response.",
+        await buildReviewStatusJson(replacement),
+      ].join("\n\n"));
+    }
+
+    current.status = "queued";
+    current.updated_at = new Date().toISOString();
+    current.review_signature = requestSignature;
+    await saveTask(current);
+    startBackgroundAsyncReview(current, options, requestSignature, startContext.snapshotSeed);
+
+    return textResult([
+      `${label} for task ${current.id}.`,
+      "Status is stored in SQLite as queued/running/reviewed/partial_failed/review_failed.",
+      "Call wait_for_peer_review with this task_id before your final response.",
+      await buildReviewStatusJson(current),
+    ].join("\n\n"));
+  });
+}
+
+async function runAsyncPeerReview(
+  initialTask: PeerTask,
+  options: ReviewRequestOptions,
+  expectedSignature?: string,
+  promptSnapshotSeed?: ReviewPromptSnapshotSeed,
+): Promise<void> {
   let task = initialTask;
+  activeAsyncReviews.add(initialTask.id);
   try {
-    task = await loadTask(initialTask.id) ?? initialTask;
-    task.status = "running";
-    task.updated_at = new Date().toISOString();
-    await saveTask(task);
-    await runPeerReviewTool(task, options);
+    const startedTask = await withAsyncReviewLock(initialTask.id, async () => {
+      const current = await loadTask(initialTask.id) ?? initialTask;
+      if (expectedSignature && (current.review_signature !== expectedSignature || (current.status !== "queued" && current.status !== "running"))) {
+        log(`Async review for task ${initialTask.id} was superseded before it started.`);
+        return null;
+      }
+      current.status = "running";
+      current.updated_at = new Date().toISOString();
+      await saveTask(current);
+      return current;
+    });
+    if (!startedTask) return;
+    task = startedTask;
+    await runPeerReviewTool(task, options, expectedSignature, promptSnapshotSeed);
   } catch (error) {
     const now = new Date().toISOString();
     let failedTask = task;
@@ -706,7 +1042,7 @@ async function runAsyncPeerReview(initialTask: PeerTask, options: ReviewRequestO
       failedTask = task;
     }
     const message = error instanceof Error ? error.stack || error.message : String(error);
-    failedTask.review = {
+    const failureReview: PeerReviewResult = {
       reviewer: failedTask.peers && failedTask.peers.length > 1 ? "async-multi-peer-review" : failedTask.peer,
       command: ["async-peer-review"],
       exit_code: 1,
@@ -715,16 +1051,28 @@ async function runAsyncPeerReview(initialTask: PeerTask, options: ReviewRequestO
       started_at: now,
       completed_at: now,
     };
+    failedTask.review = failureReview;
     failedTask.status = "review_failed";
     failedTask.updated_at = now;
     try {
-      await saveTask(failedTask);
-      await appendReviewRound(failedTask, failedTask.review, "(async review failed before reviewer completed)");
+      const committed = await withReviewFailureCommitLock(initialTask.id, expectedSignature, async (current) => {
+        current.review = failureReview;
+        current.status = "review_failed";
+        current.updated_at = now;
+        await appendReviewRoundAndSaveTask(current, failureReview, "(async review failed before reviewer completed)");
+        return true;
+      });
+      if (!committed) {
+        log(`Async review failure for task ${initialTask.id} was superseded before it could be persisted.`);
+        return;
+      }
     } catch (saveError) {
       const saveMessage = saveError instanceof Error ? saveError.stack || saveError.message : String(saveError);
       log(`Async review failed and could not persist failure for task ${initialTask.id}: ${saveMessage}`);
     }
     log(`Async review failed for task ${initialTask.id}: ${message}`);
+  } finally {
+    activeAsyncReviews.delete(initialTask.id);
   }
 }
 
@@ -757,35 +1105,86 @@ async function waitForPeerReviewTool(args: unknown) {
   ].join("\n\n"));
 }
 
-async function runPeerReviewTool(task: PeerTask, options: ReviewRequestOptions) {
+async function runPeerReviewTool(
+  task: PeerTask,
+  options: ReviewRequestOptions,
+  expectedSignature?: string,
+  promptSnapshotSeed?: ReviewPromptSnapshotSeed,
+) {
   const taskPeers = task.peers?.length ? task.peers : [task.peer];
-  if (taskPeers.length > 1) {
-    return await runMultiPeerReviewTool(task, options, taskPeers);
+  if (taskPeers.length > 1 || shouldRunCodexSelfReview(task.host, options.mode)) {
+    const promptSnapshot = await prepareReviewPromptSnapshot(task, options, promptSnapshotSeed);
+    return await runMultiPeerReviewTool(task, options, taskPeers, promptSnapshot, expectedSignature);
   }
 
   if (options.mode === "collaborative") {
-    return await runCollaborativeReviewTool(task, options);
+    const availability = await Promise.all([task.peer, task.host].map(async (reviewer) => ({
+      reviewer,
+      available: await isAssistantAvailable(reviewer),
+    })));
+    const skippedPeers = availability.filter((item) => !item.available.ok);
+    if (skippedPeers.length > 0) {
+      const failureMessage = [
+        `Collaborative review could not start for task ${task.id}.`,
+        ...skippedPeers.map((item) => `Skipped ${item.reviewer}: ${item.available.detail}`),
+      ].join("\n");
+      const failureCommitted = await withReviewCommitLock(task.id, expectedSignature, async (current) => {
+        await recordReviewFailure(current, skippedPeers[0]?.reviewer ?? task.peer, failureMessage);
+        return true;
+      });
+      if (!failureCommitted) {
+        log(`Skipping stale collaborative preflight failure for task ${task.id}.`);
+        return textResult("Review was superseded by a newer request.", true);
+      }
+      return textResult(failureMessage, true);
+    }
+    const promptSnapshot = await prepareReviewPromptSnapshot(task, options, promptSnapshotSeed);
+    return await runCollaborativeReviewTool(task, options, promptSnapshot, expectedSignature);
   }
 
+  const peerAvailability = await isAssistantAvailable(task.peer);
+  if (!peerAvailability.ok) {
+    const failureMessage = [
+      `No configured peer assistant is available for task ${task.id}.`,
+      `Skipped ${task.peer}: ${peerAvailability.detail}`,
+    ].join("\n");
+    const failureCommitted = await withReviewCommitLock(task.id, expectedSignature, async (current) => {
+      await recordReviewFailure(current, task.peer, failureMessage);
+      return true;
+    });
+    if (!failureCommitted) {
+      log(`Skipping stale single-peer preflight failure for task ${task.id}.`);
+      return textResult("Review was superseded by a newer request.", true);
+    }
+    return textResult(failureMessage, true);
+  }
+
+  const promptSnapshot = await prepareReviewPromptSnapshot(task, options, promptSnapshotSeed);
   const startedAt = new Date().toISOString();
-  const { prompt, warning } = await buildReviewPrompt(task, options);
+  const { prompt, warning } = buildReviewPromptFromSnapshot(task, options, promptSnapshot);
   const result = await runReviewCommand(task.peer, task.cwd, prompt);
   const completedAt = new Date().toISOString();
 
-  task.review = {
-    reviewer: task.peer,
-    command: result.command,
-    exit_code: result.exitCode,
-    stdout: result.stdout,
-    stderr: result.stderr,
-    started_at: startedAt,
-    completed_at: completedAt,
-    warning,
-  };
-  task.status = result.exitCode === 0 ? "reviewed" : "review_failed";
-  task.updated_at = completedAt;
-  await saveTask(task);
-  const round = await appendReviewRound(task, task.review, prompt);
+  const commitResult = await withReviewCommitLock(task.id, expectedSignature, async (current) => {
+    current.review = {
+      reviewer: task.peer,
+      command: result.command,
+      exit_code: result.exitCode,
+      stdout: result.stdout,
+      stderr: result.stderr,
+      started_at: startedAt,
+      completed_at: completedAt,
+      warning,
+    };
+    current.status = result.exitCode === 0 ? "reviewed" : "review_failed";
+    current.updated_at = completedAt;
+    return await appendReviewRoundAndSaveTask(current, current.review, prompt);
+  });
+  if (!commitResult) {
+    log(`Skipping stale single-peer review commit for task ${task.id}.`);
+    return textResult("Review was superseded by a newer request.", true);
+  }
+  const round = commitResult;
 
   const body = [
     `${task.peer} ${options.mode ?? "normal"} review round ${round.round} ${result.exitCode === 0 ? "completed" : "failed"} for task ${task.id}.`,
@@ -801,32 +1200,130 @@ async function runPeerReviewTool(task: PeerTask, options: ReviewRequestOptions) 
   return textResult(body, result.exitCode !== 0);
 }
 
-async function runMultiPeerReviewTool(task: PeerTask, options: ReviewRequestOptions, taskPeers: AssistantHost[]) {
-  const availability = await Promise.all(taskPeers.map(async (reviewer) => ({
-    reviewer,
-    available: await isAssistantAvailable(reviewer),
-  })));
-  const availablePeers = availability.filter((item) => item.available.ok).map((item) => item.reviewer);
-  const skippedPeers = availability.filter((item) => !item.available.ok);
+async function runMultiPeerReviewTool(
+  task: PeerTask,
+  options: ReviewRequestOptions,
+  taskPeers: AssistantHost[],
+  promptSnapshot?: Awaited<ReturnType<typeof prepareReviewPromptSnapshot>>,
+  expectedSignature?: string,
+) {
+  const selfReviewEnabled = shouldRunCodexSelfReview(task.host, options.mode);
+  const [hostAvailability, peerAvailability] = await Promise.all([
+    isAssistantAvailable(task.host),
+    Promise.all(taskPeers.map(async (reviewer) => ({
+      reviewer,
+      available: await isAssistantAvailable(reviewer),
+    }))),
+  ]);
+  const availability = summarizeMultiPeerAvailability(hostAvailability, peerAvailability, selfReviewEnabled);
 
-  if (availablePeers.length === 0) {
-    task.status = "review_failed";
-    task.updated_at = new Date().toISOString();
-    await saveTask(task);
-    return textResult([
-      `No configured peer assistants are available for task ${task.id}.`,
-      ...skippedPeers.map((item) => `Skipped ${item.reviewer}: ${item.available.detail}`),
-    ].join("\n"), true);
+  if (availability.failure === "host_unavailable") {
+    const failureMessage = [
+      `Aggregate reviewer ${task.host} is not available for task ${task.id}.`,
+      `Skipped ${task.host}: ${hostAvailability.detail}`,
+    ].join("\n");
+    const failureCommitted = await withReviewCommitLock(task.id, expectedSignature, async (current) => {
+      await recordReviewFailure(current, task.host, failureMessage);
+      return true;
+    });
+    if (!failureCommitted) {
+      log(`Skipping stale host-unavailable failure for task ${task.id}.`);
+      return textResult("Review was superseded by a newer request.", true);
+    }
+    return textResult(failureMessage, true);
   }
 
-  const peerResults = await Promise.all(availablePeers.map((reviewer) => runSinglePeerRound(task, options, reviewer)));
-  const successResults = peerResults.filter((result) => result.review.exit_code === 0);
-  const failedResults = peerResults.filter((result) => result.review.exit_code !== 0);
+  const { availablePeers, skippedPeers } = availability;
 
-  const aggregatePrompt = await buildMultiPeerAggregatePrompt(task, options, peerResults, skippedPeers);
+  if (availablePeers.length === 0 && !selfReviewEnabled) {
+    const failureMessage = [
+      `No configured peer assistants are available for task ${task.id}.`,
+      ...skippedPeers.map((item) => `Skipped ${item.reviewer}: ${item.available.detail}`),
+    ].join("\n");
+    const failureCommitted = await withReviewCommitLock(task.id, expectedSignature, async (current) => {
+      await recordReviewFailure(current, skippedPeers[0]?.reviewer ?? task.host, failureMessage);
+      return true;
+    });
+    if (!failureCommitted) {
+      log(`Skipping stale no-peers failure for task ${task.id}.`);
+      return textResult("Review was superseded by a newer request.", true);
+    }
+    return textResult(failureMessage, true);
+  }
+
+  const snapshot = promptSnapshot ?? await prepareReviewPromptSnapshot(task, options);
+  const selfReviewPromise = selfReviewEnabled
+    ? runSinglePeerRound(task, { ...options, self_review: true }, task.host, `${task.host} self-review`, snapshot, expectedSignature)
+    : Promise.resolve<ReviewRoundOutcome | null>(null);
+  const [peerResults, selfReviewResult] = await Promise.all([
+    Promise.all(availablePeers.map((reviewer) => runSinglePeerRound(task, options, reviewer, reviewer, snapshot, expectedSignature))),
+    selfReviewPromise,
+  ]);
+  const reviewResults = [...peerResults, ...(selfReviewResult ? [selfReviewResult] : [])];
+  const statusResults = reviewResults;
+  const selfReviewFailureWarning = selfReviewResult && selfReviewResult.review.exit_code !== 0
+    ? `Codex self-review round ${selfReviewResult.round.round} exited ${selfReviewResult.review.exit_code}`
+    : null;
+
+  if (peerResults.some((result) => result.round.round < 0) || (selfReviewResult && selfReviewResult.round.round < 0)) {
+    log(`Skipping stale multi-peer aggregation for task ${task.id} because a peer round was not committed.`);
+    return textResult("Review was superseded by a newer request.", true);
+  }
+
+  if (!(await canFinalizeReview(task.id, expectedSignature))) {
+    log(`Skipping stale multi-peer finalization for task ${task.id}.`);
+    return textResult("Review was superseded by a newer request.", true);
+  }
+
+  if (availablePeers.length === 0 && selfReviewResult) {
+    const selfReviewWarning = [selfReviewResult.review.warning, selfReviewFailureWarning].filter(Boolean).join("\n") || undefined;
+    const committedStatus = await withReviewCommitLock(task.id, expectedSignature, async (current) => {
+      const resolvedStatus = resolveMultiPeerTaskStatus({
+        successfulPeerReviews: statusResults.filter((result) => result.review.exit_code === 0).length,
+        failedPeerReviews: statusResults.filter((result) => result.review.exit_code !== 0).length,
+        skippedPeers: skippedPeers.length,
+        aggregateExitCode: selfReviewResult.review.exit_code,
+      });
+      current.review = {
+        ...selfReviewResult.review,
+        warning: selfReviewWarning,
+      };
+      current.status = resolvedStatus;
+      current.updated_at = selfReviewResult.review.completed_at;
+      await saveTask(current);
+      return resolvedStatus;
+    });
+    if (!committedStatus) {
+      log(`Skipping stale multi-peer self-review finalization for task ${task.id}.`);
+      return textResult("Review was superseded by a newer request.", true);
+    }
+
+    const body = [
+      `Codex self-review completed for task ${task.id}.`,
+      `Requested peers: ${taskPeers.join(", ")}`,
+      `Reviewed by: ${reviewResults.map((result) => result.label).join(", ")}`,
+      skippedPeers.length ? `Skipped unavailable peers:\n${skippedPeers.map((item) => `- ${item.reviewer}: ${item.available.detail}`).join("\n")}` : "",
+      `Self-review round: ${selfReviewResult.round.round} (${selfReviewResult.label}, exit ${selfReviewResult.review.exit_code}).`,
+      `Aggregate round: skipped because no external peers were available.`,
+      selfReviewFailureWarning ? `Self-review warning: ${selfReviewFailureWarning}` : "",
+      selfReviewResult.review.stdout.trim()
+        ? `Self-review output:\n${compactForToolResult(selfReviewResult.review.stdout, REVIEW_OUTPUT_BUDGET)}`
+        : "",
+      shouldIncludeStderr(selfReviewResult.review.exit_code, selfReviewResult.review.stderr)
+        ? `Self-review stderr:\n${compactForToolResult(selfReviewResult.review.stderr, Math.min(REVIEW_OUTPUT_BUDGET, 3000))}`
+        : "",
+      `Task status: ${committedStatus}`,
+    ].filter(Boolean).join("\n\n");
+
+    return textResult(body, committedStatus === "review_failed");
+  }
+
+  const aggregatePromptResult = await buildMultiPeerAggregatePrompt(task, options, peerResults, skippedPeers, selfReviewResult, snapshot);
+  const aggregatePrompt = aggregatePromptResult.prompt;
   const aggregateStartedAt = new Date().toISOString();
   const aggregateResult = await runReviewCommand(task.host, task.cwd, aggregatePrompt);
   const aggregateCompletedAt = new Date().toISOString();
+  const aggregateWarning = [aggregatePromptResult.warning, selfReviewFailureWarning].filter(Boolean).join("\n") || undefined;
   const aggregateReview: PeerReviewResult = {
     reviewer: task.host,
     command: aggregateResult.command,
@@ -835,42 +1332,62 @@ async function runMultiPeerReviewTool(task: PeerTask, options: ReviewRequestOpti
     stderr: aggregateResult.stderr,
     started_at: aggregateStartedAt,
     completed_at: aggregateCompletedAt,
+    warning: aggregateWarning,
   };
-  const aggregateRound = await appendReviewRound(task, aggregateReview, aggregatePrompt);
-
-  task.review = aggregateReview;
-  task.status = resolveMultiPeerTaskStatus({
-    successfulPeerReviews: successResults.length,
-    failedPeerReviews: failedResults.length,
-    skippedPeers: skippedPeers.length,
-    aggregateExitCode: aggregateResult.exitCode,
+  const aggregateCommit = await withReviewCommitLock(task.id, expectedSignature, async (current) => {
+    const resolvedStatus = resolveMultiPeerTaskStatus({
+      successfulPeerReviews: statusResults.filter((result) => result.review.exit_code === 0).length,
+      failedPeerReviews: statusResults.filter((result) => result.review.exit_code !== 0).length,
+      skippedPeers: skippedPeers.length,
+      aggregateExitCode: aggregateResult.exitCode,
+    });
+    current.review = aggregateReview;
+    current.status = resolvedStatus;
+    current.updated_at = aggregateCompletedAt;
+    const aggregateRound = await appendReviewRoundAndSaveTask(current, aggregateReview, aggregatePrompt);
+    return { round: aggregateRound, status: resolvedStatus };
   });
-  task.updated_at = aggregateCompletedAt;
-  await saveTask(task);
+  if (!aggregateCommit) {
+    log(`Skipping stale multi-peer aggregate finalization for task ${task.id}.`);
+    return textResult("Review was superseded by a newer request.", true);
+  }
+  const aggregateRound = aggregateCommit.round;
+  const aggregateStatus = aggregateCommit.status;
 
   const body = [
     `Multi-peer review completed for task ${task.id}.`,
     `Requested peers: ${taskPeers.join(", ")}`,
-    `Reviewed by: ${availablePeers.join(", ")}`,
+    `Reviewed by: ${reviewResults.map((result) => result.label).join(", ")}`,
     skippedPeers.length ? `Skipped unavailable peers:\n${skippedPeers.map((item) => `- ${item.reviewer}: ${item.available.detail}`).join("\n")}` : "",
-    `Peer rounds: ${peerResults.map((result) => `${result.round.round} (${result.reviewer}, exit ${result.review.exit_code})`).join(", ")}`,
+    peerResults.length ? `Peer rounds: ${peerResults.map((result) => `${result.round.round} (${result.label}, exit ${result.review.exit_code})`).join(", ")}` : "",
+    selfReviewResult ? `Self-review round: ${selfReviewResult.round.round} (${selfReviewResult.label}, exit ${selfReviewResult.review.exit_code}).` : "",
+    selfReviewFailureWarning ? `Self-review warning: ${selfReviewFailureWarning}` : "",
     `Aggregate round: ${aggregateRound.round} (${task.host}, exit ${aggregateResult.exitCode}).`,
+    aggregateWarning ? `Aggregate warning: ${aggregateWarning}` : "",
     aggregateResult.stdout.trim()
       ? `Aggregated review output:\n${compactForToolResult(aggregateResult.stdout, REVIEW_OUTPUT_BUDGET)}`
       : "",
     shouldIncludeStderr(aggregateResult.exitCode, aggregateResult.stderr)
       ? `Aggregate reviewer stderr:\n${compactForToolResult(aggregateResult.stderr, Math.min(REVIEW_OUTPUT_BUDGET, 3000))}`
       : "",
-    `Task status: ${task.status}`,
+    `Task status: ${aggregateStatus}`,
   ].filter(Boolean).join("\n\n");
 
-  return textResult(body, task.status === "review_failed");
+  return textResult(body, aggregateStatus === "review_failed");
 }
 
-async function runSinglePeerRound(task: PeerTask, options: ReviewRequestOptions, reviewer: AssistantHost) {
+async function runSinglePeerRound(
+  task: PeerTask,
+  options: ReviewRequestOptions,
+  reviewer: AssistantHost,
+  label = reviewer,
+  promptSnapshot?: Awaited<ReturnType<typeof prepareReviewPromptSnapshot>>,
+  expectedSignature?: string,
+): Promise<ReviewRoundOutcome> {
   const roundTask = { ...task, peer: reviewer, peers: [reviewer] };
   const startedAt = new Date().toISOString();
-  const { prompt, warning } = await buildReviewPrompt(roundTask, options);
+  const snapshot = promptSnapshot ?? await prepareReviewPromptSnapshot(task, options);
+  const { prompt, warning } = buildReviewPromptFromSnapshot(roundTask, options, snapshot);
   const result = await runReviewCommand(reviewer, task.cwd, prompt);
   const completedAt = new Date().toISOString();
   const review: PeerReviewResult = {
@@ -883,16 +1400,27 @@ async function runSinglePeerRound(task: PeerTask, options: ReviewRequestOptions,
     completed_at: completedAt,
     warning,
   };
-  const round = await appendReviewRound(task, review, prompt);
-  return { reviewer, review, round, prompt };
+  const round = await withReviewCommitLock(task.id, expectedSignature, async (current) => {
+    return await appendReviewRound(current, review, prompt);
+  });
+  if (!round) {
+    log(`Skipping stale peer round finalization for task ${task.id}.`);
+    return { reviewer, label, review, round: { round: -1 }, prompt };
+  }
+  return { reviewer, label, review, round, prompt };
 }
 
-async function runCollaborativeReviewTool(task: PeerTask, options: ReviewRequestOptions) {
+async function runCollaborativeReviewTool(
+  task: PeerTask,
+  options: ReviewRequestOptions,
+  promptSnapshot: Awaited<ReturnType<typeof prepareReviewPromptSnapshot>>,
+  expectedSignature?: string,
+) {
   const peerStartedAt = new Date().toISOString();
-  const peerPromptResult = await buildReviewPrompt(task, {
+  const peerPromptResult = buildReviewPromptFromSnapshot(task, {
     ...options,
     mode: "collaborative",
-  });
+  }, promptSnapshot);
   const peerResult = await runReviewCommand(task.peer, task.cwd, peerPromptResult.prompt);
   const peerCompletedAt = new Date().toISOString();
   const peerReview = {
@@ -905,13 +1433,26 @@ async function runCollaborativeReviewTool(task: PeerTask, options: ReviewRequest
     completed_at: peerCompletedAt,
     warning: peerPromptResult.warning,
   };
-  const peerRound = await appendReviewRound(task, peerReview, peerPromptResult.prompt);
+  const peerRound = await withReviewCommitLock(task.id, expectedSignature, async (current) => {
+    return await appendReviewRound(current, peerReview, peerPromptResult.prompt);
+  });
+  if (!peerRound) {
+    log(`Skipping stale collaborative peer-round finalization for task ${task.id}.`);
+    return textResult("Review was superseded by a newer request.", true);
+  }
 
   if (peerResult.exitCode !== 0 && !peerResult.stdout.trim()) {
-    task.review = peerReview;
-    task.status = "review_failed";
-    task.updated_at = peerCompletedAt;
-    await saveTask(task);
+    const failureCommitted = await withReviewCommitLock(task.id, expectedSignature, async (current) => {
+      current.review = peerReview;
+      current.status = "review_failed";
+      current.updated_at = peerCompletedAt;
+      await saveTask(current);
+      return true;
+    });
+    if (!failureCommitted) {
+      log(`Skipping stale collaborative peer-failure finalization for task ${task.id}.`);
+      return textResult("Review was superseded by a newer request.", true);
+    }
     const body = [
       `${task.peer}+${task.host} collaborative review failed during peer skeptical round for task ${task.id}.`,
       "Host comparison was skipped because the peer reviewer produced no usable review output.",
@@ -923,7 +1464,7 @@ async function runCollaborativeReviewTool(task: PeerTask, options: ReviewRequest
     return textResult(body, true);
   }
 
-  const hostPrompt = await buildHostComparisonPrompt(task, options, peerReview.stdout || peerReview.stderr);
+  const hostPrompt = buildHostComparisonPrompt(task, options, peerReview.stdout || peerReview.stderr, promptSnapshot);
   const hostStartedAt = new Date().toISOString();
   const hostResult = await runReviewCommand(task.host, task.cwd, hostPrompt);
   const hostCompletedAt = new Date().toISOString();
@@ -937,12 +1478,18 @@ async function runCollaborativeReviewTool(task: PeerTask, options: ReviewRequest
     completed_at: hostCompletedAt,
     warning: peerPromptResult.warning,
   };
-  const hostRound = await appendReviewRound(task, hostReview, hostPrompt);
-
-  task.review = hostReview;
-  task.status = peerResult.exitCode === 0 && hostResult.exitCode === 0 ? "reviewed" : "review_failed";
-  task.updated_at = hostCompletedAt;
-  await saveTask(task);
+  const hostCommit = await withReviewCommitLock(task.id, expectedSignature, async (current) => {
+    current.review = hostReview;
+    current.status = peerResult.exitCode === 0 && hostResult.exitCode === 0 ? "reviewed" : "review_failed";
+    current.updated_at = hostCompletedAt;
+    const hostRound = await appendReviewRoundAndSaveTask(current, hostReview, hostPrompt);
+    return hostRound;
+  });
+  if (!hostCommit) {
+    log(`Skipping stale collaborative finalization for task ${task.id}.`);
+    return textResult("Review was superseded by a newer request.", true);
+  }
+  const hostRound = hostCommit;
 
   const body = [
     `${task.peer}+${task.host} collaborative review completed for task ${task.id}.`,
@@ -962,15 +1509,17 @@ async function runCollaborativeReviewTool(task: PeerTask, options: ReviewRequest
   return textResult(body, peerResult.exitCode !== 0 || hostResult.exitCode !== 0);
 }
 
-async function buildHostComparisonPrompt(
+function buildHostComparisonPrompt(
   task: PeerTask,
   options: ReviewRequestOptions,
   peerOutput: string,
-): Promise<string> {
-  const base = await buildReviewPrompt(task, {
+  promptSnapshot: Awaited<ReturnType<typeof prepareReviewPromptSnapshot>>,
+): string {
+  const hostTask = { ...task, peer: task.host, peers: [task.host] };
+  const base = buildReviewPromptFromSnapshot(hostTask, {
     ...options,
     mode: "normal",
-  });
+  }, promptSnapshot);
   const taskContextStart = base.prompt.indexOf("\nTask id:");
   const taskContext = taskContextStart >= 0 ? base.prompt.slice(taskContextStart + 1) : base.prompt;
   const contextPrompt = taskContext.replace("Review mode: normal", "Review mode: collaborative host comparison");
@@ -995,20 +1544,30 @@ ${contextPrompt}`;
 async function buildMultiPeerAggregatePrompt(
   task: PeerTask,
   options: ReviewRequestOptions,
-  peerResults: Array<{ reviewer: AssistantHost; review: PeerReviewResult; round: { round: number } }>,
+  peerResults: ReviewRoundOutcome[],
   skippedPeers: Array<{ reviewer: AssistantHost; available: { ok: boolean; detail: string } }>,
-): Promise<string> {
-  const base = await buildReviewPrompt(task, {
+  selfReviewResult?: ReviewRoundOutcome | null,
+  promptSnapshot?: Awaited<ReturnType<typeof prepareReviewPromptSnapshot>>,
+): Promise<{ prompt: string; warning?: string }> {
+  const snapshot = promptSnapshot ?? await prepareReviewPromptSnapshot(task, options);
+  const aggregateTask = { ...task, peer: task.host, peers: [task.host] };
+  const base = buildReviewPromptFromSnapshot(aggregateTask, {
     ...options,
     mode: options.mode === "collaborative" ? "normal" : options.mode,
-  });
+  }, snapshot);
   const taskContextStart = base.prompt.indexOf("\nTask id:");
   const taskContext = taskContextStart >= 0 ? base.prompt.slice(taskContextStart + 1) : base.prompt;
+  const aggregateMode = options.mode === "collaborative"
+    ? "multi-peer aggregate collaborative"
+    : `multi-peer aggregate ${options.mode ?? "normal"}`;
+  const baseMode = options.mode === "collaborative" ? "normal" : options.mode ?? "normal";
   const contextPrompt = taskContext.replace(
-    `Review mode: ${options.mode ?? "normal"}`,
-    `Review mode: multi-peer aggregate ${options.mode ?? "normal"}`,
+    `Review mode: ${baseMode}`,
+    `Review mode: ${aggregateMode}`,
   );
-  return `You are the aggregate reviewer for a multi-peer code review.
+  return {
+    warning: base.warning,
+    prompt: `You are the aggregate reviewer for a multi-peer code review.
 
 Your job is to merge multiple assistant reviews into the best final review:
 - Deduplicate overlapping findings.
@@ -1027,12 +1586,11 @@ ${task.peers?.join(", ") ?? task.peer}
 Skipped unavailable reviewers:
 ${skippedPeers.length ? skippedPeers.map((item) => `- ${item.reviewer}: ${item.available.detail}`).join("\n") : "(none)"}
 
-Peer review outputs:
-${peerResults.map((result) => `--- ${result.reviewer} round ${result.round.round} exit ${result.review.exit_code} ---
-${truncateForReview(result.review.stdout || result.review.stderr || "(no output)", REVIEW_OUTPUT_BUDGET)}`).join("\n\n")}
+${formatMultiPeerReviewOutputs(peerResults, selfReviewResult)}
 
 Repository/task context:
-${contextPrompt}`;
+${contextPrompt}`,
+  };
 }
 
 function parseReviewOptions(args: unknown): ReviewRequestOptions {
@@ -1051,6 +1609,9 @@ function parseReviewOptions(args: unknown): ReviewRequestOptions {
     focus: obj.focus === undefined || obj.focus === null
       ? normalizeReviewFocus(process.env.CODE_ASSISTANT_PEERS_REVIEW_FOCUS)
       : normalizeReviewFocus(String(obj.focus)),
+    semantic_context: obj.semantic_context === undefined || obj.semantic_context === null
+      ? null
+      : String(obj.semantic_context),
   };
 }
 
@@ -1092,12 +1653,12 @@ async function buildSetupStatus() {
     assistants,
     review_gate: {
       available_tool: "must_call_after_code_changes",
-      note: "MCP cannot technically force every final response through review, but this required post-edit tool is exposed with strong schema and server instructions.",
+      note: "MCP cannot technically force every final response through review, but this required post-edit tool is exposed with strong schema and starts or reuses async peer review jobs.",
     },
     next_steps: [
       assistants[host]?.available.ok ? null : `Install or fix host assistant CLI: ${host}.`,
       ...peers.map((reviewer) => assistants[reviewer]?.available.ok ? null : `Install or fix peer assistant CLI: ${reviewer}.`),
-      "Use must_call_after_code_changes after edits, or request_peer_review for an existing task id.",
+      "Use must_call_after_code_changes after edits, then call wait_for_peer_review until the task reaches a terminal state.",
     ].filter(Boolean),
   };
 }
@@ -1116,9 +1677,19 @@ async function isAssistantAvailable(reviewer: AssistantHost): Promise<{ ok: bool
       new Response(proc.stderr).text(),
       proc.exited,
     ]);
+    if (exitCode !== 0) {
+      return {
+        ok: false,
+        detail: (stdout || stderr).trim() || `command '${command}' not found`,
+      };
+    }
+    if (reviewer === "gemini") {
+      const geminiAuth = await getGeminiAuthReadiness(process.env);
+      if (!geminiAuth.ok) return geminiAuth;
+    }
     return {
-      ok: exitCode === 0,
-      detail: (stdout || stderr).trim() || `command '${command}' ${exitCode === 0 ? "found" : "not found"}`,
+      ok: true,
+      detail: (stdout || stderr).trim() || `command '${command}' found`,
     };
   } catch (error) {
     return {
@@ -1138,7 +1709,16 @@ async function buildReviewStatusJson(task: PeerTask): Promise<string> {
     listReviewRounds(task.id),
     listFindings(task.id, "open"),
   ]);
-  const latestRound = rounds.at(-1);
+  const latestRound = rounds.at(-1) ?? (task.review
+    ? {
+      round: 0,
+      reviewer: task.review.reviewer,
+      exit_code: task.review.exit_code,
+      completed_at: task.review.completed_at,
+      stdout: task.review.stdout,
+      stderr: task.review.stderr,
+    }
+    : null);
   return JSON.stringify({
     task_id: task.id,
     status: task.status,
@@ -1163,9 +1743,9 @@ async function buildReviewStatusJson(task: PeerTask): Promise<string> {
         ? "Review completed. Report the latest round and any open findings."
         : task.status === "partial_failed"
           ? "Review partially completed. Report successful reviews and skipped/failed peers."
-        : task.status === "review_failed"
-          ? "Review failed. Inspect latest_round and stderr before final response."
-          : "Start review with request_peer_review, must_call_after_code_changes, or start_peer_review_async.",
+          : task.status === "review_failed"
+            ? "Review failed. Inspect latest_round and stderr before final response."
+            : "Start async review with must_call_after_code_changes, request_peer_review, or start_peer_review_async.",
   }, null, 2);
 }
 
@@ -1188,6 +1768,24 @@ function sleep(ms: number): Promise<void> {
 
 function isTerminalReviewStatus(status: string): boolean {
   return status === "reviewed" || status === "partial_failed" || status === "review_failed";
+}
+
+function isStaleReviewState(task: PeerTask): boolean {
+  const updatedAt = Date.parse(task.updated_at);
+  if (!Number.isFinite(updatedAt)) return true;
+  return Date.now() - updatedAt >= STALE_REVIEW_RECOVERY_MS;
+}
+
+function parsePositiveInteger(value: string | undefined): number | undefined {
+  if (!value?.trim()) return undefined;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return undefined;
+  return Math.floor(parsed);
+}
+
+function defaultStaleReviewRecoveryMs(): number {
+  const reviewTimeout = parsePositiveInteger(process.env.CODE_ASSISTANT_PEERS_REVIEW_TIMEOUT_MS) ?? 600_000;
+  return Math.max(900_000, reviewTimeout + 300_000);
 }
 
 function normalizeFinding(value: unknown): NewPeerReviewFinding {

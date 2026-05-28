@@ -1,11 +1,33 @@
-import type { AssistantHost, GitStatusEntry, PeerTask, ReviewRequestOptions } from "./types.ts";
+import type { AssistantAdapter, AssistantHost, GitStatusEntry, PeerReviewResult, PeerTask, ReviewRequestOptions } from "./types.ts";
 import { getAssistantAdapter, normalizeHost, peerFor } from "./assistants.ts";
 import { formatStatus, getReviewDiff, getStatusEntries } from "./git.ts";
+import { buildSemanticContext, parseSerenaCommand } from "./semantic.ts";
 import { listFindings, listReviewRounds } from "./store.ts";
+import { emptyWorkspaceSnapshot } from "./workspace-snapshot.ts";
 
 const REVIEW_DIFF_BUDGET = parseInt(process.env.CODE_ASSISTANT_PEERS_DIFF_BUDGET ?? "12000", 10);
 const ARGV_PROMPT_BUDGET = parseInt(process.env.CODE_ASSISTANT_PEERS_ARGV_PROMPT_BUDGET ?? "60000", 10);
+const REVIEW_OUTPUT_BUDGET = parseInt(process.env.CODE_ASSISTANT_PEERS_REVIEW_OUTPUT_BUDGET ?? "6000", 10);
 const REVIEW_FOCUS_BUDGET = 1000;
+const DEFAULT_REVIEW_COMMAND_TIMEOUT_MS = 600000;
+const DEFAULT_REVIEW_ENV_ALLOWLIST = [
+  "PATH",
+  "HOME",
+  "USER",
+  "SHELL",
+  "TERM",
+  "TMPDIR",
+  "OPENAI_API_KEY",
+  "ANTHROPIC_API_KEY",
+  "GEMINI_API_KEY",
+  "GOOGLE_API_KEY",
+  "GOOGLE_GENAI_USE_VERTEXAI",
+  "GOOGLE_CLOUD_PROJECT",
+  "GOOGLE_CLOUD_LOCATION",
+  "GOOGLE_APPLICATION_CREDENTIALS",
+  "CODEX_HOME",
+  "CLAUDE_CONFIG_DIR",
+];
 
 export const REVIEWER_SYSTEM_PROMPT = `You are a senior code reviewer working as a read-only peer reviewer.
 
@@ -34,6 +56,49 @@ export const REVIEW_OUTPUT_GUIDELINES = `Output guidelines:
 - End with an overall correctness verdict: "patch is correct" or "patch is incorrect".
 - Treat the patch as incorrect only when a blocking or material correctness issue remains. Non-blocking notes do not make the patch incorrect.
 - Keep the review compact. Do not repeat raw diffs or long logs.`;
+
+export interface ReviewRoundSummary {
+  reviewer: AssistantHost;
+  label?: string;
+  review: PeerReviewResult;
+  round: { round: number };
+}
+
+type ReviewDiffContext = Awaited<ReturnType<typeof getReviewDiff>>;
+
+export interface ReviewPromptSnapshot {
+  currentStatus: GitStatusEntry[];
+  reviewContext: ReviewDiffContext;
+  semanticContext: string;
+  warning?: string;
+  previousReviewMemory: string;
+  diffWasTruncated: boolean;
+}
+
+export interface ReviewPromptSnapshotSeed {
+  currentStatus: GitStatusEntry[];
+  reviewContext: ReviewDiffContext;
+}
+
+export const SELF_REVIEW_PROMPT = `You are performing a self-review of your own implementation.
+
+Be stricter than usual. Look for blind spots you may have missed, edge cases you assumed away, incomplete error handling, and tests that still need to be added. Prefer concrete issues you would still fix before shipping.`;
+
+export function formatMultiPeerReviewOutputs(
+  peerResults: ReviewRoundSummary[],
+  selfReviewResult?: ReviewRoundSummary | null,
+): string {
+  const peerOutput = peerResults.length > 0
+    ? peerResults.map((result) => {
+      const peerLabel = result.label ?? result.reviewer;
+      return `--- ${peerLabel} round ${result.round.round} exit ${result.review.exit_code} ---\n${truncateForReview(result.review.stdout || result.review.stderr || "(no output)", REVIEW_OUTPUT_BUDGET)}`;
+    }).join("\n\n")
+    : "(none)";
+  const selfReviewSection = selfReviewResult
+    ? `\n\nCodex self-review output:\n--- ${selfReviewResult.label ?? selfReviewResult.reviewer} round ${selfReviewResult.round.round} exit ${selfReviewResult.review.exit_code} ---\n${truncateForReview(selfReviewResult.review.stdout || selfReviewResult.review.stderr || "(no output)", REVIEW_OUTPUT_BUDGET)}`
+    : "";
+  return `Peer review outputs:\n${peerOutput}${selfReviewSection}`;
+}
 
 export const ADVERSARIAL_REVIEW_PROMPT = `You are performing an adversarial software review.
 
@@ -85,32 +150,123 @@ Review stance:
 export { normalizeHost, peerFor };
 
 export function buildReviewCommand(reviewer: AssistantHost): string[] {
-  return getAssistantAdapter(reviewer).command.map((part) => part === "{system_prompt}" ? REVIEWER_SYSTEM_PROMPT : part);
+  const command = getAssistantAdapter(reviewer).command.map((part) => part === "{system_prompt}" ? REVIEWER_SYSTEM_PROMPT : part);
+  if (reviewer !== "claude") return command;
+
+  const serenaCommand = parseSerenaCommand(process.env.CODE_ASSISTANT_PEERS_SERENA_COMMAND);
+  if (!serenaCommand) return command;
+
+  const mcpConfig = JSON.stringify({
+    mcpServers: {
+      serena: {
+        command: serenaCommand.command,
+        args: serenaCommand.args,
+      },
+    },
+  });
+  const insertAt = command.indexOf("--system-prompt");
+  const mcpConfigIndex = insertAt === -1 ? command.length : insertAt;
+  return [...command.slice(0, mcpConfigIndex), "--strict-mcp-config", "--mcp-config", mcpConfig, ...command.slice(mcpConfigIndex)];
+}
+
+export function buildSerenaReviewerGuidance(
+  reviewer: AssistantHost,
+  changedFiles: string[],
+  diffWasTruncated: boolean,
+): string {
+  if (reviewer !== "claude" || !process.env.CODE_ASSISTANT_PEERS_SERENA_COMMAND?.trim()) return "";
+
+  const sourceFiles = changedFiles.filter(isLikelyReviewerSourceFile).slice(0, 8);
+  if (sourceFiles.length === 0) return "";
+
+  const trigger = diffWasTruncated
+    ? "- The included diff is truncated, so use Serena before making final findings about omitted or surrounding code."
+    : "- Use Serena when the diff alone is not enough to understand symbol boundaries, references, implementations, or diagnostics.";
+
+  return [
+    "Serena reviewer tools:",
+    "- Read-only Serena MCP tools are mounted for this Claude reviewer subprocess.",
+    trigger,
+    "- Start with `mcp__serena__get_symbols_overview` on changed source files, then use `mcp__serena__find_symbol`, `mcp__serena__find_referencing_symbols`, `mcp__serena__find_implementations`, and `mcp__serena__get_diagnostics_for_file` only when they can validate a concrete review concern.",
+    "- Do not call Serena write/edit/onboarding/project-activation tools.",
+    "Changed source files to consider:",
+    sourceFiles.map((file) => `- ${file}`).join("\n"),
+  ].join("\n");
+}
+
+export async function prepareReviewPromptSnapshot(
+  task: PeerTask,
+  options: ReviewRequestOptions = {},
+  seed?: ReviewPromptSnapshotSeed,
+): Promise<ReviewPromptSnapshot> {
+  const [currentStatus, reviewContext] = seed
+    ? [seed.currentStatus, seed.reviewContext]
+    : await Promise.all([
+      getStatusEntries(task.cwd),
+      getReviewDiff(task.cwd, {
+        scope: options.scope,
+        base: options.base,
+        baselineWorkspaceSnapshot: task.baseline_workspace_snapshot
+          ?? (task.git_root === null
+            ? emptyWorkspaceSnapshot("No pre-edit baseline snapshot was captured; current non-git files are reported as added for review.")
+            : null),
+      }),
+    ]);
+  const warning = buildDirtyBaselineWarning(task.baseline_status, currentStatus);
+  const [semanticContext, previousReviewMemory] = await Promise.all([
+    buildSemanticContext(task.cwd, reviewContext.changedFiles, options.semantic_context, {
+      diffLength: reviewContext.diff.length,
+      diffBudget: REVIEW_DIFF_BUDGET,
+    }),
+    buildPreviousReviewMemory(task.id),
+  ]);
+
+  return {
+    currentStatus,
+    reviewContext,
+    semanticContext,
+    warning,
+    previousReviewMemory,
+    diffWasTruncated: reviewContext.diff.trim().length > REVIEW_DIFF_BUDGET,
+  };
 }
 
 export async function buildReviewPrompt(
   task: PeerTask,
   options: ReviewRequestOptions = {},
 ): Promise<{ prompt: string; warning?: string }> {
-  const mode = options.mode ?? "normal";
-  const workflow = options.workflow ?? "review_only";
-  const currentStatus = await getStatusEntries(task.cwd);
-  const reviewContext = await getReviewDiff(task.cwd, {
-    scope: options.scope,
-    base: options.base,
-  });
-  const focus = normalizeReviewFocus(options.focus ?? process.env.CODE_ASSISTANT_PEERS_REVIEW_FOCUS);
-  const diff = truncateForReview(reviewContext.diff, REVIEW_DIFF_BUDGET);
-  const warning = buildDirtyBaselineWarning(task.baseline_status, currentStatus);
-  const modePrompt = mode === "adversarial"
-    ? ADVERSARIAL_REVIEW_PROMPT
-    : mode === "collaborative"
-      ? `${ADVERSARIAL_REVIEW_PROMPT}\n\n${COLLABORATIVE_REVIEW_PROMPT}`
-    : mode === "gate"
-      ? GATE_REVIEW_PROMPT
-      : REVIEWER_SYSTEM_PROMPT;
-  const workflowPrompt = workflow === "peer_fix" ? `\n\n${PEER_FIX_PROMPT}` : "";
+  const snapshot = await prepareReviewPromptSnapshot(task, options);
+  return buildReviewPromptFromSnapshot(task, options, snapshot);
+}
 
+export function buildReviewPromptFromSnapshot(
+  task: PeerTask,
+  options: ReviewRequestOptions,
+  snapshot: ReviewPromptSnapshot,
+): { prompt: string; warning?: string } {
+  const mode = options.mode ?? "normal";
+  const selfReview = options.self_review ?? false;
+  const workflow = selfReview ? "review_only" : options.workflow ?? "review_only";
+  if (selfReview && (mode === "gate" || mode === "collaborative")) {
+    throw new Error("Codex self-review is only supported for normal and adversarial review modes");
+  }
+  const focus = normalizeReviewFocus(options.focus ?? process.env.CODE_ASSISTANT_PEERS_REVIEW_FOCUS);
+  const reviewContext = snapshot.reviewContext;
+  const serenaReviewerGuidance = buildSerenaReviewerGuidance(task.peer, reviewContext.changedFiles, snapshot.diffWasTruncated);
+  const diff = truncateForReview(reviewContext.diff, REVIEW_DIFF_BUDGET);
+  const warning = [snapshot.warning, reviewContext.warning].filter(Boolean).join("\n") || undefined;
+  const modePrompt = selfReview
+    ? mode === "adversarial"
+      ? `${SELF_REVIEW_PROMPT}\n\n${ADVERSARIAL_REVIEW_PROMPT}`
+      : SELF_REVIEW_PROMPT
+    : mode === "adversarial"
+      ? ADVERSARIAL_REVIEW_PROMPT
+      : mode === "collaborative"
+        ? `${ADVERSARIAL_REVIEW_PROMPT}\n\n${COLLABORATIVE_REVIEW_PROMPT}`
+        : mode === "gate"
+          ? GATE_REVIEW_PROMPT
+          : REVIEWER_SYSTEM_PROMPT;
+  const workflowPrompt = workflow === "peer_fix" ? `\n\n${PEER_FIX_PROMPT}` : "";
   const outputGuidelines = mode === "gate" ? "" : `\n\n${REVIEW_OUTPUT_GUIDELINES}`;
 
   const prompt = `${modePrompt}
@@ -124,6 +280,7 @@ Original user request:
 ${task.prompt}
 
 Review mode: ${mode}
+${selfReview ? "Review perspective: self-review\n" : ""}
 Workflow: ${workflow}
 Review target: ${reviewContext.label}
 ${options.change_summary ? `Host change summary:\n${options.change_summary}\n` : ""}
@@ -137,20 +294,25 @@ Review scope:
 - If review mode is collaborative, produce the peer-side skeptical review first. A host-side comparison pass will run after this.
 - You are running in the repository cwd and may inspect files directly when the included diff is insufficient.
 - Use the included status and diff as a starting point, not as a complete substitute for reading relevant surrounding code.
-- If MCP tools are available, call get_peer_task_context and get_open_findings for this task id before finalizing the review.
-- If MCP tools are available, call record_peer_review before your final response to persist a concise summary and structured findings.
+- Reviewer CLI processes are launched as separate subprocesses and do not inherit the host assistant's active MCP tool session. Do not call code-assistant-peers MCP tools from inside this reviewer subprocess.
+- Treat any Semantic context section as advisory impact context. It may include host-collected Serena-derived symbols, references, implementations, or diagnostics, but it may also be absent or partial. Use the git status, diff, and repository reads as the source of truth.
+- If read-only Serena MCP tools are explicitly mounted in this reviewer subprocess, you may use them to inspect symbols, references, implementations, and diagnostics.
 
-${warning || reviewContext.warning ? `Important warning:\n${[warning, reviewContext.warning].filter(Boolean).join("\n")}\n\n` : ""}Baseline git status when task began:
+${warning ? `Important warning:\n${warning}\n\n` : ""}Baseline git status when task began:
 ${formatStatus(task.baseline_status)}
 
 Current git status:
-${formatStatus(currentStatus)}
+${formatStatus(snapshot.currentStatus)}
 
 Changed files:
 ${reviewContext.changedFiles.length ? reviewContext.changedFiles.join("\n") : "(none detected)"}
 
+${serenaReviewerGuidance ? `${serenaReviewerGuidance}\n\n` : ""}
+Semantic context:
+${snapshot.semanticContext || "(semantic context provider disabled or no source symbols detected)"}
+
 Previous review memory:
-${await buildPreviousReviewMemory(task.id)}
+${snapshot.previousReviewMemory}
 
 Included uncommitted diff for review:
 ${diff || "(no uncommitted diff detected)"}
@@ -224,6 +386,10 @@ function buildDirtyBaselineWarning(baseline: GitStatusEntry[], current: GitStatu
   return "The working tree already had uncommitted changes when this task began. Treat baseline paths as pre-existing unless the diff clearly shows new task-related edits.";
 }
 
+function isLikelyReviewerSourceFile(file: string): boolean {
+  return /\.(cjs|cts|js|jsx|mjs|mts|ts|tsx)$/.test(file);
+}
+
 export async function runReviewCommand(
   reviewer: AssistantHost,
   cwd: string,
@@ -231,31 +397,97 @@ export async function runReviewCommand(
 ): Promise<{ exitCode: number | null; stdout: string; stderr: string; command: string[] }> {
   const command = buildReviewCommand(reviewer);
   const adapter = getAssistantAdapter(reviewer);
-  if (adapter.prompt_transport === "argv" && prompt.length > ARGV_PROMPT_BUDGET) {
-    throw new Error(
-      `Review prompt is ${prompt.length} characters, which exceeds CODE_ASSISTANT_PEERS_ARGV_PROMPT_BUDGET=${ARGV_PROMPT_BUDGET} for argv transport. Use stdin transport for large review prompts or lower CODE_ASSISTANT_PEERS_DIFF_BUDGET.`,
-    );
+  const recordedCommand = adapter.prompt_transport === "argv" ? [...command, "<prompt>"] : command;
+  const env = buildReviewCommandEnv(adapter);
+  const argvPromptBytes = byteLength(prompt);
+  if (adapter.prompt_transport === "argv" && argvPromptBytes > ARGV_PROMPT_BUDGET) {
+    return {
+      exitCode: 1,
+      stdout: "",
+      stderr: `Review prompt is ${argvPromptBytes} bytes, which exceeds CODE_ASSISTANT_PEERS_ARGV_PROMPT_BUDGET=${ARGV_PROMPT_BUDGET} for argv transport. Use stdin transport for large review prompts or lower CODE_ASSISTANT_PEERS_DIFF_BUDGET.`,
+      command: recordedCommand,
+    };
   }
   const finalCommand = adapter.prompt_transport === "argv" ? [...command, prompt] : command;
-  const recordedCommand = adapter.prompt_transport === "argv" ? [...command, "<prompt>"] : command;
-  const proc = Bun.spawn(finalCommand, {
-    cwd,
-    stdin: adapter.prompt_transport === "stdin" ? "pipe" : "ignore",
-    stdout: "pipe",
-    stderr: "pipe",
-    env: process.env,
-  });
+  const timeoutMs = resolveReviewCommandTimeoutMs(adapter);
+  let proc: any;
+  try {
+    proc = Bun.spawn(finalCommand, {
+      cwd,
+      stdin: adapter.prompt_transport === "stdin" ? "pipe" : "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+      env,
+    });
+  } catch (error) {
+    return {
+      exitCode: 1,
+      stdout: "",
+      stderr: `Review command failed to start: ${error instanceof Error ? error.message : String(error)}`,
+      command: recordedCommand,
+    };
+  }
 
   if (adapter.prompt_transport === "stdin") {
     proc.stdin?.write(prompt);
     proc.stdin?.end();
   }
 
-  const [stdout, stderr, exitCode] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
+  let timedOut = false;
+  let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
+  const timeoutTimer = setTimeout(() => {
+    timedOut = true;
+    proc.kill("SIGTERM");
+    forceKillTimer = setTimeout(() => proc.kill("SIGKILL"), 5000);
+  }, timeoutMs);
 
-  return { exitCode, stdout, stderr, command: recordedCommand };
+  try {
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+
+    if (!timedOut) return { exitCode, stdout, stderr, command: recordedCommand };
+
+    const timeoutMessage = `Review command timed out after ${timeoutMs}ms and was terminated. Set CODE_ASSISTANT_PEERS_REVIEW_TIMEOUT_MS to adjust this limit.`;
+    return {
+      exitCode: 1,
+      stdout,
+      stderr: stderr.trim() ? `${stderr.trim()}\n\n${timeoutMessage}` : timeoutMessage,
+      command: recordedCommand,
+    };
+  } finally {
+    clearTimeout(timeoutTimer);
+    if (forceKillTimer) clearTimeout(forceKillTimer);
+  }
+}
+
+function resolveReviewCommandTimeoutMs(adapter: AssistantAdapter): number {
+  const configured = parsePositiveInteger(process.env.CODE_ASSISTANT_PEERS_REVIEW_TIMEOUT_MS);
+  return configured ?? adapter.timeout_ms ?? DEFAULT_REVIEW_COMMAND_TIMEOUT_MS;
+}
+
+function parsePositiveInteger(value: string | undefined): number | undefined {
+  if (!value?.trim()) return undefined;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return undefined;
+  return Math.floor(parsed);
+}
+
+export function buildReviewCommandEnv(adapter: AssistantAdapter, sourceEnv: NodeJS.ProcessEnv = process.env): Record<string, string> {
+  if (sourceEnv.CODE_ASSISTANT_PEERS_PASS_FULL_ENV === "1") {
+    return Object.fromEntries(Object.entries(sourceEnv).filter((entry): entry is [string, string] => entry[1] !== undefined));
+  }
+  const allowlist = adapter.env_allowlist ?? DEFAULT_REVIEW_ENV_ALLOWLIST;
+  const result: Record<string, string> = {};
+  for (const key of allowlist) {
+    const value = sourceEnv[key];
+    if (value !== undefined) result[key] = value;
+  }
+  return result;
+}
+
+function byteLength(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
 }
