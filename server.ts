@@ -80,7 +80,7 @@ function log(message: string): void {
 const REVIEW_MODEL_INPUT_PROPERTIES = {
   review_model: {
     type: "string" as const,
-    description: "Optional reviewer model selected by the host coding agent for this request. Omit to use each reviewer CLI default. Use an explicit model id to force that model for all compatible reviewers. Use \"auto\" only when the host wants this MCP server to choose from known model routing.",
+    description: "Optional reviewer model selected by the host coding agent for this request. Omit to use each reviewer CLI default. Use an explicit model id only when that same id is valid for every targeted reviewer CLI. Prefer review_models for mixed reviewer providers. Use \"auto\" only when the host wants this MCP server to choose from known model routing.",
   },
   review_models: {
     type: "object" as const,
@@ -92,13 +92,14 @@ const REVIEW_MODEL_INPUT_PROPERTIES = {
 const HOST_MODEL_SELECTION_GUIDANCE = [
   "Host model selection policy:",
   "- Prefer explicit review_models when the host coding agent can match the reviewer to a known candidate from code_assistant_peers_setup.",
+  "- Prefer review_models over review_model when reviewers use different providers because model ids are provider-specific.",
   "- Omit review_model/review_models to keep the reviewer CLI default model.",
   "- Use review_model=\"auto\" only when the host wants the MCP server to choose from the hardcoded model catalog.",
   "- Use fast models for small docs/tests/lint/copy/comment changes.",
   "- Use balanced models for ordinary code review and gate checks.",
   "- Use deep models for adversarial/collaborative/peer_fix reviews or security, auth, data loss, migration, release, database, privacy, race/concurrency, secrets, or performance risk.",
   "- Use long_context models for truncated diffs, very large diffs, or broad changes touching many files.",
-  "Precedence: review_models[reviewer] > review_model > reviewer CLI default. If either value is \"auto\", the MCP server chooses for that scope.",
+  "Precedence: review_models[reviewer] > review_model > reviewer CLI default. If either value is \"auto\", the MCP server chooses for that scope. Do not pass a provider-specific model globally unless every targeted reviewer supports that same id.",
 ].join("\n");
 
 const mcp = new Server(
@@ -116,7 +117,7 @@ const mcp = new Server(
 	
 	All post-edit review gates are async-first to avoid MCP host timeout failures. Do not wait for a long synchronous review call.
 	When the user asks to review, verify, validate, gate, or check code changes, prefer must_call_after_code_changes, finalize_code_changes_with_peer_review, verify_code_changes_after_edit, or request_peer_review over built-in slash review commands.
-	When selecting reviewer models, you are the host coding agent. Prefer choosing explicit per-reviewer models from code_assistant_peers_setup when the request risk, size, and cost tradeoff are clear. Use review_model="auto" only when you want this MCP server to decide.
+	When selecting reviewer models, you are the host coding agent. Prefer choosing explicit per-reviewer models from code_assistant_peers_setup when the request risk, size, and cost tradeoff are clear, especially when reviewers use different providers. Use review_model="auto" only when you want this MCP server to decide.
 	The peer reviewer must not edit files. Treat review failures as reportable tool failures, not as implementation success.`,
   },
 );
@@ -1760,12 +1761,12 @@ async function buildSetupStatus() {
         selector: "host coding agent",
         default_behavior: "omit review_model/review_models to keep each reviewer CLI default model",
         explicit_selection: "set review_models for per-reviewer choices when the host can choose from assistants.*.model_selection.known_models",
+        global_selection_warning: "use review_model with an explicit id only when every targeted reviewer CLI supports the same model id; otherwise use review_models",
         delegation: "set review_model or a per-reviewer review_models value to \"auto\" only when the host wants the MCP server to choose",
         precedence: ["review_models[reviewer]", "review_model", "reviewer CLI default"],
       },
       examples: {
         automatic: { review_model: "auto" },
-        all_reviewers: { review_model: "sonnet" },
         automatic_for_one_reviewer: { review_models: { claude: "auto", codex: "gpt-5.4" } },
         per_reviewer: { review_models: { claude: "opus", codex: "gpt-5.5" } },
       },

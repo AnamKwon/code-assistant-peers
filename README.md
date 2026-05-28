@@ -331,6 +331,8 @@ review_models[reviewer] > review_model > reviewer CLI default
 
 If neither `review_model` nor `review_models` is provided, the reviewer CLI default model is used.
 
+Use `review_model` with an explicit model id only when that same id is valid for every targeted reviewer CLI. In mixed-provider review, prefer `review_models` because model ids are provider-specific.
+
 Pick explicit per-reviewer models when the host can make a clear cost/quality tradeoff:
 
 ```json

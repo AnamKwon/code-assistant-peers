@@ -27,6 +27,9 @@ describe("server tool descriptions", () => {
     expect(source).toContain("review_models[reviewer]");
     expect(source).toContain("Use review_model=\\\"auto\\\" only when the host wants the MCP server to choose");
     expect(source).toContain("review_models for per-reviewer choices");
+    expect(source).toContain("Prefer review_models over review_model when reviewers use different providers");
+    expect(source).toContain("global_selection_warning");
+    expect(source).not.toContain('all_reviewers: { review_model: "sonnet" }');
   });
 
   test("keeps installed project rules aligned with async-first review gates", async () => {

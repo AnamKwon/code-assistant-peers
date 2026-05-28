@@ -507,9 +507,9 @@ describe("review command construction", () => {
       "--skip-trust",
       "--approval-mode",
       "plan",
-      "-p",
       "--model",
       "flash",
+      "-p",
       "",
     ]);
   });

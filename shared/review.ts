@@ -191,6 +191,8 @@ function insertModelArg(command: string[], adapter: AssistantAdapter, model?: st
 function findModelArgInsertIndex(command: string[]): number {
   const systemPromptIndex = command.indexOf("--system-prompt");
   if (systemPromptIndex !== -1) return systemPromptIndex;
+  const promptFlagIndex = command.findIndex((part) => part === "-p" || part === "--prompt");
+  if (promptFlagIndex !== -1) return promptFlagIndex;
   const promptIndex = command.findIndex((part) => part === "-" || part === "");
   return promptIndex === -1 ? command.length : promptIndex;
 }
