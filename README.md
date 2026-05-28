@@ -275,7 +275,7 @@ Claude, Codex, and Gemini are built in:
 
 ```text
 claude -> claude -p --permission-mode plan ...
-codex  -> codex exec --sandbox read-only --skip-git-repo-check -
+codex  -> codex exec --ignore-user-config --ignore-rules --sandbox read-only --skip-git-repo-check -
 gemini -> gemini --skip-trust --approval-mode plan -p ""  # prompt over stdin
 ```
 
@@ -309,6 +309,43 @@ HOST_ASSISTANT=codex PEER_ASSISTANT=gemini code-assistant-peers-server
 
 If `PEER_ASSISTANT` is omitted, `claude` pairs with `codex`, `codex` pairs with `claude` and `gemini`, and custom hosts use the first other registered adapter.
 
+### Reviewer Model Selection
+
+`code_assistant_peers_setup` reports whether each configured assistant CLI supports model selection, the known model candidates, and whether live model probing was enabled. By default it performs no live model probes because those can spend tokens; set `CODE_ASSISTANT_PEERS_PROBE_MODELS=1` before starting the MCP server if you want setup to test known model candidates with small probe calls.
+
+Built-in model flags:
+
+```text
+claude -> --model <model>  # known candidates: haiku, sonnet, opus
+codex  -> -m <model>
+gemini -> --model <model>
+```
+
+Pick one model for a review request:
+
+```json
+{
+  "task_id": "...",
+  "review_model": "sonnet"
+}
+```
+
+Or pick models per reviewer:
+
+```json
+{
+  "task_id": "...",
+  "review_models": {
+    "claude": "opus",
+    "codex": "o3"
+  }
+}
+```
+
+The selected model is included in the recorded reviewer command. If a custom adapter should support model selection, add `model_arg` and optional `models` metadata to its `CODE_ASSISTANT_PEERS_ASSISTANTS` entry.
+
+Reviewer subprocesses are started with a recursion guard. Claude reviewers run with a strict MCP config that only exposes the optional read-only Serena server, Codex reviewers ignore user config and local rules, and all reviewer subprocesses receive `CODE_ASSISTANT_PEERS_REVIEWER_SUBPROCESS=1` so this MCP server refuses to start recursively inside a reviewer.
+
 For multi-peer review, set `PEER_ASSISTANTS` to a comma-separated list. When this variable is present, it takes precedence over `PEER_ASSISTANT`. The server removes the host from the list, checks which peer CLIs are available, sends reviews to the available peers, and stores one review round per reviewer plus a final aggregate round.
 
 ```bash
@@ -322,6 +359,22 @@ Multi-peer outcomes:
 - `review_failed`: no peer review succeeded, or the aggregate pass failed.
 
 Custom adapters cannot override built-in ids (`claude`, `codex`, or `gemini`). For backwards compatibility, a legacy custom `gemini` entry is ignored and the safer built-in Gemini adapter is used. Use a distinct id such as `gemini-custom` when experimenting with a different command.
+
+Custom adapter model metadata example:
+
+```bash
+export CODE_ASSISTANT_PEERS_ASSISTANTS='{
+  "my-reviewer": {
+    "command": ["my-reviewer", "review"],
+    "prompt_transport": "stdin",
+    "model_arg": "--model",
+    "models": [
+      { "id": "fast", "quality": "medium", "cost": "low", "latency": "low" },
+      { "id": "deep", "quality": "high", "cost": "high", "latency": "high" }
+    ]
+  }
+}'
+```
 
 Prefer `stdin` transport for code review CLIs when possible. Review prompts can include large diffs and sensitive source context. The built-in Gemini adapter uses `-p ""` plus stdin because Gemini appends stdin to the prompt flag. `argv` transport is still available for custom CLIs, but it is subject to process-list exposure and operating-system argument length limits. The server refuses argv prompts above `CODE_ASSISTANT_PEERS_ARGV_PROMPT_BUDGET` to fail with a clear error instead of an opaque process spawn failure.
 
@@ -617,6 +670,8 @@ CODE_ASSISTANT_PEERS_HOME=/path/to/store
 | `PEER_ASSISTANT` | inferred | Assistant id for the reviewer. Required for explicit custom pairings. |
 | `PEER_ASSISTANTS` | unset | Comma-separated reviewer ids for multi-peer review. Takes precedence over `PEER_ASSISTANT`. |
 | `CODE_ASSISTANT_PEERS_ASSISTANTS` | built-ins only | JSON object defining custom CLI assistant adapters. |
+| `CODE_ASSISTANT_PEERS_PROBE_MODELS` | unset | Set `1` to make `code_assistant_peers_setup` run small live probes for known model candidates. |
+| `CODE_ASSISTANT_PEERS_MODEL_PROBE_TIMEOUT_MS` | `30000` | Timeout for each live model probe when `CODE_ASSISTANT_PEERS_PROBE_MODELS=1`. |
 | `CODE_ASSISTANT_PEERS_WORKFLOW` | `review_only` | `review_only` or `peer_fix`. |
 | `CODE_ASSISTANT_PEERS_REVIEW_MODE` | `normal` | `normal`, `adversarial`, `gate`, or `collaborative`. |
 | `CODE_ASSISTANT_PEERS_REVIEW_FOCUS` | unset | Optional default review focus, such as security, data loss, migration risk, UI regressions, or performance. |

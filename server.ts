@@ -10,12 +10,15 @@ import { formatStatus, getGitRoot, getReviewDiff, getStatusEntries, getUncommitt
 import { captureWorkspaceSnapshot, emptyWorkspaceSnapshot } from "./shared/workspace-snapshot.ts";
 import {
   COLLABORATIVE_REVIEW_PROMPT,
+  buildReviewCommand,
+  buildReviewCommandEnv,
   buildReviewPromptFromSnapshot,
   formatMultiPeerReviewOutputs,
   normalizeHost,
   normalizeReviewFocus,
   peerFor,
   prepareReviewPromptSnapshot,
+  resolveReviewerModel,
   runReviewCommand,
   truncateForReview,
   type ReviewPromptSnapshotSeed,
@@ -37,6 +40,11 @@ import { getAssistantAdapter, getGeminiAuthReadiness, loadAssistantRegistry, pee
 import { areConfiguredAssistantsReady, resolveMultiPeerTaskStatus, shouldRunCodexSelfReview, summarizeMultiPeerAvailability } from "./shared/multi-peer.ts";
 import type { AssistantHost, NewPeerReviewFinding, PeerReviewResult, PeerTask, PeerWorkflow, ReviewMode, ReviewRequestOptions, ReviewScope } from "./shared/types.ts";
 
+if (process.env.CODE_ASSISTANT_PEERS_REVIEWER_SUBPROCESS === "1") {
+  console.error("Refusing to start code-assistant-peers inside a reviewer subprocess to avoid recursive peer-review MCP calls.");
+  process.exit(2);
+}
+
 const assistantRegistry = loadAssistantRegistry();
 const host = normalizeHost(process.env.HOST_ASSISTANT, assistantRegistry);
 const peers = peersFor(host, process.env.PEER_ASSISTANTS, process.env.PEER_ASSISTANT, assistantRegistry);
@@ -46,6 +54,7 @@ const INCLUDE_SUCCESS_STDERR = process.env.CODE_ASSISTANT_PEERS_INCLUDE_SUCCESS_
 const DEFAULT_WORKFLOW = normalizeWorkflow(process.env.CODE_ASSISTANT_PEERS_WORKFLOW);
 const DEFAULT_REVIEW_MODE = normalizeDefaultReviewMode(process.env.CODE_ASSISTANT_PEERS_REVIEW_MODE);
 const STALE_REVIEW_RECOVERY_MS = parsePositiveInteger(process.env.CODE_ASSISTANT_PEERS_STALE_REVIEW_MS) ?? defaultStaleReviewRecoveryMs();
+const MODEL_PROBE_TIMEOUT_MS = parsePositiveInteger(process.env.CODE_ASSISTANT_PEERS_MODEL_PROBE_TIMEOUT_MS) ?? 30000;
 
 type ReviewRoundOutcome = {
   reviewer: AssistantHost;
@@ -66,6 +75,18 @@ const activeAsyncReviews = new Set<string>();
 function log(message: string): void {
   console.error(`[code-assistant-peers] ${message}`);
 }
+
+const REVIEW_MODEL_INPUT_PROPERTIES = {
+  review_model: {
+    type: "string" as const,
+    description: "Optional model name to use for all compatible reviewer CLIs in this review request, such as sonnet, opus, haiku, or a provider-specific full model id.",
+  },
+  review_models: {
+    type: "object" as const,
+    additionalProperties: { type: "string" as const },
+    description: "Optional per-reviewer model mapping, such as {\"claude\":\"sonnet\",\"codex\":\"o3\"}. Overrides review_model for matching reviewers.",
+  },
+};
 
 const mcp = new Server(
   { name: "code-assistant-peers", version: "0.2.0-alpha.0" },
@@ -147,6 +168,7 @@ const TOOLS = [
           enum: ["review_only", "peer_fix"],
           description: "review_only only reviews. peer_fix asks the peer for concrete fix proposals, but still forbids direct file edits.",
         },
+        ...REVIEW_MODEL_INPUT_PROPERTIES,
       },
       required: ["task_id"],
     },
@@ -196,6 +218,7 @@ const TOOLS = [
           type: "string" as const,
           enum: ["review_only", "peer_fix"],
         },
+        ...REVIEW_MODEL_INPUT_PROPERTIES,
       },
     },
   },
@@ -244,6 +267,7 @@ const TOOLS = [
           type: "string" as const,
           enum: ["review_only", "peer_fix"],
         },
+        ...REVIEW_MODEL_INPUT_PROPERTIES,
       },
     },
   },
@@ -292,6 +316,7 @@ const TOOLS = [
           type: "string" as const,
           enum: ["review_only", "peer_fix"],
         },
+        ...REVIEW_MODEL_INPUT_PROPERTIES,
       },
     },
   },
@@ -340,6 +365,7 @@ const TOOLS = [
           type: "string" as const,
           enum: ["review_only", "peer_fix"],
         },
+        ...REVIEW_MODEL_INPUT_PROPERTIES,
       },
     },
   },
@@ -743,6 +769,8 @@ function buildReviewRequestSignatureFromState(
     focus: normalizeReviewFocus(options.focus ?? process.env.CODE_ASSISTANT_PEERS_REVIEW_FOCUS),
     semantic_context: options.semantic_context ?? null,
     self_review: options.self_review ?? false,
+    review_model: options.review_model ?? null,
+    review_models: options.review_models ?? {},
     git_status: reviewState.statusEntries,
     git_diff: reviewState.diff,
   };
@@ -1162,7 +1190,7 @@ async function runPeerReviewTool(
   const promptSnapshot = await prepareReviewPromptSnapshot(task, options, promptSnapshotSeed);
   const startedAt = new Date().toISOString();
   const { prompt, warning } = buildReviewPromptFromSnapshot(task, options, promptSnapshot);
-  const result = await runReviewCommand(task.peer, task.cwd, prompt);
+  const result = await runReviewCommand(task.peer, task.cwd, prompt, resolveReviewerModel(task.peer, options));
   const completedAt = new Date().toISOString();
 
   const commitResult = await withReviewCommitLock(task.id, expectedSignature, async (current) => {
@@ -1321,7 +1349,7 @@ async function runMultiPeerReviewTool(
   const aggregatePromptResult = await buildMultiPeerAggregatePrompt(task, options, peerResults, skippedPeers, selfReviewResult, snapshot);
   const aggregatePrompt = aggregatePromptResult.prompt;
   const aggregateStartedAt = new Date().toISOString();
-  const aggregateResult = await runReviewCommand(task.host, task.cwd, aggregatePrompt);
+  const aggregateResult = await runReviewCommand(task.host, task.cwd, aggregatePrompt, resolveReviewerModel(task.host, options));
   const aggregateCompletedAt = new Date().toISOString();
   const aggregateWarning = [aggregatePromptResult.warning, selfReviewFailureWarning].filter(Boolean).join("\n") || undefined;
   const aggregateReview: PeerReviewResult = {
@@ -1388,7 +1416,7 @@ async function runSinglePeerRound(
   const startedAt = new Date().toISOString();
   const snapshot = promptSnapshot ?? await prepareReviewPromptSnapshot(task, options);
   const { prompt, warning } = buildReviewPromptFromSnapshot(roundTask, options, snapshot);
-  const result = await runReviewCommand(reviewer, task.cwd, prompt);
+  const result = await runReviewCommand(reviewer, task.cwd, prompt, resolveReviewerModel(reviewer, options));
   const completedAt = new Date().toISOString();
   const review: PeerReviewResult = {
     reviewer,
@@ -1421,7 +1449,7 @@ async function runCollaborativeReviewTool(
     ...options,
     mode: "collaborative",
   }, promptSnapshot);
-  const peerResult = await runReviewCommand(task.peer, task.cwd, peerPromptResult.prompt);
+  const peerResult = await runReviewCommand(task.peer, task.cwd, peerPromptResult.prompt, resolveReviewerModel(task.peer, options));
   const peerCompletedAt = new Date().toISOString();
   const peerReview = {
     reviewer: task.peer,
@@ -1466,7 +1494,7 @@ async function runCollaborativeReviewTool(
 
   const hostPrompt = buildHostComparisonPrompt(task, options, peerReview.stdout || peerReview.stderr, promptSnapshot);
   const hostStartedAt = new Date().toISOString();
-  const hostResult = await runReviewCommand(task.host, task.cwd, hostPrompt);
+  const hostResult = await runReviewCommand(task.host, task.cwd, hostPrompt, resolveReviewerModel(task.host, options));
   const hostCompletedAt = new Date().toISOString();
   const hostReview = {
     reviewer: task.host,
@@ -1612,7 +1640,38 @@ function parseReviewOptions(args: unknown): ReviewRequestOptions {
     semantic_context: obj.semantic_context === undefined || obj.semantic_context === null
       ? null
       : String(obj.semantic_context),
+    review_model: normalizeReviewModel(obj.review_model),
+    review_models: normalizeReviewModels(obj.review_models),
   };
+}
+
+function normalizeReviewModel(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  const model = String(value).trim();
+  if (!model) return null;
+  if (!/^[A-Za-z0-9._:-]+$/.test(model)) {
+    throw new Error("review_model may contain only letters, numbers, dot, underscore, hyphen, and colon.");
+  }
+  return model;
+}
+
+function normalizeReviewModels(value: unknown): Record<string, string> | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("review_models must be an object mapping assistant id to model.");
+  }
+  const result: Record<string, string> = {};
+  for (const [assistant, rawModel] of Object.entries(value as Record<string, unknown>)) {
+    const id = String(assistant).trim().toLowerCase();
+    const model = normalizeReviewModel(rawModel);
+    if (!id || !model) continue;
+    if (!assistantRegistry[id]) {
+      const available = Object.keys(assistantRegistry).sort().join(", ");
+      throw new Error(`review_models contains unknown assistant '${assistant}'. Available assistants: ${available}`);
+    }
+    result[id] = model;
+  }
+  return Object.keys(result).length ? result : undefined;
 }
 
 function parseReviewMode(value: unknown): ReviewMode | undefined {
@@ -1640,6 +1699,7 @@ async function buildSetupStatus() {
     return [adapter.id, {
       ...adapter,
       available: await isAssistantAvailable(adapter.id),
+      model_selection: await getAssistantModelSelectionStatus(adapter.id),
       command_preview: adapter.command,
     }];
   })));
@@ -1655,12 +1715,150 @@ async function buildSetupStatus() {
       available_tool: "must_call_after_code_changes",
       note: "MCP cannot technically force every final response through review, but this required post-edit tool is exposed with strong schema and starts or reuses async peer review jobs.",
     },
+    model_routing: {
+      request_options: ["review_model", "review_models"],
+      examples: {
+        all_reviewers: { review_model: "sonnet" },
+        per_reviewer: { review_models: { claude: "opus", codex: "o3" } },
+      },
+      probe_note: "Known model candidates are listed at setup. Set CODE_ASSISTANT_PEERS_PROBE_MODELS=1 before starting the MCP server to verify candidate model access with live probe calls.",
+    },
     next_steps: [
       assistants[host]?.available.ok ? null : `Install or fix host assistant CLI: ${host}.`,
       ...peers.map((reviewer) => assistants[reviewer]?.available.ok ? null : `Install or fix peer assistant CLI: ${reviewer}.`),
       "Use must_call_after_code_changes after edits, then call wait_for_peer_review until the task reaches a terminal state.",
     ].filter(Boolean),
   };
+}
+
+async function getAssistantModelSelectionStatus(reviewer: AssistantHost) {
+  const adapter = getAssistantAdapter(reviewer, assistantRegistry);
+  const supportsModelOption = adapter.model_arg ? await assistantHelpMentionsArg(adapter, adapter.model_arg) : false;
+  const knownModels = adapter.models ?? [];
+  const probeModels = process.env.CODE_ASSISTANT_PEERS_PROBE_MODELS === "1";
+  const modelAvailability = probeModels && supportsModelOption && knownModels.length > 0
+    ? Object.fromEntries(await Promise.all(knownModels.map(async (model) => {
+      const result = await runModelProbeCommand(reviewer, model.id);
+      return [model.id, {
+        available: result.exitCode === 0,
+        detail: result.exitCode === 0
+          ? "probe succeeded"
+          : compactForToolResult(result.stderr || result.stdout || "probe failed", 500),
+      }];
+    })))
+    : null;
+
+  return {
+    supports_model_option: supportsModelOption,
+    model_arg: adapter.model_arg ?? null,
+    known_models: knownModels,
+    availability_checked: Boolean(modelAvailability),
+    availability: modelAvailability,
+  };
+}
+
+async function runModelProbeCommand(
+  reviewer: AssistantHost,
+  model: string,
+): Promise<{ exitCode: number | null; stdout: string; stderr: string }> {
+  const adapter = getAssistantAdapter(reviewer, assistantRegistry);
+  const command = buildReviewCommand(reviewer, model);
+  const prompt = "Reply with exactly OK.";
+  const finalCommand = adapter.prompt_transport === "argv" ? [...command, prompt] : command;
+  let proc: any;
+  try {
+    proc = Bun.spawn(finalCommand, {
+      cwd: process.cwd(),
+      stdin: adapter.prompt_transport === "stdin" ? "pipe" : "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+      env: buildReviewCommandEnv(adapter),
+    });
+  } catch (error) {
+    return {
+      exitCode: 1,
+      stdout: "",
+      stderr: `model probe failed to start: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+  if (adapter.prompt_transport === "stdin") {
+    proc.stdin?.write(prompt);
+    proc.stdin?.end();
+  }
+  let timedOut = false;
+  let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    proc.kill("SIGTERM");
+    forceKillTimer = setTimeout(() => proc.kill("SIGKILL"), 5000);
+  }, MODEL_PROBE_TIMEOUT_MS);
+  try {
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    return {
+      exitCode: timedOut ? 1 : exitCode,
+      stdout,
+      stderr: timedOut
+        ? [stderr.trim(), `model probe timed out after ${MODEL_PROBE_TIMEOUT_MS}ms`].filter(Boolean).join("\n\n")
+        : stderr,
+    };
+  } finally {
+    clearTimeout(timeout);
+    if (forceKillTimer) clearTimeout(forceKillTimer);
+  }
+}
+
+async function assistantHelpMentionsArg(adapter: ReturnType<typeof getAssistantAdapter>, arg: string): Promise<boolean> {
+  const helpCommand = buildAssistantHelpCommand(adapter);
+  if (!helpCommand) return false;
+  try {
+    const proc = Bun.spawn(helpCommand, {
+      stdout: "pipe",
+      stderr: "pipe",
+      env: buildMinimalHelpEnv(),
+    });
+    let timedOut = false;
+    let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
+    const timeoutTimer = setTimeout(() => {
+      timedOut = true;
+      proc.kill("SIGTERM");
+      forceKillTimer = setTimeout(() => proc.kill("SIGKILL"), 5000);
+    }, MODEL_PROBE_TIMEOUT_MS);
+    try {
+      const [stdout, stderr] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+        proc.exited,
+      ]);
+      return !timedOut && `${stdout}\n${stderr}`.includes(arg);
+    } finally {
+      clearTimeout(timeoutTimer);
+      if (forceKillTimer) clearTimeout(forceKillTimer);
+    }
+  } catch {
+    return false;
+  }
+}
+
+function buildAssistantHelpCommand(adapter: ReturnType<typeof getAssistantAdapter>): string[] | null {
+  const command = adapter.command.find((part) => part !== "{system_prompt}");
+  if (!command) return null;
+  if (adapter.id === "codex") return [command, "exec", "--help"];
+  return [command, "--help"];
+}
+
+function buildMinimalHelpEnv(): Record<string, string> {
+  return Object.fromEntries([
+    "PATH",
+    "HOME",
+    "USER",
+    "SHELL",
+    "TERM",
+    "TMPDIR",
+  ].map((key) => [key, process.env[key]]).filter((entry): entry is [string, string] => entry[1] !== undefined));
 }
 
 async function isAssistantAvailable(reviewer: AssistantHost): Promise<{ ok: boolean; detail: string }> {

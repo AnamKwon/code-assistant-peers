@@ -20,6 +20,7 @@ import {
   normalizeReviewFocus,
   peerFor,
   prepareReviewPromptSnapshot,
+  resolveReviewerModel,
   runReviewCommand,
   truncateForReview,
 } from "../shared/review.ts";
@@ -415,6 +416,8 @@ describe("review command construction", () => {
     expect(buildReviewCommand("codex")).toEqual([
       "codex",
       "exec",
+      "--ignore-user-config",
+      "--ignore-rules",
       "--sandbox",
       "read-only",
       "--skip-git-repo-check",
@@ -432,6 +435,9 @@ describe("review command construction", () => {
         "-p",
         "--permission-mode",
         "plan",
+        "--strict-mcp-config",
+        "--mcp-config",
+        '{"mcpServers":{}}',
         "--system-prompt",
         REVIEWER_SYSTEM_PROMPT,
         "--allowedTools",
@@ -470,6 +476,42 @@ describe("review command construction", () => {
       if (previous === undefined) delete process.env.CODE_ASSISTANT_PEERS_SERENA_COMMAND;
       else process.env.CODE_ASSISTANT_PEERS_SERENA_COMMAND = previous;
     }
+  });
+
+  test("review model selection inserts provider model arguments before prompt transport", () => {
+    expect(buildReviewCommand("claude", "sonnet").slice(0, 7)).toEqual([
+      "claude",
+      "-p",
+      "--permission-mode",
+      "plan",
+      "--model",
+      "sonnet",
+      "--strict-mcp-config",
+    ]);
+    expect(buildReviewCommand("codex", "o3")).toEqual([
+      "codex",
+      "exec",
+      "--ignore-user-config",
+      "--ignore-rules",
+      "--sandbox",
+      "read-only",
+      "--skip-git-repo-check",
+      "-m",
+      "o3",
+      "-",
+    ]);
+  });
+
+  test("review model resolution lets per-reviewer models override the global model", () => {
+    expect(resolveReviewerModel("claude", {
+      review_model: "sonnet",
+      review_models: { claude: "opus" },
+    })).toBe("opus");
+    expect(resolveReviewerModel("codex", {
+      review_model: "sonnet",
+      review_models: { claude: "opus" },
+    })).toBe("sonnet");
+    expect(resolveReviewerModel("gemini", {})).toBeNull();
   });
 
   test("Serena reviewer guidance gives Claude a read-only lookup path", () => {
@@ -568,6 +610,7 @@ describe("review command construction", () => {
     expect(env).toEqual({
       PATH: "/bin",
       SAFE_KEY: "kept",
+      CODE_ASSISTANT_PEERS_REVIEWER_SUBPROCESS: "1",
     });
   });
 
@@ -589,6 +632,7 @@ describe("review command construction", () => {
       OPENAI_API_KEY: "openai",
       GEMINI_API_KEY: "gemini",
       ANTHROPIC_API_KEY: "anthropic",
+      CODE_ASSISTANT_PEERS_REVIEWER_SUBPROCESS: "1",
     });
   });
 

@@ -4,9 +4,10 @@ import { homedir } from "node:os";
 export const BUILTIN_ASSISTANTS: Record<string, AssistantAdapter> = {
   codex: {
     id: "codex",
-    command: ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check", "-"],
+    command: ["codex", "exec", "--ignore-user-config", "--ignore-rules", "--sandbox", "read-only", "--skip-git-repo-check", "-"],
     prompt_transport: "stdin",
     description: "OpenAI Codex CLI in read-only exec mode.",
+    model_arg: "-m",
     env_allowlist: [
       "PATH",
       "HOME",
@@ -62,6 +63,12 @@ export const BUILTIN_ASSISTANTS: Record<string, AssistantAdapter> = {
     ],
     prompt_transport: "stdin",
     description: "Claude Code print mode with read-only review tools.",
+    model_arg: "--model",
+    models: [
+      { id: "haiku", quality: "medium", cost: "low", latency: "low", description: "Fast/cheap review for docs and small low-risk diffs." },
+      { id: "sonnet", quality: "high", cost: "medium", latency: "medium", description: "Balanced default review model." },
+      { id: "opus", quality: "highest", cost: "high", latency: "high", description: "Deep review for security, migrations, large diffs, and release gates." },
+    ],
     env_allowlist: [
       "PATH",
       "HOME",
@@ -80,6 +87,7 @@ export const BUILTIN_ASSISTANTS: Record<string, AssistantAdapter> = {
     prompt_transport: "stdin",
     description: "Gemini CLI headless review mode.",
     timeout_ms: 180000,
+    model_arg: "--model",
     env_allowlist: [
       "PATH",
       "HOME",
@@ -219,9 +227,39 @@ function parseCustomAssistants(value: string | undefined): Record<string, Assist
       description: config.description === undefined ? undefined : String(config.description),
       timeout_ms: parseOptionalTimeoutMs(id, config.timeout_ms),
       env_allowlist: parseOptionalEnvAllowlist(id, config.env_allowlist),
+      model_arg: config.model_arg === undefined ? undefined : String(config.model_arg),
+      models: parseOptionalModels(id, config.models),
     };
   }
   return result;
+}
+
+function parseOptionalModels(id: string, value: unknown) {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) {
+    throw new Error(`Assistant '${id}' models must be an array.`);
+  }
+  return value.map((item, index) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      throw new Error(`Assistant '${id}' model at index ${index} must be an object.`);
+    }
+    const config = item as Record<string, unknown>;
+    const modelId = typeof config.id === "string" ? config.id.trim() : "";
+    if (!modelId) throw new Error(`Assistant '${id}' model at index ${index} requires an id.`);
+    return {
+      id: modelId,
+      aliases: Array.isArray(config.aliases) ? config.aliases.map(String).filter(Boolean) : undefined,
+      quality: parseTier(config.quality, ["low", "medium", "high", "highest"]),
+      cost: parseTier(config.cost, ["low", "medium", "high"]),
+      latency: parseTier(config.latency, ["low", "medium", "high"]),
+      description: config.description === undefined ? undefined : String(config.description),
+    };
+  });
+}
+
+function parseTier<T extends string>(value: unknown, allowed: readonly T[]): T | undefined {
+  if (value === undefined) return undefined;
+  return allowed.includes(String(value) as T) ? String(value) as T : undefined;
 }
 
 function parseOptionalEnvAllowlist(id: string, value: unknown): string[] | undefined {

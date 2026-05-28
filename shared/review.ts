@@ -149,24 +149,40 @@ Review stance:
 
 export { normalizeHost, peerFor };
 
-export function buildReviewCommand(reviewer: AssistantHost): string[] {
-  const command = getAssistantAdapter(reviewer).command.map((part) => part === "{system_prompt}" ? REVIEWER_SYSTEM_PROMPT : part);
+export function buildReviewCommand(reviewer: AssistantHost, model?: string | null): string[] {
+  const adapter = getAssistantAdapter(reviewer);
+  let command = adapter.command.map((part) => part === "{system_prompt}" ? REVIEWER_SYSTEM_PROMPT : part);
+  command = insertModelArg(command, adapter, model);
   if (reviewer !== "claude") return command;
 
   const serenaCommand = parseSerenaCommand(process.env.CODE_ASSISTANT_PEERS_SERENA_COMMAND);
-  if (!serenaCommand) return command;
-
   const mcpConfig = JSON.stringify({
-    mcpServers: {
-      serena: {
-        command: serenaCommand.command,
-        args: serenaCommand.args,
-      },
-    },
+    mcpServers: serenaCommand
+      ? {
+        serena: {
+          command: serenaCommand.command,
+          args: serenaCommand.args,
+        },
+      }
+      : {},
   });
   const insertAt = command.indexOf("--system-prompt");
   const mcpConfigIndex = insertAt === -1 ? command.length : insertAt;
   return [...command.slice(0, mcpConfigIndex), "--strict-mcp-config", "--mcp-config", mcpConfig, ...command.slice(mcpConfigIndex)];
+}
+
+function insertModelArg(command: string[], adapter: AssistantAdapter, model?: string | null): string[] {
+  const normalized = model?.trim();
+  if (!normalized || !adapter.model_arg) return command;
+  const insertAt = findModelArgInsertIndex(command);
+  return [...command.slice(0, insertAt), adapter.model_arg, normalized, ...command.slice(insertAt)];
+}
+
+function findModelArgInsertIndex(command: string[]): number {
+  const systemPromptIndex = command.indexOf("--system-prompt");
+  if (systemPromptIndex !== -1) return systemPromptIndex;
+  const promptIndex = command.findIndex((part) => part === "-" || part === "");
+  return promptIndex === -1 ? command.length : promptIndex;
 }
 
 export function buildSerenaReviewerGuidance(
@@ -394,10 +410,19 @@ export async function runReviewCommand(
   reviewer: AssistantHost,
   cwd: string,
   prompt: string,
+  model?: string | null,
 ): Promise<{ exitCode: number | null; stdout: string; stderr: string; command: string[] }> {
-  const command = buildReviewCommand(reviewer);
+  const command = buildReviewCommand(reviewer, model);
   const adapter = getAssistantAdapter(reviewer);
   const recordedCommand = adapter.prompt_transport === "argv" ? [...command, "<prompt>"] : command;
+  if (model?.trim() && !adapter.model_arg) {
+    return {
+      exitCode: 1,
+      stdout: "",
+      stderr: `Reviewer '${reviewer}' does not declare a model_arg, so review_model cannot be applied to this adapter.`,
+      command: recordedCommand,
+    };
+  }
   const env = buildReviewCommandEnv(adapter);
   const argvPromptBytes = byteLength(prompt);
   if (adapter.prompt_transport === "argv" && argvPromptBytes > ARGV_PROMPT_BUDGET) {
@@ -477,7 +502,10 @@ function parsePositiveInteger(value: string | undefined): number | undefined {
 
 export function buildReviewCommandEnv(adapter: AssistantAdapter, sourceEnv: NodeJS.ProcessEnv = process.env): Record<string, string> {
   if (sourceEnv.CODE_ASSISTANT_PEERS_PASS_FULL_ENV === "1") {
-    return Object.fromEntries(Object.entries(sourceEnv).filter((entry): entry is [string, string] => entry[1] !== undefined));
+    return {
+      ...Object.fromEntries(Object.entries(sourceEnv).filter((entry): entry is [string, string] => entry[1] !== undefined)),
+      CODE_ASSISTANT_PEERS_REVIEWER_SUBPROCESS: "1",
+    };
   }
   const allowlist = adapter.env_allowlist ?? DEFAULT_REVIEW_ENV_ALLOWLIST;
   const result: Record<string, string> = {};
@@ -485,7 +513,17 @@ export function buildReviewCommandEnv(adapter: AssistantAdapter, sourceEnv: Node
     const value = sourceEnv[key];
     if (value !== undefined) result[key] = value;
   }
+  result.CODE_ASSISTANT_PEERS_REVIEWER_SUBPROCESS = "1";
   return result;
+}
+
+export function resolveReviewerModel(
+  reviewer: AssistantHost,
+  options: Pick<ReviewRequestOptions, "review_model" | "review_models">,
+): string | null {
+  const explicit = options.review_models?.[reviewer]?.trim();
+  if (explicit) return explicit;
+  return options.review_model?.trim() || null;
 }
 
 function byteLength(value: string): number {
