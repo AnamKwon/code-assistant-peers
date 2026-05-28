@@ -98,6 +98,8 @@ export interface ReviewRequestOptions {
   review_models?: Record<string, string>;
 }
 
+export type ReviewModelRoutingTier = "fast" | "balanced" | "deep" | "long_context";
+
 export interface SemanticSymbolHint {
   file: string;
   line: number;
@@ -122,5 +124,6 @@ export interface AssistantModelInfo {
   quality?: "low" | "medium" | "high" | "highest";
   cost?: "low" | "medium" | "high";
   latency?: "low" | "medium" | "high";
+  routing?: ReviewModelRoutingTier[];
   description?: string;
 }

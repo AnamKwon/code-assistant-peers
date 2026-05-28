@@ -316,10 +316,26 @@ If `PEER_ASSISTANT` is omitted, `claude` pairs with `codex`, `codex` pairs with 
 Built-in model flags:
 
 ```text
-claude -> --model <model>  # known candidates: haiku, sonnet, opus
-codex  -> -m <model>
-gemini -> --model <model>
+claude -> --model <model>  # known candidates: haiku, sonnet, opus, best, sonnet[1m], opus[1m], opusplan
+codex  -> -m <model>       # known candidates: gpt-5.3-codex, gpt-5.2-codex, gpt-5.1-codex-max, gpt-5-codex, gpt-5.1-codex, gpt-5.1-codex-mini, codex-mini-latest, o3
+gemini -> --model <model>  # known candidates: auto, pro, flash, flash-lite, gemini-3-pro-preview, gemini-3-flash-preview, gemini-2.5-pro, gemini-2.5-flash, gemini-2.5-flash-lite
 ```
+
+Use automatic model routing:
+
+```json
+{
+  "task_id": "...",
+  "review_model": "auto"
+}
+```
+
+With `auto`, the server chooses from the hardcoded candidate list per reviewer:
+
+- `fast`: small docs, tests, lint, copy, or low-risk diffs.
+- `balanced`: normal review, gate review, and self-review.
+- `deep`: adversarial/collaborative review, peer-fix requests, or focus areas like security, auth, data loss, migrations, rollback, secrets, privacy, race conditions, databases, releases, or performance.
+- `long_context`: truncated diffs, very large diffs, or changes touching many files.
 
 Pick one model for a review request:
 
@@ -342,7 +358,9 @@ Or pick models per reviewer:
 }
 ```
 
-The selected model is included in the recorded reviewer command. If a custom adapter should support model selection, add `model_arg` and optional `models` metadata to its `CODE_ASSISTANT_PEERS_ASSISTANTS` entry.
+The selected model is included in the recorded reviewer command. Explicit per-reviewer models override the global model. If a per-reviewer value is `"auto"`, only that reviewer uses automatic routing.
+
+If a custom adapter should support model selection, add `model_arg` and optional `models` metadata to its `CODE_ASSISTANT_PEERS_ASSISTANTS` entry. Model metadata can include `routing` tags (`fast`, `balanced`, `deep`, `long_context`) so automatic routing can choose an appropriate model for that custom reviewer.
 
 Reviewer subprocesses are started with a recursion guard. Claude reviewers run with a strict MCP config that only exposes the optional read-only Serena server, Codex reviewers ignore user config and local rules, and all reviewer subprocesses receive `CODE_ASSISTANT_PEERS_REVIEWER_SUBPROCESS=1` so this MCP server refuses to start recursively inside a reviewer.
 

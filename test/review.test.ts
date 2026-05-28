@@ -14,6 +14,7 @@ import {
   buildReviewCommand,
   buildReviewPrompt,
   buildReviewPromptFromSnapshot,
+  chooseReviewModelTier,
   formatMultiPeerReviewOutputs,
   buildSerenaReviewerGuidance,
   normalizeHost,
@@ -21,6 +22,7 @@ import {
   peerFor,
   prepareReviewPromptSnapshot,
   resolveReviewerModel,
+  selectAutoReviewerModel,
   runReviewCommand,
   truncateForReview,
 } from "../shared/review.ts";
@@ -500,6 +502,16 @@ describe("review command construction", () => {
       "o3",
       "-",
     ]);
+    expect(buildReviewCommand("gemini", "flash")).toEqual([
+      "gemini",
+      "--skip-trust",
+      "--approval-mode",
+      "plan",
+      "-p",
+      "--model",
+      "flash",
+      "",
+    ]);
   });
 
   test("review model resolution lets per-reviewer models override the global model", () => {
@@ -512,6 +524,36 @@ describe("review command construction", () => {
       review_models: { claude: "opus" },
     })).toBe("sonnet");
     expect(resolveReviewerModel("gemini", {})).toBeNull();
+  });
+
+  test("auto review model selection uses hardcoded reviewer model tiers", () => {
+    expect(selectAutoReviewerModel("claude", { diffLength: 1000, changedFileCount: 1, focus: "docs" })).toBe("haiku");
+    expect(selectAutoReviewerModel("claude", { focus: "security and data loss", diffLength: 1000 })).toBe("opus");
+    expect(selectAutoReviewerModel("claude", { diffWasTruncated: true })).toBe("sonnet[1m]");
+    expect(selectAutoReviewerModel("codex", { mode: "adversarial" })).toBe("gpt-5.3-codex");
+    expect(selectAutoReviewerModel("gemini", { diffLength: 1000, changedFileCount: 1, focus: "tests" })).toBe("flash");
+  });
+
+  test("review model auto token routes through the automatic selector", () => {
+    expect(resolveReviewerModel("claude", {
+      review_model: "auto",
+    }, { focus: "auth migration", diffLength: 5000 })).toBe("opus");
+    expect(resolveReviewerModel("codex", {
+      review_model: "auto",
+      review_models: { codex: "gpt-5-codex" },
+    }, { mode: "adversarial" })).toBe("gpt-5-codex");
+    expect(resolveReviewerModel("gemini", {
+      review_model: "sonnet",
+      review_models: { gemini: "auto" },
+    }, { diffLength: 1000, changedFileCount: 1, focus: "readme" })).toBe("flash");
+  });
+
+  test("review model tier classifier prefers deeper models for risky or broad reviews", () => {
+    expect(chooseReviewModelTier({ focus: "security", diffLength: 2000 })).toBe("deep");
+    expect(chooseReviewModelTier({ mode: "collaborative" })).toBe("deep");
+    expect(chooseReviewModelTier({ diffWasTruncated: true })).toBe("long_context");
+    expect(chooseReviewModelTier({ focus: "docs", diffLength: 2000, changedFileCount: 1 })).toBe("fast");
+    expect(chooseReviewModelTier({ mode: "gate", diffLength: 2000 })).toBe("balanced");
   });
 
   test("Serena reviewer guidance gives Claude a read-only lookup path", () => {

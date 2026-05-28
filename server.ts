@@ -12,6 +12,7 @@ import {
   COLLABORATIVE_REVIEW_PROMPT,
   buildReviewCommand,
   buildReviewCommandEnv,
+  buildReviewModelRoutingContext,
   buildReviewPromptFromSnapshot,
   formatMultiPeerReviewOutputs,
   normalizeHost,
@@ -1190,7 +1191,12 @@ async function runPeerReviewTool(
   const promptSnapshot = await prepareReviewPromptSnapshot(task, options, promptSnapshotSeed);
   const startedAt = new Date().toISOString();
   const { prompt, warning } = buildReviewPromptFromSnapshot(task, options, promptSnapshot);
-  const result = await runReviewCommand(task.peer, task.cwd, prompt, resolveReviewerModel(task.peer, options));
+  const result = await runReviewCommand(
+    task.peer,
+    task.cwd,
+    prompt,
+    resolveReviewerModel(task.peer, options, buildReviewModelRoutingContext(options, promptSnapshot)),
+  );
   const completedAt = new Date().toISOString();
 
   const commitResult = await withReviewCommitLock(task.id, expectedSignature, async (current) => {
@@ -1349,7 +1355,12 @@ async function runMultiPeerReviewTool(
   const aggregatePromptResult = await buildMultiPeerAggregatePrompt(task, options, peerResults, skippedPeers, selfReviewResult, snapshot);
   const aggregatePrompt = aggregatePromptResult.prompt;
   const aggregateStartedAt = new Date().toISOString();
-  const aggregateResult = await runReviewCommand(task.host, task.cwd, aggregatePrompt, resolveReviewerModel(task.host, options));
+  const aggregateResult = await runReviewCommand(
+    task.host,
+    task.cwd,
+    aggregatePrompt,
+    resolveReviewerModel(task.host, options, buildReviewModelRoutingContext(options, snapshot)),
+  );
   const aggregateCompletedAt = new Date().toISOString();
   const aggregateWarning = [aggregatePromptResult.warning, selfReviewFailureWarning].filter(Boolean).join("\n") || undefined;
   const aggregateReview: PeerReviewResult = {
@@ -1416,7 +1427,12 @@ async function runSinglePeerRound(
   const startedAt = new Date().toISOString();
   const snapshot = promptSnapshot ?? await prepareReviewPromptSnapshot(task, options);
   const { prompt, warning } = buildReviewPromptFromSnapshot(roundTask, options, snapshot);
-  const result = await runReviewCommand(reviewer, task.cwd, prompt, resolveReviewerModel(reviewer, options));
+  const result = await runReviewCommand(
+    reviewer,
+    task.cwd,
+    prompt,
+    resolveReviewerModel(reviewer, options, buildReviewModelRoutingContext(options, snapshot)),
+  );
   const completedAt = new Date().toISOString();
   const review: PeerReviewResult = {
     reviewer,
@@ -1449,7 +1465,12 @@ async function runCollaborativeReviewTool(
     ...options,
     mode: "collaborative",
   }, promptSnapshot);
-  const peerResult = await runReviewCommand(task.peer, task.cwd, peerPromptResult.prompt, resolveReviewerModel(task.peer, options));
+  const peerResult = await runReviewCommand(
+    task.peer,
+    task.cwd,
+    peerPromptResult.prompt,
+    resolveReviewerModel(task.peer, options, buildReviewModelRoutingContext({ ...options, mode: "collaborative" }, promptSnapshot)),
+  );
   const peerCompletedAt = new Date().toISOString();
   const peerReview = {
     reviewer: task.peer,
@@ -1494,7 +1515,12 @@ async function runCollaborativeReviewTool(
 
   const hostPrompt = buildHostComparisonPrompt(task, options, peerReview.stdout || peerReview.stderr, promptSnapshot);
   const hostStartedAt = new Date().toISOString();
-  const hostResult = await runReviewCommand(task.host, task.cwd, hostPrompt, resolveReviewerModel(task.host, options));
+  const hostResult = await runReviewCommand(
+    task.host,
+    task.cwd,
+    hostPrompt,
+    resolveReviewerModel(task.host, options, buildReviewModelRoutingContext(options, promptSnapshot)),
+  );
   const hostCompletedAt = new Date().toISOString();
   const hostReview = {
     reviewer: task.host,
@@ -1649,8 +1675,8 @@ function normalizeReviewModel(value: unknown): string | null {
   if (value === undefined || value === null) return null;
   const model = String(value).trim();
   if (!model) return null;
-  if (!/^[A-Za-z0-9._:-]+$/.test(model)) {
-    throw new Error("review_model may contain only letters, numbers, dot, underscore, hyphen, and colon.");
+  if (!/^[A-Za-z0-9._:[\]-]+$/.test(model)) {
+    throw new Error("review_model may contain only letters, numbers, dot, underscore, hyphen, colon, and square brackets.");
   }
   return model;
 }
@@ -1718,8 +1744,16 @@ async function buildSetupStatus() {
     model_routing: {
       request_options: ["review_model", "review_models"],
       examples: {
+        automatic: { review_model: "auto" },
         all_reviewers: { review_model: "sonnet" },
+        automatic_for_one_reviewer: { review_models: { claude: "auto", codex: "gpt-5-codex" } },
         per_reviewer: { review_models: { claude: "opus", codex: "o3" } },
+      },
+      auto_strategy: {
+        fast: "small docs/tests/lint/copy/comment changes",
+        balanced: "normal, gate, and self-review requests",
+        deep: "adversarial/collaborative/peer_fix or high-risk focus areas",
+        long_context: "truncated diffs, very large diffs, or many changed files",
       },
       probe_note: "Known model candidates are listed at setup. Set CODE_ASSISTANT_PEERS_PROBE_MODELS=1 before starting the MCP server to verify candidate model access with live probe calls.",
     },
