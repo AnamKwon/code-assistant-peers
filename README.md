@@ -284,6 +284,8 @@ For other CLIs, set `CODE_ASSISTANT_PEERS_ASSISTANTS` to a JSON object. Each ada
 - `command`: argv array used to launch the assistant.
 - `prompt_transport`: `stdin` or `argv`.
 - `description`: optional human-readable label.
+- `model_arg`: optional CLI flag used before the model id, such as `--model` or `-m`.
+- `models`: optional model metadata shown in `code_assistant_peers_setup` and used by `review_model: "auto"`.
 
 Example:
 
@@ -291,11 +293,23 @@ Example:
 export CODE_ASSISTANT_PEERS_ASSISTANTS='{
   "glm": {
     "command": ["glm", "chat"],
-    "prompt_transport": "stdin"
+    "prompt_transport": "stdin",
+    "description": "GLM coding CLI",
+    "model_arg": "--model",
+    "models": [
+      { "id": "glm-4.6", "quality": "high", "cost": "medium", "latency": "medium", "routing": ["balanced"] },
+      { "id": "glm-4.6-air", "quality": "medium", "cost": "low", "latency": "low", "routing": ["fast"] }
+    ]
   },
   "deepseek": {
     "command": ["deepseek", "chat"],
-    "prompt_transport": "stdin"
+    "prompt_transport": "stdin",
+    "description": "DeepSeek coding CLI",
+    "model_arg": "--model",
+    "models": [
+      { "id": "deepseek-chat", "quality": "high", "cost": "low", "latency": "medium", "routing": ["balanced"] },
+      { "id": "deepseek-reasoner", "quality": "highest", "cost": "medium", "latency": "high", "routing": ["deep"] }
+    ]
   }
 }'
 ```
@@ -308,6 +322,135 @@ HOST_ASSISTANT=codex PEER_ASSISTANT=gemini code-assistant-peers-server
 ```
 
 If `PEER_ASSISTANT` is omitted, `claude` pairs with `codex`, `codex` pairs with `claude` and `gemini`, and custom hosts use the first other registered adapter.
+
+### Custom Adapter Recipes
+
+Custom adapter commands are thin wrappers around existing coding-agent CLIs. The MCP server does not normalize provider APIs by itself; it passes a review prompt to the configured command and, when requested, inserts `model_arg <model>` into that command.
+
+Use `stdin` when the CLI supports it. Use `argv` only for short prompt CLIs because review prompts may include large diffs and semantic context.
+
+#### GLM CLI
+
+```bash
+export CODE_ASSISTANT_PEERS_ASSISTANTS='{
+  "glm": {
+    "command": ["glm", "chat"],
+    "prompt_transport": "stdin",
+    "description": "GLM coding CLI",
+    "model_arg": "--model",
+    "models": [
+      { "id": "glm-4.6", "quality": "high", "cost": "medium", "latency": "medium", "routing": ["balanced"] },
+      { "id": "glm-4.6-air", "quality": "medium", "cost": "low", "latency": "low", "routing": ["fast"] }
+    ],
+    "env_allowlist": ["PATH", "HOME", "USER", "SHELL", "TERM", "TMPDIR", "GLM_API_KEY"]
+  }
+}'
+
+HOST_ASSISTANT=codex PEER_ASSISTANT=glm code-assistant-peers-server
+```
+
+Review with an explicit GLM model:
+
+```json
+{
+  "task_id": "...",
+  "review_models": {
+    "glm": "glm-4.6"
+  }
+}
+```
+
+#### OpenRouter Wrapper
+
+OpenRouter is an API provider, so you usually need a small CLI wrapper that accepts a prompt on stdin and forwards it to OpenRouter. The adapter should point to that wrapper. Replace the model ids below with the exact ids your OpenRouter account and wrapper support.
+
+```bash
+export CODE_ASSISTANT_PEERS_ASSISTANTS='{
+  "openrouter": {
+    "command": ["openrouter-review"],
+    "prompt_transport": "stdin",
+    "description": "OpenRouter review wrapper",
+    "model_arg": "--model",
+    "models": [
+      { "id": "anthropic/claude-sonnet", "quality": "high", "cost": "medium", "latency": "medium", "routing": ["balanced"] },
+      { "id": "anthropic/claude-opus", "quality": "highest", "cost": "high", "latency": "high", "routing": ["deep"] },
+      { "id": "google/gemini-pro", "quality": "highest", "cost": "high", "latency": "high", "routing": ["deep", "long_context"] },
+      { "id": "openai/gpt-mini", "quality": "high", "cost": "medium", "latency": "low", "routing": ["fast", "balanced"] }
+    ],
+    "env_allowlist": ["PATH", "HOME", "USER", "SHELL", "TERM", "TMPDIR", "OPENROUTER_API_KEY"]
+  }
+}'
+
+HOST_ASSISTANT=codex PEER_ASSISTANT=openrouter code-assistant-peers-server
+```
+
+Example wrapper contract:
+
+```text
+openrouter-review --model anthropic/claude-sonnet
+# reads review prompt from stdin
+# writes review text to stdout
+# exits non-zero on provider or validation failure
+```
+
+Review with OpenRouter:
+
+```json
+{
+  "task_id": "...",
+  "mode": "gate",
+  "review_models": {
+    "openrouter": "anthropic/claude-sonnet"
+  }
+}
+```
+
+#### DeepSeek CLI
+
+```bash
+export CODE_ASSISTANT_PEERS_ASSISTANTS='{
+  "deepseek": {
+    "command": ["deepseek", "chat"],
+    "prompt_transport": "stdin",
+    "description": "DeepSeek coding CLI",
+    "model_arg": "--model",
+    "models": [
+      { "id": "deepseek-chat", "quality": "high", "cost": "low", "latency": "medium", "routing": ["balanced"] },
+      { "id": "deepseek-reasoner", "quality": "highest", "cost": "medium", "latency": "high", "routing": ["deep"] }
+    ],
+    "env_allowlist": ["PATH", "HOME", "USER", "SHELL", "TERM", "TMPDIR", "DEEPSEEK_API_KEY"]
+  }
+}'
+```
+
+#### Ollama or Local CLI
+
+For local models, keep `env_allowlist` small and point `command` at a wrapper CLI that can read stdin.
+
+```bash
+export CODE_ASSISTANT_PEERS_ASSISTANTS='{
+  "ollama": {
+    "command": ["ollama-review"],
+    "prompt_transport": "stdin",
+    "description": "Local Ollama reviewer wrapper",
+    "model_arg": "--model",
+    "models": [
+      { "id": "qwen3-coder", "quality": "medium", "cost": "low", "latency": "medium", "routing": ["fast"] }
+    ]
+  }
+}'
+```
+
+Example wrapper contract:
+
+```text
+ollama-review --model qwen3-coder
+# reads review prompt from stdin
+# internally calls: ollama run qwen3-coder
+# writes review text to stdout
+```
+
+If the local CLI expects the model as a positional argument instead of a flag, use a wrapper script. Custom adapters insert models as `model_arg <model>`, so positional-model CLIs are cleaner behind wrappers.
 
 ### Reviewer Model Selection
 
