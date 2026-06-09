@@ -3,6 +3,7 @@ import { getAssistantAdapter, normalizeHost, peerFor } from "./assistants.ts";
 import { formatStatus, getReviewDiff, getStatusEntries } from "./git.ts";
 import { buildSemanticContext, parseSerenaCommand } from "./semantic.ts";
 import { listFindings, listReviewRounds } from "./store.ts";
+import { reviewViaBroker } from "./broker-client.ts";
 import { emptyWorkspaceSnapshot } from "./workspace-snapshot.ts";
 
 const REVIEW_DIFF_BUDGET = parseInt(process.env.CODE_ASSISTANT_PEERS_DIFF_BUDGET ?? "12000", 10);
@@ -397,10 +398,25 @@ export async function runReviewCommand(
 ): Promise<{ exitCode: number | null; stdout: string; stderr: string; command: string[] }> {
   const command = buildReviewCommand(reviewer);
   const adapter = getAssistantAdapter(reviewer);
-  const recordedCommand = adapter.prompt_transport === "argv" ? [...command, "<prompt>"] : command;
+  const timeoutMs = resolveReviewCommandTimeoutMs(adapter);
+
+  // Channel transport: route the review to a backgrounded live reviewer session via the broker
+  // (subscription pool, no `claude -p`). On any broker/session failure, fall back to spawning
+  // the adapter's CLI command over stdin (graceful degradation to the original behavior).
+  let transport: "stdin" | "argv" = adapter.prompt_transport === "argv" ? "argv" : "stdin";
+  if (adapter.prompt_transport === "channel") {
+    const reply = await reviewViaBroker(reviewer, prompt, timeoutMs);
+    if (reply.ok) {
+      return { exitCode: 0, stdout: reply.text, stderr: "", command: ["<broker>", reviewer] };
+    }
+    console.error(`[code-assistant-peers] broker channel unavailable (${reply.error}); falling back to spawning ${reviewer}.`);
+    transport = "stdin";
+  }
+
+  const recordedCommand = transport === "argv" ? [...command, "<prompt>"] : command;
   const env = buildReviewCommandEnv(adapter);
   const argvPromptBytes = byteLength(prompt);
-  if (adapter.prompt_transport === "argv" && argvPromptBytes > ARGV_PROMPT_BUDGET) {
+  if (transport === "argv" && argvPromptBytes > ARGV_PROMPT_BUDGET) {
     return {
       exitCode: 1,
       stdout: "",
@@ -408,13 +424,12 @@ export async function runReviewCommand(
       command: recordedCommand,
     };
   }
-  const finalCommand = adapter.prompt_transport === "argv" ? [...command, prompt] : command;
-  const timeoutMs = resolveReviewCommandTimeoutMs(adapter);
+  const finalCommand = transport === "argv" ? [...command, prompt] : command;
   let proc: any;
   try {
     proc = Bun.spawn(finalCommand, {
       cwd,
-      stdin: adapter.prompt_transport === "stdin" ? "pipe" : "ignore",
+      stdin: transport === "stdin" ? "pipe" : "ignore",
       stdout: "pipe",
       stderr: "pipe",
       env,
@@ -428,7 +443,7 @@ export async function runReviewCommand(
     };
   }
 
-  if (adapter.prompt_transport === "stdin") {
+  if (transport === "stdin") {
     proc.stdin?.write(prompt);
     proc.stdin?.end();
   }

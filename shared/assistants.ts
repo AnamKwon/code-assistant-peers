@@ -97,6 +97,16 @@ export const BUILTIN_ASSISTANTS: Record<string, AssistantAdapter> = {
   },
 };
 
+// Claude reviewer routed to a backgrounded interactive Claude session via the broker
+// (subscription pool, no `claude -p`). Reuses the `claude` command/env as the fallback that
+// runReviewCommand spawns when the broker / live session is unavailable.
+BUILTIN_ASSISTANTS["claude-live"] = {
+  ...BUILTIN_ASSISTANTS.claude,
+  id: "claude-live",
+  prompt_transport: "channel",
+  description: "Claude review routed to a backgrounded interactive Claude session via the broker (subscription pool, no `claude -p`); falls back to spawning `claude -p` if the broker/session is unavailable.",
+};
+
 let cachedCustomConfig: string | undefined;
 let cachedRegistry: Record<string, AssistantAdapter> | null = null;
 
@@ -211,7 +221,11 @@ function parseCustomAssistants(value: string | undefined): Record<string, Assist
       throw new Error(`Assistant '${id}' requires a non-empty command array.`);
     }
     const command = config.command.map((part) => String(part));
-    const promptTransport = config.prompt_transport === "argv" ? "argv" : "stdin";
+    const promptTransport: "stdin" | "argv" | "channel" = config.prompt_transport === "argv"
+      ? "argv"
+      : config.prompt_transport === "channel"
+        ? "channel"
+        : "stdin";
     result[id] = {
       id,
       command,

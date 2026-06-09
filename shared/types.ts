@@ -106,7 +106,7 @@ export interface SemanticSymbolHint {
 export interface AssistantAdapter {
   id: AssistantHost;
   command: string[];
-  prompt_transport: "stdin" | "argv";
+  prompt_transport: "stdin" | "argv" | "channel";
   description?: string;
   timeout_ms?: number;
   env_allowlist?: string[];
