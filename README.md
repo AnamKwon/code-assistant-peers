@@ -137,7 +137,7 @@ For a web-friendly one-line setup that also verifies Serena registration and pat
 curl -fsSL https://raw.githubusercontent.com/AnamKwon/code-assistant-peers/main/scripts/web-setup.sh | sh
 ```
 
-The web setup script clones the project into `~/mcp-code-assistant-peers` when needed, runs `bun install`, registers Codex by default, enables `serena-auto` when Serena or `uvx` is available, patches Codex to a 30 minute MCP timeout, and prints the relevant config lines. Useful variants:
+The web setup script clones the project into `~/mcp-code-assistant-peers` when needed, runs `bun install`, registers Codex by default, enables `serena-auto` when Serena or `uvx` is available, patches Codex to a 30-minute MCP timeout, and prints the relevant config lines. Useful variants:
 
 ```bash
 # Use an existing checkout and set Codex MCP timeout to 30 minutes
