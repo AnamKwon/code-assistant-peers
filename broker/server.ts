@@ -15,6 +15,9 @@ interface Job {
   id: string;
   reviewer: string;
   prompt: string;
+  // Repo dir the review is for, so the reviewer worker drives a session pinned to the right repo
+  // (per-repo isolation across concurrently reviewed repos). Empty => worker's default cwd.
+  cwd: string;
   status: "pending" | "claimed" | "done" | "error";
   result?: string;
   createdAt: number;
@@ -36,10 +39,10 @@ Bun.serve({
 
     // --- channel transport side ---
     if (req.method === "POST" && pathname === "/jobs") {
-      const body = (await req.json().catch(() => ({}))) as { reviewer?: string; prompt?: string };
+      const body = (await req.json().catch(() => ({}))) as { reviewer?: string; prompt?: string; cwd?: string };
       if (!body.prompt) return json({ error: "prompt required" }, 400);
       const id = `job_${Date.now().toString(36)}_${seq++}`;
-      jobs.set(id, { id, reviewer: String(body.reviewer ?? "claude"), prompt: body.prompt, status: "pending", createdAt: Date.now() });
+      jobs.set(id, { id, reviewer: String(body.reviewer ?? "claude"), prompt: body.prompt, cwd: String(body.cwd ?? ""), status: "pending", createdAt: Date.now() });
       return json({ id, status: "pending" });
     }
 
@@ -75,7 +78,7 @@ Bun.serve({
       for (const job of jobs.values()) {
         if (job.status === "pending") {
           job.status = "claimed";
-          return json({ id: job.id, reviewer: job.reviewer, prompt: job.prompt });
+          return json({ id: job.id, reviewer: job.reviewer, prompt: job.prompt, cwd: job.cwd });
         }
       }
       return json({ id: null });

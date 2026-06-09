@@ -1,0 +1,484 @@
+#!/usr/bin/env bun
+// Reviewer worker for the "channel" review transport — the half that actually keeps reviews
+// on the SUBSCRIPTION pool instead of `claude -p`.
+//
+//   broker (localhost) ──GET /next──▶ reviewer worker (this file)
+//                                       │  drives a backgrounded INTERACTIVE `claude` TUI
+//                                       │  (tmux send-keys → capture-pane), read-only
+//                                       ◀──POST /jobs/:id/result── reviewer worker
+//
+// Why interactive (not `claude -p`): per Anthropic's billing model, interactive Claude Code in
+// a terminal draws from the Pro/Max SUBSCRIPTION, while `claude -p` / the Agent SDK draw from a
+// separate credit pool (separated 2026-06-15). Driving the live TUI via tmux keeps it
+// interactive. IMPORTANT: `ANTHROPIC_API_KEY` in the environment forces API-key billing
+// regardless of mode — it must be UNSET for this session, and `claude` must be logged in via
+// claude.ai (OAuth). See broker/REVIEWER.md.
+//
+// Run:  bun broker/reviewer.ts            # ensures the tmux session + processes jobs forever
+//       bun broker/reviewer.ts --once     # process at most one job then exit (verification)
+//       bun broker/reviewer.ts --echo     # fake session that echoes the prompt (no claude; dev)
+
+import { closeSync, openSync, readFileSync, unlinkSync, writeSync } from "node:fs";
+import { mkdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+const DEFAULT_BROKER_URL = "http://127.0.0.1:7899";
+const DEFAULT_POLL_INTERVAL_MS = 1000;
+const DEFAULT_DELIVER_TIMEOUT_MS = 600_000;
+
+export interface ReviewJob {
+  id: string;
+  reviewer: string;
+  prompt: string;
+  cwd: string; // repo dir this review is for ("" => worker default); routes to a per-repo session
+}
+
+// A reviewer backend. The real one drives a live `claude` TUI; tests/dev inject fakes.
+export interface ReviewerSession {
+  deliver(prompt: string, jobId: string, signal: AbortSignal): Promise<string>;
+  close?(): Promise<void>;
+}
+
+export interface ReviewerWorkerOptions {
+  brokerUrl: string;
+  // Build (or look up) the reviewer session for a given repo cwd. The worker caches one session
+  // per distinct cwd, so each repo gets its own backgrounded Claude session pinned to that repo,
+  // and concurrently reviewed repos never share a working directory.
+  sessionFor: (cwd: string) => ReviewerSession;
+  signal: AbortSignal;
+  pollIntervalMs?: number;
+  once?: boolean;
+  log?: (message: string) => void;
+}
+
+// Claim the next pending job from the broker. Returns null when there is nothing to do or the
+// broker is briefly unreachable (the loop just retries) — never throws for transport hiccups.
+export async function claimNextJob(brokerUrl: string, signal: AbortSignal): Promise<ReviewJob | null> {
+  let res: Response;
+  try {
+    res = await fetch(`${brokerUrl}/next`, { signal });
+  } catch {
+    return null;
+  }
+  if (!res.ok) return null;
+  const body = (await res.json().catch(() => ({}))) as { id?: string | null; reviewer?: string; prompt?: string; cwd?: string };
+  if (!body.id || !body.prompt) return null;
+  return { id: body.id, reviewer: String(body.reviewer ?? "claude-live"), prompt: body.prompt, cwd: String(body.cwd ?? "") };
+}
+
+async function postResult(brokerUrl: string, jobId: string, result: string): Promise<void> {
+  await fetch(`${brokerUrl}/jobs/${encodeURIComponent(jobId)}/result`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ result }),
+  });
+}
+
+async function postError(brokerUrl: string, jobId: string, error: string): Promise<void> {
+  await fetch(`${brokerUrl}/jobs/${encodeURIComponent(jobId)}/error`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ error }),
+  });
+}
+
+// The worker loop: claim → deliver to the live session → report result/error. Bounded only by
+// the abort signal. A failed delivery is reported as a job error (not a crash) so one bad review
+// never takes the worker down.
+export async function runReviewerWorker(options: ReviewerWorkerOptions): Promise<void> {
+  const { brokerUrl, sessionFor, signal } = options;
+  const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+  const log = options.log ?? (() => {});
+
+  // One session per distinct repo cwd, created lazily and reused for every review of that repo.
+  const sessions = new Map<string, ReviewerSession>();
+  const resolveSession = (cwd: string): ReviewerSession => {
+    let session = sessions.get(cwd);
+    if (!session) {
+      session = sessionFor(cwd);
+      sessions.set(cwd, session);
+    }
+    return session;
+  };
+
+  try {
+    while (!signal.aborted) {
+      const job = await claimNextJob(brokerUrl, signal);
+      if (!job) {
+        if (options.once) return;
+        await sleep(pollIntervalMs, signal);
+        continue;
+      }
+
+      log(`claimed job ${job.id} (${job.reviewer}, cwd=${job.cwd || "(default)"})`);
+      try {
+        const review = await resolveSession(job.cwd).deliver(job.prompt, job.id, signal);
+        await postResult(brokerUrl, job.id, review);
+        log(`job ${job.id} reviewed (${review.length} chars)`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        await postError(brokerUrl, job.id, `reviewer worker failed: ${message}`).catch(() => {});
+        log(`job ${job.id} failed: ${message}`);
+      }
+
+      if (options.once) return;
+    }
+  } finally {
+    for (const session of sessions.values()) await session.close?.();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Output extraction (pure, unit-tested)
+//
+// We instruct the live session to end its review with a unique-per-job marker. The marker shows
+// up at least twice in the captured pane: once where our instruction is echoed into the input,
+// and once where the session prints it at the end of the review. We take the text BETWEEN the
+// first and last occurrence as the review. Per-job-unique markers mean stale markers from prior
+// jobs in the scrollback never match.
+// ---------------------------------------------------------------------------
+
+export function doneMarkerFor(jobId: string): string {
+  // Plain hyphenated token only — NO angle brackets, backticks, or markdown-special chars. The
+  // Claude TUI/markdown renderer mangles bracketed markers (e.g. `<<<x>>>` renders as `<<x>>`),
+  // which broke marker matching. Letters/digits/hyphens/underscores survive rendering intact.
+  return `PEER-REVIEW-DONE-${jobId}-END`;
+}
+
+// Returns the review text if the capture shows a completed review (marker present as real output,
+// i.e. at least twice — echo + emitted), otherwise null (still running / not delivered yet).
+export function extractReviewFromCapture(capture: string, jobId: string): string | null {
+  const marker = doneMarkerFor(jobId);
+  const first = capture.indexOf(marker);
+  if (first === -1) return null;
+  const last = capture.lastIndexOf(marker);
+  if (last === first) return null; // only the echoed instruction so far — not done
+
+  const between = capture.slice(first + marker.length, last);
+  return cleanCapturedReview(between);
+}
+
+// Strip TUI chrome from scraped pane text: box-drawing borders, the leading "> " input echo,
+// and blank padding. Best-effort — the pane is a rendered screen, not a clean stream.
+function cleanCapturedReview(text: string): string {
+  const lines = text
+    .split("\n")
+    .map((line) =>
+      line
+        // Drop tmux/Claude TUI box-drawing border characters and trailing whitespace.
+        .replace(/[│┃|]\s?/g, "")
+        .replace(/[─━╭╮╰╯┌┐└┘]/g, "")
+        // Strip the leading response bullet glyph Claude prints before assistant text.
+        .replace(/^\s*[⏺●○•]\s?/, "")
+        .replace(/\s+$/g, ""),
+    )
+    // Drop Claude tool-call status chrome (never review content), e.g. "Read 1 file (ctrl+o to
+    // expand)" or other "(ctrl+o to expand)" affordances captured from the rendered pane.
+    .filter((line) => !/\(ctrl\+o to expand\)/.test(line) && !/^\s*Read \d+ file\b/.test(line));
+  // Trim leading/trailing blank lines.
+  while (lines.length && lines[0].trim() === "") lines.shift();
+  while (lines.length && lines[lines.length - 1].trim() === "") lines.pop();
+  return lines.join("\n").trim();
+}
+
+// ---------------------------------------------------------------------------
+// tmux-driven interactive Claude session (the real backend)
+// ---------------------------------------------------------------------------
+
+export interface TmuxSessionConfig {
+  sessionName: string;
+  cwd: string;
+  claudeArgs: string[];
+  // Dir the per-job prompt files are written to. Granted to the session via `--add-dir` so the
+  // read-only reviewer can Read it without a permission prompt (it lives outside the repo cwd).
+  promptDir: string;
+  startupTimeoutMs: number;
+  deliverTimeoutMs: number;
+  pollIntervalMs: number;
+}
+
+// Read-only launch: plan mode + edit tools disallowed so a reviewed diff containing injected
+// instructions still cannot modify files (same safety model as the `claude -p` reviewer).
+export const DEFAULT_REVIEWER_CLAUDE_ARGS = [
+  "--permission-mode",
+  "plan",
+  "--allowedTools",
+  "Read,Grep,Glob,Bash(git status:*),Bash(git diff:*),Bash(git show:*),Bash(git log:*),Bash(git ls-files:*)",
+  "--disallowedTools",
+  "Edit,Write,MultiEdit,NotebookEdit",
+];
+
+export class TmuxClaudeSession implements ReviewerSession {
+  private ready = false;
+  constructor(private readonly config: TmuxSessionConfig) {}
+
+  async deliver(prompt: string, jobId: string, signal: AbortSignal): Promise<string> {
+    await this.ensureSession(signal);
+    const marker = doneMarkerFor(jobId);
+    const { sessionName, promptDir, deliverTimeoutMs, pollIntervalMs } = this.config;
+
+    // Hand the (large) review prompt to the session via a file — typing it through send-keys is
+    // fragile. The instruction itself stays short to avoid input-line wrapping in the pane.
+    // promptDir is granted via `--add-dir` at launch so the read-only session can Read it.
+    await mkdir(promptDir, { recursive: true });
+    const promptFile = join(promptDir, `${jobId}.md`);
+    await writeFile(promptFile, prompt, "utf8");
+    const instruction =
+      `Read the file ${promptFile} and perform the code review it describes. ` +
+      `Output the full review as plain text. On the final line, output exactly this and nothing else: ${marker}`;
+
+    try {
+      // Reset the reused session's CONVERSATION before each review: this single live session
+      // serves every review, so without `/clear` its context grows unbounded and earlier reviews
+      // could bleed into later ones. `/clear` keeps each review independent and bounded.
+      await tmux(["send-keys", "-t", sessionName, "-l", "--", "/clear"]);
+      await sleep(150, signal);
+      await tmux(["send-keys", "-t", sessionName, "Enter"]);
+      await sleep(600, signal); // let /clear settle before we wipe scrollback
+      // Drop prior scrollback so only this job's output (and its echoed marker) is captured.
+      await tmux(["clear-history", "-t", sessionName]);
+      await tmux(["send-keys", "-t", sessionName, "-l", "--", instruction]);
+      await sleep(150, signal); // let the TUI register the paste before submitting
+      await tmux(["send-keys", "-t", sessionName, "Enter"]);
+
+      const deadline = Date.now() + deliverTimeoutMs;
+      while (Date.now() < deadline) {
+        await sleep(pollIntervalMs, signal);
+        const capture = await this.capture();
+        const review = extractReviewFromCapture(capture, jobId);
+        if (review !== null) return review;
+      }
+      throw new Error(`timed out after ${deliverTimeoutMs}ms waiting for the review marker in the live session`);
+    } finally {
+      await rm(promptFile, { force: true }).catch(() => {});
+    }
+  }
+
+  async close(): Promise<void> {
+    await tmux(["kill-session", "-t", this.config.sessionName]).catch(() => {});
+  }
+
+  // Ensure a tmux session running the interactive `claude` TUI exists and is ready for input.
+  // If the session already exists we reuse it (the user may have launched it themselves).
+  private async ensureSession(signal: AbortSignal): Promise<void> {
+    if (this.ready) return;
+    const { sessionName, cwd, claudeArgs, promptDir, startupTimeoutMs } = this.config;
+
+    const exists = (await tmux(["has-session", "-t", sessionName])).code === 0;
+    if (!exists) {
+      await mkdir(promptDir, { recursive: true });
+      // Wide window => less line wrapping => cleaner capture. `--` ends tmux option parsing so
+      // the rest is the command run inside the session. `--add-dir promptDir` lets the read-only
+      // session Read the prompt files (which live outside the repo cwd) without a prompt.
+      const created = await tmux([
+        "new-session", "-d", "-s", sessionName, "-c", cwd, "-x", "400", "-y", "120",
+        "--", "claude", ...claudeArgs, "--add-dir", promptDir,
+      ]);
+      if (created.code !== 0) {
+        throw new Error(`failed to start tmux session '${sessionName}': ${created.stderr.trim() || `exit ${created.code}`}`);
+      }
+      await this.waitUntilReady(startupTimeoutMs, signal);
+    }
+    this.ready = true;
+  }
+
+  // The TUI takes a moment to boot. We don't know an exact "ready" string across versions, so we
+  // wait until the captured pane is non-empty and stable across two consecutive reads.
+  private async waitUntilReady(timeoutMs: number, signal: AbortSignal): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    let previous = "";
+    let stableReads = 0;
+    while (Date.now() < deadline) {
+      await sleep(700, signal);
+      const current = await this.capture();
+      if (current.trim().length > 0 && current === previous) {
+        if (++stableReads >= 2) return;
+      } else {
+        stableReads = 0;
+      }
+      previous = current;
+    }
+    // Don't hard-fail: proceed and let the deliver timeout catch a truly dead session.
+  }
+
+  private async capture(): Promise<string> {
+    // -p prints to stdout, -S - includes the full scrollback (post clear-history it is just this
+    // job), -J joins wrapped lines so a soft-wrapped marker still matches.
+    const result = await tmux(["capture-pane", "-t", this.config.sessionName, "-p", "-J", "-S", "-"]);
+    return result.stdout;
+  }
+}
+
+async function tmux(args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
+  const proc = Bun.spawn(["tmux", ...args], { stdout: "pipe", stderr: "pipe" });
+  const [stdout, stderr, code] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  return { code, stdout, stderr };
+}
+
+// A fake session for local testing without claude/tmux: echoes a canned review.
+export class EchoSession implements ReviewerSession {
+  async deliver(prompt: string, jobId: string): Promise<string> {
+    return `No findings. (echo reviewer for job ${jobId}; prompt was ${prompt.length} chars)\npatch is correct`;
+  }
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (ms <= 0) return resolve();
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function envInt(name: string, fallback: number): number {
+  const parsed = Number(process.env[name]);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
+async function main(): Promise<void> {
+  const argv = process.argv.slice(2);
+  const once = argv.includes("--once");
+  const echo = argv.includes("--echo");
+
+  const brokerUrl = process.env.CODE_ASSISTANT_PEERS_BROKER_URL ?? DEFAULT_BROKER_URL;
+
+  // Singleton guard: at most one real worker per broker (echo/dev workers are exempt). Prevents
+  // two workers from driving the same per-repo tmux session concurrently.
+  let releaseLock: (() => void) | null = null;
+  if (!echo) {
+    releaseLock = acquireWorkerLock(brokerUrl);
+    if (!releaseLock) {
+      console.error(`[reviewer] another reviewer worker already owns ${brokerUrl}; exiting.`);
+      return;
+    }
+    process.on("exit", () => releaseLock?.());
+  }
+
+  const controller = new AbortController();
+  process.on("SIGINT", () => controller.abort());
+  process.on("SIGTERM", () => controller.abort());
+
+  if (process.env.ANTHROPIC_API_KEY && !echo) {
+    console.error(
+      "[reviewer] WARNING: ANTHROPIC_API_KEY is set — Claude Code will bill to the API key, NOT your subscription. " +
+        "Unset it (and log in via claude.ai) for subscription billing.",
+    );
+  }
+
+  const baseCwd = process.env.CODE_ASSISTANT_PEERS_REVIEWER_CWD ?? process.cwd();
+  const sessionBaseName = process.env.CODE_ASSISTANT_PEERS_TMUX_SESSION ?? "peer-reviewer";
+  const claudeArgs = parseClaudeArgs(process.env.CODE_ASSISTANT_PEERS_REVIEWER_CLAUDE_ARGS) ?? DEFAULT_REVIEWER_CLAUDE_ARGS;
+  const promptDir = process.env.CODE_ASSISTANT_PEERS_REVIEWER_PROMPT_DIR ?? join(tmpdir(), "peer-reviewer-prompts");
+
+  // One session per repo cwd: a job's cwd selects (and the worker caches) a tmux `claude` pinned
+  // to that repo, so reviews for different repos run in the correct working directory.
+  const sessionFor = (cwd: string): ReviewerSession => {
+    if (echo) return new EchoSession();
+    const repoCwd = cwd || baseCwd;
+    return new TmuxClaudeSession({
+      sessionName: sessionNameForCwd(sessionBaseName, repoCwd),
+      cwd: repoCwd,
+      claudeArgs,
+      promptDir,
+      startupTimeoutMs: envInt("CODE_ASSISTANT_PEERS_REVIEWER_STARTUP_MS", 30_000),
+      deliverTimeoutMs: envInt("CODE_ASSISTANT_PEERS_REVIEW_TIMEOUT_MS", DEFAULT_DELIVER_TIMEOUT_MS),
+      pollIntervalMs: envInt("CODE_ASSISTANT_PEERS_REVIEWER_POLL_MS", DEFAULT_POLL_INTERVAL_MS),
+    });
+  };
+
+  console.error(`[reviewer] worker started (broker=${brokerUrl}, session=${echo ? "echo" : "tmux/claude per repo"}${once ? ", once" : ""})`);
+  await runReviewerWorker({
+    brokerUrl,
+    sessionFor,
+    signal: controller.signal,
+    once,
+    log: (message) => console.error(`[reviewer] ${message}`),
+  });
+  releaseLock?.();
+}
+
+// Stable, tmux-safe session name per repo cwd: "<base>-<repo-slug>-<hash>". The hash disambiguates
+// same-named repos in different paths; the slug keeps it human-readable in `tmux ls`.
+export function sessionNameForCwd(base: string, cwd: string): string {
+  const slug = (cwd.split("/").filter(Boolean).pop() ?? "repo").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 24) || "repo";
+  return `${base}-${slug}-${shortHash(cwd)}`;
+}
+
+function shortHash(value: string): string {
+  let h = 5381;
+  for (let i = 0; i < value.length; i++) h = ((h << 5) + h + value.charCodeAt(i)) >>> 0; // djb2
+  return h.toString(36);
+}
+
+// Ensure only ONE reviewer worker runs per broker. Without this, an autostart race (two MCP
+// servers both seeing "no broker" at once) could leave two workers polling the same broker and
+// driving the same per-repo tmux session concurrently — interleaved send-keys/capture corrupts
+// both. The lock is keyed by broker URL so distinct brokers get independent workers. Returns a
+// release fn, or null if another LIVE worker already holds the lock (caller should exit).
+export function acquireWorkerLock(brokerUrl: string): (() => void) | null {
+  const lockPath = join(tmpdir(), `code-assistant-peers-reviewer-${shortHash(brokerUrl)}.lock`);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const fd = openSync(lockPath, "wx"); // exclusive create — fails if the lock already exists
+      writeSync(fd, String(process.pid));
+      closeSync(fd);
+      return () => {
+        try {
+          unlinkSync(lockPath);
+        } catch {
+          // already gone
+        }
+      };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== "EEXIST") throw error;
+      if (lockHolderAlive(lockPath)) return null; // a live worker owns it
+      try {
+        unlinkSync(lockPath); // stale lock (holder died) — drop it and retry once
+      } catch {
+        // raced with another reclaimer; loop will retry
+      }
+    }
+  }
+  return null;
+}
+
+function lockHolderAlive(lockPath: string): boolean {
+  try {
+    const pid = Number(readFileSync(lockPath, "utf8").trim());
+    if (!Number.isFinite(pid) || pid <= 0) return false;
+    process.kill(pid, 0); // throws if the process does not exist
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function parseClaudeArgs(value: string | undefined): string[] | undefined {
+  if (!value?.trim()) return undefined;
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (Array.isArray(parsed) && parsed.every((item) => typeof item === "string")) return parsed as string[];
+  } catch {
+    // not JSON — fall through to whitespace split
+  }
+  return value.trim().split(/\s+/);
+}
+
+if (import.meta.main) {
+  main().catch((error) => {
+    console.error(`[reviewer] fatal: ${error instanceof Error ? error.message : String(error)}`);
+    process.exit(1);
+  });
+}

@@ -1,6 +1,26 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { reviewViaBroker } from "../shared/broker-client.ts";
+import { type BackendBootstrapDeps, bootstrapBackend, reviewViaBroker } from "../shared/broker-client.ts";
 import { runReviewCommand } from "../shared/review.ts";
+
+function bootstrapDeps(overrides: Partial<BackendBootstrapDeps> = {}): BackendBootstrapDeps & { spawnCalls: number } {
+  let clock = 0;
+  const state = {
+    brokerHealthy: async () => false,
+    spawnBackend: () => {},
+    sleep: async () => {},
+    now: () => (clock += 100),
+    healthWaitMs: 1000,
+    pollMs: 100,
+    spawnCalls: 0,
+  } as BackendBootstrapDeps & { spawnCalls: number };
+  Object.assign(state, overrides);
+  const userSpawn = state.spawnBackend;
+  state.spawnBackend = (cwd: string) => {
+    state.spawnCalls++;
+    userSpawn(cwd);
+  };
+  return state;
+}
 
 // Mock broker: POST /jobs -> id; GET /jobs/:id -> done with a canned review.
 function startMockBroker(reviewText: string) {
@@ -10,6 +30,9 @@ function startMockBroker(reviewText: string) {
     hostname: "127.0.0.1",
     fetch(req) {
       const { pathname } = new URL(req.url);
+      if (req.method === "GET" && pathname === "/health") {
+        return Response.json({ ok: true }); // healthy => runReviewCommand's autostart is a no-op
+      }
       if (req.method === "POST" && pathname === "/jobs") {
         jobId = "mock-1";
         return Response.json({ id: jobId, status: "pending" });
@@ -33,7 +56,7 @@ describe("channel review transport (broker)", () => {
     const server = startMockBroker("MOCK REVIEW: No findings.");
     process.env.CODE_ASSISTANT_PEERS_BROKER_URL = `http://127.0.0.1:${server.port}`;
     try {
-      const reply = await reviewViaBroker("claude-live", "review this", 5000, 25);
+      const reply = await reviewViaBroker("claude-live", "review this", 5000, "", 25);
       expect(reply.ok).toBe(true);
       expect(reply.text).toContain("MOCK REVIEW");
     } finally {
@@ -43,9 +66,31 @@ describe("channel review transport (broker)", () => {
 
   test("reviewViaBroker fails gracefully when the broker is unreachable", async () => {
     process.env.CODE_ASSISTANT_PEERS_BROKER_URL = "http://127.0.0.1:1";
-    const reply = await reviewViaBroker("claude-live", "review this", 400, 25);
+    const reply = await reviewViaBroker("claude-live", "review this", 400, "", 25);
     expect(reply.ok).toBe(false);
     expect(reply.error).toBeTruthy();
+  });
+
+  test("bootstrapBackend does not spawn when the broker is already healthy", async () => {
+    const deps = bootstrapDeps({ brokerHealthy: async () => true });
+    await bootstrapBackend(process.cwd(), deps);
+    expect(deps.spawnCalls).toBe(0);
+  });
+
+  test("bootstrapBackend spawns once and returns when the broker comes up", async () => {
+    let healthChecks = 0;
+    const deps = bootstrapDeps({
+      // first check (pre-spawn) unhealthy, then healthy after the spawn + one poll
+      brokerHealthy: async () => ++healthChecks > 1,
+    });
+    await bootstrapBackend(process.cwd(), deps);
+    expect(deps.spawnCalls).toBe(1);
+  });
+
+  test("bootstrapBackend spawns once then proceeds even if the broker never answers", async () => {
+    const deps = bootstrapDeps({ brokerHealthy: async () => false, healthWaitMs: 500, pollMs: 100 });
+    await bootstrapBackend(process.cwd(), deps); // resolves (does not hang) so the caller can fall back
+    expect(deps.spawnCalls).toBe(1);
   });
 
   test("runReviewCommand routes the claude-live adapter through the broker (no spawn)", async () => {

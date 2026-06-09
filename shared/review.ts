@@ -3,7 +3,7 @@ import { getAssistantAdapter, normalizeHost, peerFor } from "./assistants.ts";
 import { formatStatus, getReviewDiff, getStatusEntries } from "./git.ts";
 import { buildSemanticContext, parseSerenaCommand } from "./semantic.ts";
 import { listFindings, listReviewRounds } from "./store.ts";
-import { reviewViaBroker } from "./broker-client.ts";
+import { ensureChannelBackend, reviewViaBroker } from "./broker-client.ts";
 import { emptyWorkspaceSnapshot } from "./workspace-snapshot.ts";
 
 const REVIEW_DIFF_BUDGET = parseInt(process.env.CODE_ASSISTANT_PEERS_DIFF_BUDGET ?? "12000", 10);
@@ -396,7 +396,6 @@ export async function runReviewCommand(
   cwd: string,
   prompt: string,
 ): Promise<{ exitCode: number | null; stdout: string; stderr: string; command: string[] }> {
-  const command = buildReviewCommand(reviewer);
   const adapter = getAssistantAdapter(reviewer);
   const timeoutMs = resolveReviewCommandTimeoutMs(adapter);
 
@@ -405,7 +404,10 @@ export async function runReviewCommand(
   // the adapter's CLI command over stdin (graceful degradation to the original behavior).
   let transport: "stdin" | "argv" = adapter.prompt_transport === "argv" ? "argv" : "stdin";
   if (adapter.prompt_transport === "channel") {
-    const reply = await reviewViaBroker(reviewer, prompt, timeoutMs);
+    // Auto-start the broker + backgrounded reviewer worker if they are not already running, so a
+    // host only has to pick `claude-live` — no manual daemon launch. Idempotent + reused.
+    await ensureChannelBackend(cwd);
+    const reply = await reviewViaBroker(reviewer, prompt, timeoutMs, cwd);
     if (reply.ok) {
       return { exitCode: 0, stdout: reply.text, stderr: "", command: ["<broker>", reviewer] };
     }
@@ -413,6 +415,9 @@ export async function runReviewCommand(
     transport = "stdin";
   }
 
+  // Built only here (not before the channel branch) so a successful broker route does no
+  // wasted command construction.
+  const command = buildReviewCommand(reviewer);
   const recordedCommand = transport === "argv" ? [...command, "<prompt>"] : command;
   const env = buildReviewCommandEnv(adapter);
   const argvPromptBytes = byteLength(prompt);
