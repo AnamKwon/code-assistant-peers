@@ -8,11 +8,27 @@ programmatic credit pool.
 host (Codex/…) ──peer review──▶ code-assistant-peers MCP
                                    │  peer = claude-live  (prompt_transport: "channel")
                                    ▼
-                              broker (localhost) ──push──▶ 🟦 backgrounded interactive Claude
-                                   ◀──── review reply ───────  (read-only, subscription)
-                                   ▼
-                           runReviewCommand returns it (command = ["<broker>", "claude-live"])
+                              broker (localhost) ──GET /next──▶ 🟦 reviewer worker (broker/reviewer.ts)
+                                   ◀── POST /jobs/:id/result ──   │  tmux send-keys / capture-pane
+                                   ▼                              ▼
+                           runReviewCommand returns it     backgrounded interactive `claude`
+                           (command = ["<broker>", …])     (read-only, subscription pool)
 ```
+
+## Why this stays on the subscription pool (researched, high confidence)
+
+Anthropic bills by **mode of use**: the **interactive** Claude Code TUI draws from the Pro/Max
+**subscription**; `claude -p` / the Agent SDK / `stream-json` draw from the separate programmatic
+credit pool (split off on **2026-06-15**). The reviewer worker drives the **interactive** TUI via
+tmux, so it stays interactive — and therefore on the subscription.
+
+> Caveat: "a tmux-driven interactive session is billed as interactive" is a strong inference from
+> Anthropic's interactive-vs-headless boundary, **not** a vendor-confirmed ruling. Verify with the
+> checklist below before relying on it for cost.
+
+**`ANTHROPIC_API_KEY` overrides everything** → if it is set, Claude Code bills the API key
+regardless of mode. It MUST be unset for the reviewer session, and `claude` must be logged in via
+claude.ai (OAuth). The worker prints a warning if it sees `ANTHROPIC_API_KEY`.
 
 ## Status
 
@@ -22,62 +38,100 @@ host (Codex/…) ──peer review──▶ code-assistant-peers MCP
 | channel transport client (`shared/broker-client.ts`) | ✅ implemented + tested |
 | `runReviewCommand` channel branch **+ fallback to `claude -p`** | ✅ implemented + tested |
 | broker daemon (`broker/server.ts`) | ✅ implemented (generic relay) |
-| **reviewer bridge → live Claude session (channels)** | ⬜ **needs a live session; research preview** |
-| **billing actually = subscription** | ⬜ **must be measured** (see checklist) |
+| **reviewer worker → live Claude TUI via tmux** (`broker/reviewer.ts`) | ✅ implemented; loop + extraction unit-tested |
+| **auto-start backend on first `claude-live` review** (`ensureChannelBackend`) | ✅ implemented + tested; verified end-to-end live |
+| live tmux↔claude round-trip | ✅ verified (review returned, `command = ["<broker>","claude-live"]`, repo unchanged) |
+| **billing actually = subscription** | ⬜ **confirm on the Anthropic usage dashboard** (strongly inferred: interactive TUI + no API key) |
 
-## Setup
+The worker loop, broker round-trip (with an `--echo` stand-in), and tmux verbs are tested. The one
+piece that can only be verified with a logged-in `claude` is the live TUI round-trip and that the
+usage actually lands on the subscription.
 
-1. **Start the broker:**
-   ```bash
-   CODE_ASSISTANT_PEERS_BROKER_PORT=7899 bun broker/server.ts
-   ```
-2. **Point the tool at the channel reviewer** — use `claude-live` where you'd use `claude`:
-   ```bash
-   PEER_ASSISTANTS=claude-live   # or codex,claude-live for multi-peer
-   # optional: CODE_ASSISTANT_PEERS_BROKER_URL=http://127.0.0.1:7899
-   ```
-3. **Run a backgrounded, READ-ONLY interactive Claude reviewer** in the repo dir, connected to
-   the broker via a channel bridge (e.g. `louislva/claude-peers-mcp`). It MUST be the
-   **interactive** `claude` (NOT `claude -p`) so it stays on the subscription pool, launched
-   read-only so it cannot modify files:
-   ```bash
-   # in tmux/screen (persistent terminal), inside the project dir:
-   claude --permission-mode plan \
-     --allowedTools 'Read,Grep,Glob,Bash(git status:*),Bash(git diff:*),Bash(git show:*)' \
-     --disallowedTools 'Edit,Write,MultiEdit,NotebookEdit'
-   # + a channel MCP that: GET /next from the broker, push the prompt into this session,
-   #   then POST the review to /jobs/:id/result
-   ```
-   Requires Claude Code v2.1.80+ and claude.ai (OAuth) login — channels do not work with API-key auth.
+## Setup — just pick `claude-live` (auto-start)
+
+The backend (broker + reviewer worker + the tmux `claude` session) **starts itself automatically**
+on the first `claude-live` review and is **reused** for every later review. So the only setup is:
+
+```bash
+PEER_ASSISTANTS=claude-live          # or codex,claude-live for multi-peer
+```
+…and make sure `ANTHROPIC_API_KEY` is **unset** and `claude` is logged in (`claude` → `/login`,
+claude.ai). That's it — review from Codex or Claude as usual and the backgrounded Claude session
+appears on demand. The MCP server logs one line to stderr when it auto-starts the backend.
+
+- Watch the live reviewer think: `tmux attach -t peer-reviewer` (Ctrl-b d to detach).
+- Auto-start logs (broker + worker stdout/stderr): `$TMPDIR/code-assistant-peers-backend.log`.
+- Stop the backend: `tmux kill-session -t peer-reviewer` and kill the broker on its port.
+- Disable auto-start (run the daemons yourself): `CODE_ASSISTANT_PEERS_NO_AUTOSTART=1`.
+
+### Manual / advanced (optional)
+
+Run the daemons yourself (e.g. on a different host/port, or to share one reviewer across repos):
+
+```bash
+# terminal A — broker
+CODE_ASSISTANT_PEERS_BROKER_PORT=7899 bun broker/server.ts
+# terminal B — reviewer worker (creates the read-only interactive tmux `claude`, processes jobs)
+CODE_ASSISTANT_PEERS_REVIEWER_CWD="$PWD" bun broker/reviewer.ts
+#   --once : process a single job then exit (verification)
+#   --echo : fake reviewer (no claude) for plumbing tests
+```
+
+### Tuning (env)
+
+| var | default | meaning |
+|---|---|---|
+| `CODE_ASSISTANT_PEERS_TMUX_SESSION` | `peer-reviewer` | tmux session name |
+| `CODE_ASSISTANT_PEERS_REVIEWER_CWD` | cwd | repo dir the reviewer runs in |
+| `CODE_ASSISTANT_PEERS_REVIEWER_CLAUDE_ARGS` | read-only flags | override `claude` args (JSON array or space-separated) |
+| `CODE_ASSISTANT_PEERS_REVIEWER_STARTUP_MS` | `30000` | how long to wait for the TUI to boot |
+| `CODE_ASSISTANT_PEERS_REVIEW_TIMEOUT_MS` | `600000` | per-review deliver timeout |
+| `CODE_ASSISTANT_PEERS_REVIEWER_POLL_MS` | `1000` | pane poll interval |
 
 ## Read-only safety
 
-The reviewer session is launched with `--permission-mode plan` + `Edit/Write/MultiEdit`
+The reviewer session launches with `--permission-mode plan` and `Edit/Write/MultiEdit/NotebookEdit`
 disallowed → it **cannot modify project files**, even if a reviewed diff contains injected
-instructions. tmux does not isolate anything; the read-only permission mode is the safeguard
-(same model the existing `claude -p` reviewer uses). Run it in the project dir so it can read
-the working state (needed to review uncommitted changes).
+instructions. tmux does not isolate anything; the read-only permission mode is the safeguard (same
+model the existing `claude -p` reviewer uses). It runs in the project dir so it can read the working
+state needed to review uncommitted changes.
+
+## How delivery / capture works (and its limits)
+
+- The (large) review prompt is written to a temp file; the worker sends the session a SHORT
+  instruction ("read this file, review it, end with marker `<<<PEER-REVIEW-DONE:<jobId>>>>`").
+- Completion is detected by polling `capture-pane` for the **per-job-unique marker** appearing
+  twice (once echoed into the input, once emitted at the end of the review). The review is the
+  text between the two; `clear-history` per job keeps the scrollback to the current job.
+- This scrapes a rendered TUI screen, so capture is **best-effort**: very long reviews, heavy
+  repaints, or unusual wrapping can degrade extraction. A wide pane (`-x 400`) and `capture-pane -J`
+  (join wrapped lines) mitigate it. If the marker never appears within the timeout, the worker
+  reports a job error and the host falls back to `claude -p`.
 
 ## Fallback
 
-If the broker or the live session is unavailable, `runReviewCommand` **falls back to spawning
+If the broker or the reviewer worker is unavailable, `runReviewCommand` **falls back to spawning
 `claude -p`** (logs the reason to stderr). So the gate degrades to current behavior rather than
-failing — at the cost of the credit pool for that review.
+failing — at the cost of the credit pool for that one review.
 
 ## Verification checklist (the remaining empirical step)
 
-Before relying on this for cost, confirm on a real run:
-1. **Round-trip:** a review request reaches the live session and the reply comes back
-   (`command` in the stored round is `["<broker>", "claude-live"]`, not a spawned `claude -p`).
-2. **No file changes:** `git status` in the project is unchanged after a review.
-3. **Billing = subscription:** the reviewer's usage appears under the Claude **subscription**,
-   NOT the Agent-SDK/headless credit pool. This is the load-bearing assumption — measure it.
+Run with the worker up and `PEER_ASSISTANTS=claude-live`:
+1. **Plumbing (no claude):** `bun broker/reviewer.ts --echo --once` against a submitted job returns
+   a result — confirms broker↔worker↔result wiring. (Covered by tests too.)
+2. **Live round-trip:** a real review reaches the tmux `claude` session and the reply comes back —
+   the stored round's `command` is `["<broker>", "claude-live"]`, not a spawned `claude -p`.
+   Watch it live with `tmux attach -t peer-reviewer`.
+3. **No file changes:** `git status` in the project is unchanged after a review.
+4. **Billing = subscription:** the reviewer's usage appears under the Claude **subscription**, NOT
+   the Agent-SDK/headless credit pool, and `ANTHROPIC_API_KEY` is unset. This is the load-bearing
+   assumption — measure it.
 
 ## Tradeoffs vs `claude -p`
 
-| | `claude -p` | channel + live session |
+| | `claude -p` | tmux + live session |
 |---|---|---|
-| billing | credit pool ❌ | subscription ✅ (assumed; verify) |
+| billing | credit pool (after 2026-06-15) ❌ | subscription ✅ (inferred; verify) |
 | concurrency | parallel (fresh process each) | serialized (one session) |
 | availability | always spawnable | session must be up (else fallback) |
-| stability | stable | channels = research preview |
+| stability | stable | TUI scraping is best-effort |
