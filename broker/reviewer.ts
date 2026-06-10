@@ -132,30 +132,43 @@ export async function runReviewerWorker(options: ReviewerWorkerOptions): Promise
 // ---------------------------------------------------------------------------
 // Output extraction (pure, unit-tested)
 //
-// We instruct the live session to end its review with a unique-per-job marker. The marker shows
-// up at least twice in the captured pane: once where our instruction is echoed into the input,
-// and once where the session prints it at the end of the review. We take the text BETWEEN the
-// first and last occurrence as the review. Per-job-unique markers mean stale markers from prior
-// jobs in the scrollback never match.
+// We instruct the live session to WRAP its review between two unique-per-job markers: a BEGIN
+// marker printed immediately before the review body and a DONE marker on the final line. Each
+// marker also appears once where our instruction is echoed into the input, so the review is
+// complete only when each marker appears at least twice (echo + emitted). We take the text
+// between the LAST BEGIN and the LAST DONE occurrence — this structurally excludes the echoed
+// instruction, any preamble narration, and tool-status chrome printed before the body (which the
+// old single-end-marker scheme could only filter heuristically). Per-job-unique markers mean
+// stale markers from prior jobs in the scrollback never match.
 // ---------------------------------------------------------------------------
 
+// Plain hyphenated tokens only — NO angle brackets, backticks, or markdown-special chars. The
+// Claude TUI/markdown renderer mangles bracketed markers (e.g. `<<<x>>>` renders as `<<x>>`),
+// which broke marker matching. Letters/digits/hyphens/underscores survive rendering intact.
+export function beginMarkerFor(jobId: string): string {
+  return `PEER-REVIEW-BEGIN-${jobId}`;
+}
+
 export function doneMarkerFor(jobId: string): string {
-  // Plain hyphenated token only — NO angle brackets, backticks, or markdown-special chars. The
-  // Claude TUI/markdown renderer mangles bracketed markers (e.g. `<<<x>>>` renders as `<<x>>`),
-  // which broke marker matching. Letters/digits/hyphens/underscores survive rendering intact.
   return `PEER-REVIEW-DONE-${jobId}-END`;
 }
 
-// Returns the review text if the capture shows a completed review (marker present as real output,
-// i.e. at least twice — echo + emitted), otherwise null (still running / not delivered yet).
+// Returns the review text if the capture shows a completed review (both markers EMITTED by the
+// session, i.e. each present at least twice — echo + emitted), otherwise null (still running).
 export function extractReviewFromCapture(capture: string, jobId: string): string | null {
-  const marker = doneMarkerFor(jobId);
-  const first = capture.indexOf(marker);
-  if (first === -1) return null;
-  const last = capture.lastIndexOf(marker);
-  if (last === first) return null; // only the echoed instruction so far — not done
+  const begin = beginMarkerFor(jobId);
+  const done = doneMarkerFor(jobId);
+  const firstBegin = capture.indexOf(begin);
+  const firstDone = capture.indexOf(done);
+  if (firstBegin === -1 || firstDone === -1) return null;
+  const lastBegin = capture.lastIndexOf(begin);
+  const lastDone = capture.lastIndexOf(done);
+  // Each marker appears once in the echoed instruction; require a second (emitted) occurrence of
+  // both, in order, so the echo alone (which contains BEGIN then DONE) never matches.
+  if (lastBegin === firstBegin || lastDone === firstDone) return null;
+  if (lastDone <= lastBegin) return null; // mid-repaint / out-of-order — keep polling
 
-  const between = capture.slice(first + marker.length, last);
+  const between = capture.slice(lastBegin + begin.length, lastDone);
   return cleanCapturedReview(between);
 }
 
@@ -193,6 +206,10 @@ export interface TmuxSessionConfig {
   // Dir the per-job prompt files are written to. Granted to the session via `--add-dir` so the
   // read-only reviewer can Read it without a permission prompt (it lives outside the repo cwd).
   promptDir: string;
+  // Send `/clear` before each review (default true). False keeps the live session's conversation
+  // memory across reviews of this repo — richer follow-up context at the cost of cross-task
+  // bleed and unbounded context growth.
+  clearBetweenReviews: boolean;
   startupTimeoutMs: number;
   deliverTimeoutMs: number;
   pollIntervalMs: number;
@@ -215,7 +232,8 @@ export class TmuxClaudeSession implements ReviewerSession {
 
   async deliver(prompt: string, jobId: string, signal: AbortSignal): Promise<string> {
     await this.ensureSession(signal);
-    const marker = doneMarkerFor(jobId);
+    const begin = beginMarkerFor(jobId);
+    const done = doneMarkerFor(jobId);
     const { sessionName, promptDir, deliverTimeoutMs, pollIntervalMs } = this.config;
 
     // Hand the (large) review prompt to the session via a file — typing it through send-keys is
@@ -226,17 +244,25 @@ export class TmuxClaudeSession implements ReviewerSession {
     await writeFile(promptFile, prompt, "utf8");
     const instruction =
       `Read the file ${promptFile} and perform the code review it describes. ` +
-      `Output the full review as plain text. On the final line, output exactly this and nothing else: ${marker}`;
+      `Print exactly ${begin} on a line by itself, then the full review as plain text, ` +
+      `then exactly ${done} on the final line.`;
 
     try {
-      // Reset the reused session's CONVERSATION before each review: this single live session
-      // serves every review, so without `/clear` its context grows unbounded and earlier reviews
-      // could bleed into later ones. `/clear` keeps each review independent and bounded.
-      await tmux(["send-keys", "-t", sessionName, "-l", "--", "/clear"]);
-      await sleep(150, signal);
-      await tmux(["send-keys", "-t", sessionName, "Enter"]);
-      await sleep(600, signal); // let /clear settle before we wipe scrollback
-      // Drop prior scrollback so only this job's output (and its echoed marker) is captured.
+      // Reset the reused session's CONVERSATION before each review (default): this single live
+      // session serves every review, so without `/clear` its context grows unbounded and earlier
+      // reviews bleed into later ones. Opt out (CODE_ASSISTANT_PEERS_REVIEWER_CLEAR=never) to
+      // keep the session's memory across reviews — e.g. follow-up rounds that benefit from what
+      // the reviewer already read. NOTE the session is per-REPO, not per-task, so without /clear
+      // history from other tasks in the same repo accumulates too.
+      if (this.config.clearBetweenReviews) {
+        await tmux(["send-keys", "-t", sessionName, "-l", "--", "/clear"]);
+        await sleep(150, signal);
+        await tmux(["send-keys", "-t", sessionName, "Enter"]);
+        await sleep(600, signal); // let /clear settle before we wipe scrollback
+      }
+      // Always drop prior tmux scrollback so the capture is bounded to this job. This wipes the
+      // rendered pane history only — NOT the session's conversation memory — so it is safe (and
+      // required for clean extraction) regardless of clearBetweenReviews.
       await tmux(["clear-history", "-t", sessionName]);
       await tmux(["send-keys", "-t", sessionName, "-l", "--", instruction]);
       await sleep(150, signal); // let the TUI register the paste before submitting
@@ -392,6 +418,8 @@ async function main(): Promise<void> {
       cwd: repoCwd,
       claudeArgs,
       promptDir,
+      // "never" keeps the session's conversation memory across reviews; anything else clears.
+      clearBetweenReviews: process.env.CODE_ASSISTANT_PEERS_REVIEWER_CLEAR !== "never",
       startupTimeoutMs: envInt("CODE_ASSISTANT_PEERS_REVIEWER_STARTUP_MS", 30_000),
       deliverTimeoutMs: envInt("CODE_ASSISTANT_PEERS_REVIEW_TIMEOUT_MS", DEFAULT_DELIVER_TIMEOUT_MS),
       pollIntervalMs: envInt("CODE_ASSISTANT_PEERS_REVIEWER_POLL_MS", DEFAULT_POLL_INTERVAL_MS),

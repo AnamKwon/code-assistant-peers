@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   type ReviewerSession,
   acquireWorkerLock,
+  beginMarkerFor,
   claimNextJob,
   doneMarkerFor,
   extractReviewFromCapture,
@@ -172,42 +173,56 @@ describe("reviewer worker loop", () => {
 });
 
 describe("review extraction from a captured pane", () => {
-  test("returns null when the marker is absent (no review yet)", () => {
+  // The echoed instruction line, as it appears in the pane: contains BOTH markers once.
+  const echoLine = (jobId: string) =>
+    `> Read the file /tmp/peer/${jobId}.md ... Print exactly ${beginMarkerFor(jobId)} on a line by itself, then the full review as plain text, then exactly ${doneMarkerFor(jobId)} on the final line.`;
+
+  test("returns null when the markers are absent (no review yet)", () => {
     expect(extractReviewFromCapture("just booting up\n> ", "job-1")).toBeNull();
   });
 
-  test("returns null when only the echoed instruction marker is present (still running)", () => {
-    const marker = doneMarkerFor("job-1");
-    const pane = `> Read the file /tmp/x.md ... output exactly: ${marker}\n\nthinking...`;
+  test("returns null when only the echoed instruction is present (still running)", () => {
+    // The echo contains BEGIN then DONE in order — must NOT be mistaken for a completed review.
+    const pane = `${echoLine("job-1")}\n\nthinking...`;
     expect(extractReviewFromCapture(pane, "job-1")).toBeNull();
   });
 
-  test("extracts the review between the echoed marker and the emitted marker", () => {
-    const marker = doneMarkerFor("job-7");
+  test("returns null when only the BEGIN marker has been emitted (body still streaming)", () => {
+    const pane = [echoLine("job-2"), "", beginMarkerFor("job-2"), "No findings so far..."].join("\n");
+    expect(extractReviewFromCapture(pane, "job-2")).toBeNull();
+  });
+
+  test("extracts only the body between the EMITTED markers, excluding preamble and tool chrome", () => {
     const pane = [
-      "│ > Read the file /tmp/peer/job-7.md ... output exactly: " + marker,
+      "│ " + echoLine("job-7"),
       "│",
+      "│ I'll read the job file and review the change.", // preamble narration — must be excluded
+      "│   Read 1 file (ctrl+o to expand)", // tool-status chrome — must be excluded
+      "│ ⏺ " + beginMarkerFor("job-7"),
       "│ No findings. The change correctly clamps the timeout.",
       "│ patch is correct",
-      "│ " + marker,
+      "│ " + doneMarkerFor("job-7"),
       "╰──────────────────────────────────────────╯",
     ].join("\n");
     const review = extractReviewFromCapture(pane, "job-7");
     expect(review).toContain("No findings");
     expect(review).toContain("patch is correct");
-    expect(review).not.toContain(marker);
+    expect(review).not.toContain("I'll read the job file"); // begin marker excludes the preamble
+    expect(review).not.toContain("Read 1 file");
+    expect(review).not.toContain(beginMarkerFor("job-7"));
+    expect(review).not.toContain(doneMarkerFor("job-7"));
   });
 
-  test("a stale marker from a different job does not match this job", () => {
-    const otherMarker = doneMarkerFor("old-job");
-    const pane = `previous review ... ${otherMarker}\nfresh prompt for the new job`;
+  test("stale markers from a different job do not match this job", () => {
+    const pane = `previous review ... ${beginMarkerFor("old-job")}\nbody\n${doneMarkerFor("old-job")}\nfresh prompt for the new job`;
     expect(extractReviewFromCapture(pane, "job-9")).toBeNull();
   });
 
   // Regression: the Claude TUI/markdown renderer mangles bracketed markers (e.g. `<<<x>>>` is
-  // rendered as `<<x>>`), which silently broke live marker matching. The marker must use only
-  // letters/digits/hyphens/underscores so it survives rendering byte-for-byte.
-  test("the done marker contains no markdown/TUI-special characters", () => {
+  // rendered as `<<x>>`), which silently broke live marker matching. Markers must use only
+  // letters/digits/hyphens/underscores so they survive rendering byte-for-byte.
+  test("both markers contain no markdown/TUI-special characters", () => {
+    expect(beginMarkerFor("job-1")).toMatch(/^[A-Za-z0-9_-]+$/);
     expect(doneMarkerFor("job-1")).toMatch(/^[A-Za-z0-9_-]+$/);
   });
 });

@@ -84,6 +84,7 @@ CODE_ASSISTANT_PEERS_REVIEWER_CWD="$PWD" bun broker/reviewer.ts
 | `CODE_ASSISTANT_PEERS_TMUX_SESSION` | `peer-reviewer` | tmux session name |
 | `CODE_ASSISTANT_PEERS_REVIEWER_CWD` | cwd | repo dir the reviewer runs in |
 | `CODE_ASSISTANT_PEERS_REVIEWER_CLAUDE_ARGS` | read-only flags | override `claude` args (JSON array or space-separated) |
+| `CODE_ASSISTANT_PEERS_REVIEWER_CLEAR` | `always` | `never` keeps the session's conversation memory across reviews (richer follow-up context; note the session is per-REPO, so other tasks' history accumulates too, and a long-lived context will eventually auto-compact) |
 | `CODE_ASSISTANT_PEERS_REVIEWER_STARTUP_MS` | `30000` | how long to wait for the TUI to boot |
 | `CODE_ASSISTANT_PEERS_REVIEW_TIMEOUT_MS` | `600000` | per-review deliver timeout |
 | `CODE_ASSISTANT_PEERS_REVIEWER_POLL_MS` | `1000` | pane poll interval |
@@ -99,10 +100,13 @@ state needed to review uncommitted changes.
 ## How delivery / capture works (and its limits)
 
 - The (large) review prompt is written to a temp file; the worker sends the session a SHORT
-  instruction ("read this file, review it, end with marker `<<<PEER-REVIEW-DONE:<jobId>>>>`").
-- Completion is detected by polling `capture-pane` for the **per-job-unique marker** appearing
-  twice (once echoed into the input, once emitted at the end of the review). The review is the
-  text between the two; `clear-history` per job keeps the scrollback to the current job.
+  instruction ("read this file, review it, print `PEER-REVIEW-BEGIN-<jobId>`, the review, then
+  `PEER-REVIEW-DONE-<jobId>-END`").
+- Completion is detected by polling `capture-pane` until **both per-job-unique markers** have been
+  emitted (each also appears once in the echoed instruction, so each must appear at least twice).
+  The review is the text between the last BEGIN and the last DONE — wrapping the body in two
+  markers structurally excludes the echoed instruction, preamble narration, and tool-status
+  chrome; `clear-history` per job keeps the scrollback to the current job.
 - This scrapes a rendered TUI screen, so capture is **best-effort**: very long reviews, heavy
   repaints, or unusual wrapping can degrade extraction. A wide pane (`-x 400`) and `capture-pane -J`
   (join wrapped lines) mitigate it. If the marker never appears within the timeout, the worker
