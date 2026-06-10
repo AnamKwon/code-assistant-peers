@@ -270,6 +270,9 @@ export class TmuxClaudeSession implements ReviewerSession {
 
       const deadline = Date.now() + deliverTimeoutMs;
       while (Date.now() < deadline) {
+        // Bail out promptly on worker shutdown (SIGINT/SIGTERM) instead of polling until the
+        // deliver timeout — the job is reported as an error and the worker loop can exit.
+        if (signal.aborted) throw new Error("reviewer worker is shutting down");
         await sleep(pollIntervalMs, signal);
         const capture = await this.capture();
         const review = extractReviewFromCapture(capture, jobId);

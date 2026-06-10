@@ -126,9 +126,9 @@ function spawnBackend(cwd: string): void {
   Bun.spawn([process.execPath, reviewerPath], opts);
   console.error(
     `[code-assistant-peers] auto-started channel backend (broker + reviewer worker) in ${cwd}. ` +
-      `It runs a backgrounded INTERACTIVE Claude session (subscription pool, not 'claude -p'). ` +
-      `Logs: ${logPath}. Watch the reviewer live: tmux attach -t peer-reviewer. ` +
-      `Stop it: tmux kill-session -t peer-reviewer and kill the broker on ${base}.`,
+      `It runs backgrounded INTERACTIVE Claude sessions, one per reviewed repo (subscription pool, not 'claude -p'). ` +
+      `Logs: ${logPath}. List the reviewer sessions: tmux ls (named peer-reviewer-<repo>-<hash>); ` +
+      `watch one live: tmux attach -t <name>. Stop everything: tmux kill-session per session and kill the broker on ${base}.`,
   );
 }
 

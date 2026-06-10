@@ -59,9 +59,10 @@ PEER_ASSISTANTS=claude-live          # or codex,claude-live for multi-peer
 claude.ai). That's it — review from Codex or Claude as usual and the backgrounded Claude session
 appears on demand. The MCP server logs one line to stderr when it auto-starts the backend.
 
-- Watch the live reviewer think: `tmux attach -t peer-reviewer` (Ctrl-b d to detach).
+- Sessions are per repo, named `peer-reviewer-<repo>-<hash>` — list them with `tmux ls`.
+- Watch a live reviewer think: `tmux attach -t <session name>` (Ctrl-b d to detach).
 - Auto-start logs (broker + worker stdout/stderr): `$TMPDIR/code-assistant-peers-backend.log`.
-- Stop the backend: `tmux kill-session -t peer-reviewer` and kill the broker on its port.
+- Stop the backend: `tmux kill-session -t <session name>` per session and kill the broker on its port.
 - Disable auto-start (run the daemons yourself): `CODE_ASSISTANT_PEERS_NO_AUTOSTART=1`.
 
 ### Manual / advanced (optional)
@@ -81,7 +82,7 @@ CODE_ASSISTANT_PEERS_REVIEWER_CWD="$PWD" bun broker/reviewer.ts
 
 | var | default | meaning |
 |---|---|---|
-| `CODE_ASSISTANT_PEERS_TMUX_SESSION` | `peer-reviewer` | tmux session name |
+| `CODE_ASSISTANT_PEERS_TMUX_SESSION` | `peer-reviewer` | tmux session BASE name (per-repo sessions are `<base>-<repo>-<hash>`) |
 | `CODE_ASSISTANT_PEERS_REVIEWER_CWD` | cwd | repo dir the reviewer runs in |
 | `CODE_ASSISTANT_PEERS_REVIEWER_CLAUDE_ARGS` | read-only flags | override `claude` args (JSON array or space-separated) |
 | `CODE_ASSISTANT_PEERS_REVIEWER_CLEAR` | `always` | `never` keeps the session's conversation memory across reviews (richer follow-up context; note the session is per-REPO, so other tasks' history accumulates too, and a long-lived context will eventually auto-compact) |
@@ -133,7 +134,7 @@ Run with the worker up and `PEER_ASSISTANTS=claude-live`:
    a result — confirms broker↔worker↔result wiring. (Covered by tests too.)
 2. **Live round-trip:** a real review reaches the tmux `claude` session and the reply comes back —
    the stored round's `command` is `["<broker>", "claude-live"]`, not a spawned `claude -p`.
-   Watch it live with `tmux attach -t peer-reviewer`.
+   Watch it live: `tmux ls` to find the `peer-reviewer-<repo>-<hash>` session, then `tmux attach -t <name>`.
 3. **No file changes:** `git status` in the project is unchanged after a review.
 4. **Billing = subscription:** the reviewer's usage appears under the Claude **subscription**, NOT
    the Agent-SDK/headless credit pool, and `ANTHROPIC_API_KEY` is unset. This is the load-bearing
