@@ -101,17 +101,43 @@ Run local checks:
 bun run check
 ```
 
-For registry-based usage after publishing:
+## Install From Npm
+
+The package is published as `mcp-code-assistant-peers` on npm. Install Bun first because the package binaries run through `#!/usr/bin/env bun`:
 
 ```bash
-bun add -g mcp-code-assistant-peers
+curl -fsSL https://bun.sh/install | bash
+export BUN_INSTALL="$HOME/.bun"
+export PATH="$BUN_INSTALL/bin:$PATH"
+```
+
+Then install the package globally before running `setup`, so MCP registration points to a stable package path:
+
+```bash
+npm install -g mcp-code-assistant-peers
 code-assistant-peers status
 ```
 
-One-shot usage is also possible:
+Configure one MCP client with the npm-installed package. Choose only the block for the client you use.
+
+For Codex:
 
 ```bash
-bunx mcp-code-assistant-peers status
+code-assistant-peers setup codex --peers=auto
+```
+
+For Claude Code:
+
+```bash
+code-assistant-peers setup claude --peers=auto
+```
+
+Then restart the configured MCP client and call `code_assistant_peers_setup` from that client to verify the registered server.
+
+One-shot usage is also possible for read-only commands such as `status`, but do not use `npx` for `setup` because MCP registration needs a stable installed server path:
+
+```bash
+npx mcp-code-assistant-peers status
 ```
 
 ## Quick Start
@@ -249,7 +275,7 @@ Claude, Codex, and Gemini are built in:
 
 ```text
 claude -> claude -p --permission-mode plan ...
-codex  -> codex exec --sandbox read-only --skip-git-repo-check -
+codex  -> codex exec --ignore-user-config --ignore-rules --sandbox read-only --skip-git-repo-check -
 gemini -> gemini --skip-trust --approval-mode plan -p ""  # prompt over stdin
 ```
 
@@ -258,6 +284,8 @@ For other CLIs, set `CODE_ASSISTANT_PEERS_ASSISTANTS` to a JSON object. Each ada
 - `command`: argv array used to launch the assistant.
 - `prompt_transport`: `stdin` or `argv`.
 - `description`: optional human-readable label.
+- `model_arg`: optional CLI flag used before the model id, such as `--model` or `-m`.
+- `models`: optional model metadata shown in `code_assistant_peers_setup` and used by `review_model: "auto"`.
 
 Example:
 
@@ -265,11 +293,23 @@ Example:
 export CODE_ASSISTANT_PEERS_ASSISTANTS='{
   "glm": {
     "command": ["glm", "chat"],
-    "prompt_transport": "stdin"
+    "prompt_transport": "stdin",
+    "description": "GLM coding CLI",
+    "model_arg": "--model",
+    "models": [
+      { "id": "glm-4.6", "quality": "high", "cost": "medium", "latency": "medium", "routing": ["balanced"] },
+      { "id": "glm-4.6-air", "quality": "medium", "cost": "low", "latency": "low", "routing": ["fast"] }
+    ]
   },
   "deepseek": {
     "command": ["deepseek", "chat"],
-    "prompt_transport": "stdin"
+    "prompt_transport": "stdin",
+    "description": "DeepSeek coding CLI",
+    "model_arg": "--model",
+    "models": [
+      { "id": "deepseek-chat", "quality": "high", "cost": "low", "latency": "medium", "routing": ["balanced"] },
+      { "id": "deepseek-reasoner", "quality": "highest", "cost": "medium", "latency": "high", "routing": ["deep"] }
+    ]
   }
 }'
 ```
@@ -282,6 +322,216 @@ HOST_ASSISTANT=codex PEER_ASSISTANT=gemini code-assistant-peers-server
 ```
 
 If `PEER_ASSISTANT` is omitted, `claude` pairs with `codex`, `codex` pairs with `claude` and `gemini`, and custom hosts use the first other registered adapter.
+
+### Custom Adapter Recipes
+
+Custom adapter commands are thin wrappers around existing coding-agent CLIs. The MCP server does not normalize provider APIs by itself; it passes a review prompt to the configured command and, when requested, inserts `model_arg <model>` into that command.
+
+Use `stdin` when the CLI supports it. Use `argv` only for short prompt CLIs because review prompts may include large diffs and semantic context.
+
+#### GLM CLI
+
+```bash
+export CODE_ASSISTANT_PEERS_ASSISTANTS='{
+  "glm": {
+    "command": ["glm", "chat"],
+    "prompt_transport": "stdin",
+    "description": "GLM coding CLI",
+    "model_arg": "--model",
+    "models": [
+      { "id": "glm-4.6", "quality": "high", "cost": "medium", "latency": "medium", "routing": ["balanced"] },
+      { "id": "glm-4.6-air", "quality": "medium", "cost": "low", "latency": "low", "routing": ["fast"] }
+    ],
+    "env_allowlist": ["PATH", "HOME", "USER", "SHELL", "TERM", "TMPDIR", "GLM_API_KEY"]
+  }
+}'
+
+HOST_ASSISTANT=codex PEER_ASSISTANT=glm code-assistant-peers-server
+```
+
+Review with an explicit GLM model:
+
+```json
+{
+  "task_id": "...",
+  "review_models": {
+    "glm": "glm-4.6"
+  }
+}
+```
+
+#### OpenRouter Wrapper
+
+OpenRouter is an API provider, so you usually need a small CLI wrapper that accepts a prompt on stdin and forwards it to OpenRouter. The adapter should point to that wrapper. Replace the model ids below with the exact ids your OpenRouter account and wrapper support.
+
+```bash
+export CODE_ASSISTANT_PEERS_ASSISTANTS='{
+  "openrouter": {
+    "command": ["openrouter-review"],
+    "prompt_transport": "stdin",
+    "description": "OpenRouter review wrapper",
+    "model_arg": "--model",
+    "models": [
+      { "id": "anthropic/claude-sonnet", "quality": "high", "cost": "medium", "latency": "medium", "routing": ["balanced"] },
+      { "id": "anthropic/claude-opus", "quality": "highest", "cost": "high", "latency": "high", "routing": ["deep"] },
+      { "id": "google/gemini-pro", "quality": "highest", "cost": "high", "latency": "high", "routing": ["deep", "long_context"] },
+      { "id": "openai/gpt-mini", "quality": "high", "cost": "medium", "latency": "low", "routing": ["fast", "balanced"] }
+    ],
+    "env_allowlist": ["PATH", "HOME", "USER", "SHELL", "TERM", "TMPDIR", "OPENROUTER_API_KEY"]
+  }
+}'
+
+HOST_ASSISTANT=codex PEER_ASSISTANT=openrouter code-assistant-peers-server
+```
+
+Example wrapper contract:
+
+```text
+openrouter-review --model anthropic/claude-sonnet
+# reads review prompt from stdin
+# writes review text to stdout
+# exits non-zero on provider or validation failure
+```
+
+Review with OpenRouter:
+
+```json
+{
+  "task_id": "...",
+  "mode": "gate",
+  "review_models": {
+    "openrouter": "anthropic/claude-sonnet"
+  }
+}
+```
+
+#### DeepSeek CLI
+
+```bash
+export CODE_ASSISTANT_PEERS_ASSISTANTS='{
+  "deepseek": {
+    "command": ["deepseek", "chat"],
+    "prompt_transport": "stdin",
+    "description": "DeepSeek coding CLI",
+    "model_arg": "--model",
+    "models": [
+      { "id": "deepseek-chat", "quality": "high", "cost": "low", "latency": "medium", "routing": ["balanced"] },
+      { "id": "deepseek-reasoner", "quality": "highest", "cost": "medium", "latency": "high", "routing": ["deep"] }
+    ],
+    "env_allowlist": ["PATH", "HOME", "USER", "SHELL", "TERM", "TMPDIR", "DEEPSEEK_API_KEY"]
+  }
+}'
+```
+
+#### Ollama or Local CLI
+
+For local models, keep `env_allowlist` small and point `command` at a wrapper CLI that can read stdin.
+
+```bash
+export CODE_ASSISTANT_PEERS_ASSISTANTS='{
+  "ollama": {
+    "command": ["ollama-review"],
+    "prompt_transport": "stdin",
+    "description": "Local Ollama reviewer wrapper",
+    "model_arg": "--model",
+    "models": [
+      { "id": "qwen3-coder", "quality": "medium", "cost": "low", "latency": "medium", "routing": ["fast"] }
+    ]
+  }
+}'
+```
+
+Example wrapper contract:
+
+```text
+ollama-review --model qwen3-coder
+# reads review prompt from stdin
+# internally calls: ollama run qwen3-coder
+# writes review text to stdout
+```
+
+If the local CLI expects the model as a positional argument instead of a flag, use a wrapper script. Custom adapters insert models as `model_arg <model>`, so positional-model CLIs are cleaner behind wrappers.
+
+### Reviewer Model Selection
+
+`code_assistant_peers_setup` reports whether each configured assistant CLI supports model selection, the known model candidates, and whether live model probing was enabled. By default it performs no live model probes because those can spend tokens; set `CODE_ASSISTANT_PEERS_PROBE_MODELS=1` before starting the MCP server if you want setup to test known model candidates with small probe calls.
+
+Built-in model flags:
+
+```text
+claude -> --model <model>  # known candidates: haiku, sonnet, opus, best, sonnet[1m], opus[1m], opusplan
+codex  -> -m <model>       # known candidates: gpt-5.5, gpt-5.4, gpt-5.3-codex, gpt-5.4-mini, gpt-5.4-nano
+gemini -> --model <model>  # known candidates: auto, pro, flash, flash-lite, gemini-3-pro-preview, gemini-3-flash-preview, gemini-2.5-pro, gemini-2.5-flash, gemini-2.5-flash-lite
+```
+
+The host coding agent that calls the MCP review tool should choose the reviewer model when it has enough context. The MCP server exposes the known candidates in `code_assistant_peers_setup`, including `quality`, `cost`, `latency`, and `routing` metadata.
+
+Selection precedence:
+
+```text
+review_models[reviewer] > review_model > reviewer CLI default
+```
+
+If neither `review_model` nor `review_models` is provided, the reviewer CLI default model is used.
+
+Use `review_model` with an explicit model id only when that same id is valid for every targeted reviewer CLI. In mixed-provider review, prefer `review_models` because model ids are provider-specific.
+
+Pick explicit per-reviewer models when the host can make a clear cost/quality tradeoff:
+
+```json
+{
+  "task_id": "...",
+  "mode": "adversarial",
+  "focus": "security and migration risk",
+  "review_models": {
+    "claude": "opus",
+    "codex": "gpt-5.5"
+  }
+}
+```
+
+Use automatic model routing only when the host wants to delegate the choice to this MCP server:
+
+```json
+{
+  "task_id": "...",
+  "review_model": "auto"
+}
+```
+
+With `auto`, the server chooses from the hardcoded candidate list per reviewer:
+
+- `fast`: small docs, tests, lint, copy, or low-risk diffs.
+- `balanced`: normal review, gate review, and self-review.
+- `deep`: adversarial/collaborative review, peer-fix requests, or focus areas like security, auth, data loss, migrations, rollback, secrets, privacy, race conditions, databases, releases, or performance.
+- `long_context`: truncated diffs, very large diffs, or changes touching many files.
+
+Pick one model for a review request:
+
+```json
+{
+  "task_id": "...",
+  "review_model": "sonnet"
+}
+```
+
+Or pick models per reviewer:
+
+```json
+{
+  "task_id": "...",
+  "review_models": {
+    "claude": "opus",
+    "codex": "gpt-5.4"
+  }
+}
+```
+
+The selected model is included in the recorded reviewer command. Explicit per-reviewer models override the global model. If a per-reviewer value is `"auto"`, only that reviewer uses automatic routing.
+
+If a custom adapter should support model selection, add `model_arg` and optional `models` metadata to its `CODE_ASSISTANT_PEERS_ASSISTANTS` entry. Model metadata can include `routing` tags (`fast`, `balanced`, `deep`, `long_context`) so automatic routing can choose an appropriate model for that custom reviewer.
+
+Reviewer subprocesses are started with a recursion guard. Claude reviewers run with a strict MCP config that only exposes the optional read-only Serena server, Codex reviewers ignore user config and local rules, and all reviewer subprocesses receive `CODE_ASSISTANT_PEERS_REVIEWER_SUBPROCESS=1` so this MCP server refuses to start recursively inside a reviewer.
 
 For multi-peer review, set `PEER_ASSISTANTS` to a comma-separated list. When this variable is present, it takes precedence over `PEER_ASSISTANT`. The server removes the host from the list, checks which peer CLIs are available, sends reviews to the available peers, and stores one review round per reviewer plus a final aggregate round.
 
@@ -296,6 +546,22 @@ Multi-peer outcomes:
 - `review_failed`: no peer review succeeded, or the aggregate pass failed.
 
 Custom adapters cannot override built-in ids (`claude`, `codex`, or `gemini`). For backwards compatibility, a legacy custom `gemini` entry is ignored and the safer built-in Gemini adapter is used. Use a distinct id such as `gemini-custom` when experimenting with a different command.
+
+Custom adapter model metadata example:
+
+```bash
+export CODE_ASSISTANT_PEERS_ASSISTANTS='{
+  "my-reviewer": {
+    "command": ["my-reviewer", "review"],
+    "prompt_transport": "stdin",
+    "model_arg": "--model",
+    "models": [
+      { "id": "fast", "quality": "medium", "cost": "low", "latency": "low" },
+      { "id": "deep", "quality": "high", "cost": "high", "latency": "high" }
+    ]
+  }
+}'
+```
 
 Prefer `stdin` transport for code review CLIs when possible. Review prompts can include large diffs and sensitive source context. The built-in Gemini adapter uses `-p ""` plus stdin because Gemini appends stdin to the prompt flag. `argv` transport is still available for custom CLIs, but it is subject to process-list exposure and operating-system argument length limits. The server refuses argv prompts above `CODE_ASSISTANT_PEERS_ARGV_PROMPT_BUDGET` to fail with a clear error instead of an opaque process spawn failure.
 
@@ -591,6 +857,8 @@ CODE_ASSISTANT_PEERS_HOME=/path/to/store
 | `PEER_ASSISTANT` | inferred | Assistant id for the reviewer. Required for explicit custom pairings. |
 | `PEER_ASSISTANTS` | unset | Comma-separated reviewer ids for multi-peer review. Takes precedence over `PEER_ASSISTANT`. |
 | `CODE_ASSISTANT_PEERS_ASSISTANTS` | built-ins only | JSON object defining custom CLI assistant adapters. |
+| `CODE_ASSISTANT_PEERS_PROBE_MODELS` | unset | Set `1` to make `code_assistant_peers_setup` run small live probes for known model candidates. |
+| `CODE_ASSISTANT_PEERS_MODEL_PROBE_TIMEOUT_MS` | `30000` | Timeout for each live model probe when `CODE_ASSISTANT_PEERS_PROBE_MODELS=1`. |
 | `CODE_ASSISTANT_PEERS_WORKFLOW` | `review_only` | `review_only` or `peer_fix`. |
 | `CODE_ASSISTANT_PEERS_REVIEW_MODE` | `normal` | `normal`, `adversarial`, `gate`, or `collaborative`. |
 | `CODE_ASSISTANT_PEERS_REVIEW_FOCUS` | unset | Optional default review focus, such as security, data loss, migration risk, UI regressions, or performance. |
@@ -643,8 +911,9 @@ test/                  Bun test suite
 
 ## Packaging Notes
 
-This package exposes two binaries:
+This package exposes three binaries:
 
+- `mcp-code-assistant-peers`: package-name management CLI alias
 - `code-assistant-peers`: management CLI
 - `code-assistant-peers-server`: MCP stdio server
 

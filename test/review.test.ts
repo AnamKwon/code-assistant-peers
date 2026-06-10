@@ -14,12 +14,15 @@ import {
   buildReviewCommand,
   buildReviewPrompt,
   buildReviewPromptFromSnapshot,
+  chooseReviewModelTier,
   formatMultiPeerReviewOutputs,
   buildSerenaReviewerGuidance,
   normalizeHost,
   normalizeReviewFocus,
   peerFor,
   prepareReviewPromptSnapshot,
+  resolveReviewerModel,
+  selectAutoReviewerModel,
   runReviewCommand,
   truncateForReview,
 } from "../shared/review.ts";
@@ -36,7 +39,7 @@ import {
   validateSerenaToolSet,
 } from "../shared/semantic.ts";
 import { buildSerenaEnv, resolveAutoPeerSetupConfig, resolveGeminiAutoPeerReadiness, resolveSerenaSetupConfig, upsertCodexMcpTimeoutConfig } from "../shared/setup.ts";
-import { getReviewDiff } from "../shared/git.ts";
+import { getReviewDiff, parseStatusEntriesZ } from "../shared/git.ts";
 import { captureWorkspaceSnapshot, emptyWorkspaceSnapshot } from "../shared/workspace-snapshot.ts";
 import type { PeerTask } from "../shared/types.ts";
 
@@ -415,6 +418,8 @@ describe("review command construction", () => {
     expect(buildReviewCommand("codex")).toEqual([
       "codex",
       "exec",
+      "--ignore-user-config",
+      "--ignore-rules",
       "--sandbox",
       "read-only",
       "--skip-git-repo-check",
@@ -432,6 +437,9 @@ describe("review command construction", () => {
         "-p",
         "--permission-mode",
         "plan",
+        "--strict-mcp-config",
+        "--mcp-config",
+        '{"mcpServers":{}}',
         "--system-prompt",
         REVIEWER_SYSTEM_PROMPT,
         "--allowedTools",
@@ -470,6 +478,91 @@ describe("review command construction", () => {
       if (previous === undefined) delete process.env.CODE_ASSISTANT_PEERS_SERENA_COMMAND;
       else process.env.CODE_ASSISTANT_PEERS_SERENA_COMMAND = previous;
     }
+  });
+
+  test("review model selection inserts provider model arguments before prompt transport", () => {
+    expect(buildReviewCommand("claude", "sonnet").slice(0, 7)).toEqual([
+      "claude",
+      "-p",
+      "--permission-mode",
+      "plan",
+      "--model",
+      "sonnet",
+      "--strict-mcp-config",
+    ]);
+    expect(buildReviewCommand("codex", "gpt-5.5")).toEqual([
+      "codex",
+      "exec",
+      "--ignore-user-config",
+      "--ignore-rules",
+      "--sandbox",
+      "read-only",
+      "--skip-git-repo-check",
+      "-m",
+      "gpt-5.5",
+      "-",
+    ]);
+    expect(buildReviewCommand("gemini", "flash")).toEqual([
+      "gemini",
+      "--skip-trust",
+      "--approval-mode",
+      "plan",
+      "--model",
+      "flash",
+      "-p",
+      "",
+    ]);
+  });
+
+  test("review model resolution lets per-reviewer models override the global model", () => {
+    expect(resolveReviewerModel("claude", {
+      review_model: "sonnet",
+      review_models: { claude: "opus" },
+    })).toBe("opus");
+    expect(resolveReviewerModel("codex", {
+      review_model: "sonnet",
+      review_models: { claude: "opus" },
+    })).toBe("sonnet");
+    expect(resolveReviewerModel("gemini", {})).toBeNull();
+  });
+
+  test("auto review model selection uses hardcoded reviewer model tiers", () => {
+    expect(selectAutoReviewerModel("claude", { diffLength: 1000, changedFileCount: 1, focus: "docs" })).toBe("haiku");
+    expect(selectAutoReviewerModel("claude", { focus: "security and data loss", diffLength: 1000 })).toBe("opus");
+    // diffWasTruncated alone (diffLength=0) no longer forces long_context → balanced
+    expect(selectAutoReviewerModel("claude", { diffWasTruncated: true })).toBe("sonnet");
+    // diffWasTruncated + genuinely large diff still escalates to long_context
+    expect(selectAutoReviewerModel("claude", { diffWasTruncated: true, diffLength: 15000 })).toBe("sonnet[1m]");
+    expect(selectAutoReviewerModel("codex", { mode: "adversarial" })).toBe("gpt-5.5");
+    expect(selectAutoReviewerModel("gemini", { diffLength: 1000, changedFileCount: 1, focus: "tests" })).toBe("flash");
+  });
+
+  test("review model auto token routes through the automatic selector", () => {
+    expect(resolveReviewerModel("claude", {
+      review_model: "auto",
+    }, { focus: "auth migration", diffLength: 5000 })).toBe("opus");
+    expect(resolveReviewerModel("codex", {
+      review_model: "auto",
+      review_models: { codex: "gpt-5.4" },
+    }, { mode: "adversarial" })).toBe("gpt-5.4");
+    expect(resolveReviewerModel("gemini", {
+      review_model: "sonnet",
+      review_models: { gemini: "auto" },
+    }, { diffLength: 1000, changedFileCount: 1, focus: "readme" })).toBe("flash");
+  });
+
+  test("review model tier classifier prefers deeper models for risky or broad reviews", () => {
+    expect(chooseReviewModelTier({ focus: "security", diffLength: 2000 })).toBe("deep");
+    expect(chooseReviewModelTier({ mode: "collaborative" })).toBe("deep");
+    // Serena sets CODE_ASSISTANT_PEERS_DIFF_BUDGET=4000, so any >4k diff is flagged as
+    // truncated. diffWasTruncated alone must not force long_context when the actual diff
+    // is small — it would route every routine change to Opus unnecessarily.
+    expect(chooseReviewModelTier({ diffWasTruncated: true })).toBe("balanced");
+    expect(chooseReviewModelTier({ diffWasTruncated: true, diffLength: 5000 })).toBe("balanced");
+    // Only escalate to long_context when the raw diff is also genuinely large (>12k).
+    expect(chooseReviewModelTier({ diffWasTruncated: true, diffLength: 15000 })).toBe("long_context");
+    expect(chooseReviewModelTier({ focus: "docs", diffLength: 2000, changedFileCount: 1 })).toBe("fast");
+    expect(chooseReviewModelTier({ mode: "gate", diffLength: 2000 })).toBe("balanced");
   });
 
   test("Serena reviewer guidance gives Claude a read-only lookup path", () => {
@@ -568,6 +661,7 @@ describe("review command construction", () => {
     expect(env).toEqual({
       PATH: "/bin",
       SAFE_KEY: "kept",
+      CODE_ASSISTANT_PEERS_REVIEWER_SUBPROCESS: "1",
     });
   });
 
@@ -589,6 +683,7 @@ describe("review command construction", () => {
       OPENAI_API_KEY: "openai",
       GEMINI_API_KEY: "gemini",
       ANTHROPIC_API_KEY: "anthropic",
+      CODE_ASSISTANT_PEERS_REVIEWER_SUBPROCESS: "1",
     });
   });
 
@@ -1191,12 +1286,13 @@ describe("review prompt shaping", () => {
     };
 
     const { prompt } = await buildReviewPrompt(task, { mode: "gate" });
+    const promptInstructions = prompt.split("\nIncluded uncommitted diff for review:")[0];
     expect(prompt).toContain("ALLOW: <short reason>");
     expect(prompt).toContain('"overall_correctness"');
     expect(prompt).toContain('"priority"');
     expect(prompt).toContain('"confidence": 0.8');
     expect(prompt).toContain('"overall_confidence": 0.8');
-    expect(prompt).not.toContain("Start with findings.");
+    expect(promptInstructions).not.toContain("Start with findings.");
     expect(prompt.indexOf("ALLOW: <short reason>")).toBeLessThan(prompt.indexOf("Finding selection rules:"));
   });
 
@@ -1340,9 +1436,10 @@ describe("review prompt shaping", () => {
     };
 
     const { prompt } = await buildReviewPrompt(task, { self_review: true, workflow: "peer_fix" });
+    const promptInstructions = prompt.split("\nIncluded uncommitted diff for review:")[0];
     expect(prompt).toContain("Review mode: normal");
-    expect(prompt).not.toContain("proposing fixes as a peer assistant");
-    expect(prompt).not.toContain(PEER_FIX_PROMPT);
+    expect(promptInstructions).not.toContain("proposing fixes as a peer assistant");
+    expect(promptInstructions).not.toContain(PEER_FIX_PROMPT);
   });
 
   test("rejects gate and collaborative modes for Codex self-review prompts", async () => {
@@ -1366,5 +1463,46 @@ describe("review prompt shaping", () => {
     await expect(buildReviewPrompt(task, { self_review: true, mode: "collaborative" })).rejects.toThrow(
       "Codex self-review is only supported for normal and adversarial review modes",
     );
+  });
+});
+
+describe("git status -z parsing", () => {
+  test("parses a normal mix of status entries", () => {
+    // " M file.ts\0?? new.ts\0A  added.ts\0"
+    const stdout = " M file.ts\0?? new.ts\0A  added.ts\0";
+    expect(parseStatusEntriesZ(stdout)).toEqual([
+      { code: " M", path: "file.ts" },
+      { code: "??", path: "new.ts" },
+      { code: "A ", path: "added.ts" },
+    ]);
+  });
+
+  test("consumes the original-path field for renames without emitting a phantom entry", () => {
+    // Rename: "R  new.ts\0old.ts\0", then a following modified file.
+    const stdout = "R  new.ts\0old.ts\0 M after.ts\0";
+    expect(parseStatusEntriesZ(stdout)).toEqual([
+      { code: "R ", path: "new.ts" },
+      { code: " M", path: "after.ts" },
+    ]);
+  });
+
+  test("handles rename and copy codes in either index or worktree position", () => {
+    const stdout = [
+      "R  staged-new\0staged-old",
+      " R worktree-new\0worktree-old",
+      "C  copy-new\0copy-src",
+      " M plain",
+      "",
+    ].join("\0");
+    expect(parseStatusEntriesZ(stdout)).toEqual([
+      { code: "R ", path: "staged-new" },
+      { code: " R", path: "worktree-new" },
+      { code: "C ", path: "copy-new" },
+      { code: " M", path: "plain" },
+    ]);
+  });
+
+  test("returns an empty list for empty output", () => {
+    expect(parseStatusEntriesZ("")).toEqual([]);
   });
 });

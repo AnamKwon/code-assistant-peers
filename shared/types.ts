@@ -94,7 +94,11 @@ export interface ReviewRequestOptions {
   focus?: string | null;
   semantic_context?: string | null;
   self_review?: boolean;
+  review_model?: string | null;
+  review_models?: Record<string, string>;
 }
+
+export type ReviewModelRoutingTier = "fast" | "balanced" | "deep" | "long_context";
 
 export interface SemanticSymbolHint {
   file: string;
@@ -110,4 +114,16 @@ export interface AssistantAdapter {
   description?: string;
   timeout_ms?: number;
   env_allowlist?: string[];
+  model_arg?: string;
+  models?: AssistantModelInfo[];
+}
+
+export interface AssistantModelInfo {
+  id: string;
+  aliases?: string[];
+  quality?: "low" | "medium" | "high" | "highest";
+  cost?: "low" | "medium" | "high";
+  latency?: "low" | "medium" | "high";
+  routing?: ReviewModelRoutingTier[];
+  description?: string;
 }
