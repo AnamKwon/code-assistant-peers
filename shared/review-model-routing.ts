@@ -56,7 +56,11 @@ export function chooseReviewModelTier(context: ReviewModelRoutingContext = {}): 
   const changedFileCount = context.changedFileCount ?? 0;
   const diffLength = context.diffLength ?? 0;
   const highRisk = /\b(security|auth|permission|data loss|migration|rollback|payment|billing|secret|privacy|race|concurrency|database|schema|production|release|performance)\b/.test(focus);
-  if (context.diffWasTruncated || diffLength > 30000 || changedFileCount > 20) return "long_context";
+  // diffWasTruncated alone is not a reliable long_context signal: a low Serena diff
+  // budget (CODE_ASSISTANT_PEERS_DIFF_BUDGET=4000) marks any routine diff as truncated
+  // even when the actual diff is well within a balanced model's context window.
+  // Only escalate to long_context when the raw diff is genuinely large or very broad.
+  if (diffLength > 30000 || changedFileCount > 20 || (context.diffWasTruncated && diffLength > 12000)) return "long_context";
   if (highRisk || context.mode === "adversarial" || context.mode === "collaborative" || context.workflow === "peer_fix") return "deep";
   if (context.mode === "gate" || context.selfReview) return "balanced";
   if (diffLength > 0 && diffLength <= 4000 && changedFileCount <= 3 && isLowRiskFocus(focus)) return "fast";

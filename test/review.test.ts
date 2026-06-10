@@ -39,7 +39,7 @@ import {
   validateSerenaToolSet,
 } from "../shared/semantic.ts";
 import { buildSerenaEnv, resolveAutoPeerSetupConfig, resolveGeminiAutoPeerReadiness, resolveSerenaSetupConfig, upsertCodexMcpTimeoutConfig } from "../shared/setup.ts";
-import { getReviewDiff } from "../shared/git.ts";
+import { getReviewDiff, parseStatusEntriesZ } from "../shared/git.ts";
 import { captureWorkspaceSnapshot, emptyWorkspaceSnapshot } from "../shared/workspace-snapshot.ts";
 import type { PeerTask } from "../shared/types.ts";
 
@@ -529,7 +529,10 @@ describe("review command construction", () => {
   test("auto review model selection uses hardcoded reviewer model tiers", () => {
     expect(selectAutoReviewerModel("claude", { diffLength: 1000, changedFileCount: 1, focus: "docs" })).toBe("haiku");
     expect(selectAutoReviewerModel("claude", { focus: "security and data loss", diffLength: 1000 })).toBe("opus");
-    expect(selectAutoReviewerModel("claude", { diffWasTruncated: true })).toBe("sonnet[1m]");
+    // diffWasTruncated alone (diffLength=0) no longer forces long_context → balanced
+    expect(selectAutoReviewerModel("claude", { diffWasTruncated: true })).toBe("sonnet");
+    // diffWasTruncated + genuinely large diff still escalates to long_context
+    expect(selectAutoReviewerModel("claude", { diffWasTruncated: true, diffLength: 15000 })).toBe("sonnet[1m]");
     expect(selectAutoReviewerModel("codex", { mode: "adversarial" })).toBe("gpt-5.5");
     expect(selectAutoReviewerModel("gemini", { diffLength: 1000, changedFileCount: 1, focus: "tests" })).toBe("flash");
   });
@@ -551,7 +554,13 @@ describe("review command construction", () => {
   test("review model tier classifier prefers deeper models for risky or broad reviews", () => {
     expect(chooseReviewModelTier({ focus: "security", diffLength: 2000 })).toBe("deep");
     expect(chooseReviewModelTier({ mode: "collaborative" })).toBe("deep");
-    expect(chooseReviewModelTier({ diffWasTruncated: true })).toBe("long_context");
+    // Serena sets CODE_ASSISTANT_PEERS_DIFF_BUDGET=4000, so any >4k diff is flagged as
+    // truncated. diffWasTruncated alone must not force long_context when the actual diff
+    // is small — it would route every routine change to Opus unnecessarily.
+    expect(chooseReviewModelTier({ diffWasTruncated: true })).toBe("balanced");
+    expect(chooseReviewModelTier({ diffWasTruncated: true, diffLength: 5000 })).toBe("balanced");
+    // Only escalate to long_context when the raw diff is also genuinely large (>12k).
+    expect(chooseReviewModelTier({ diffWasTruncated: true, diffLength: 15000 })).toBe("long_context");
     expect(chooseReviewModelTier({ focus: "docs", diffLength: 2000, changedFileCount: 1 })).toBe("fast");
     expect(chooseReviewModelTier({ mode: "gate", diffLength: 2000 })).toBe("balanced");
   });
@@ -1454,5 +1463,46 @@ describe("review prompt shaping", () => {
     await expect(buildReviewPrompt(task, { self_review: true, mode: "collaborative" })).rejects.toThrow(
       "Codex self-review is only supported for normal and adversarial review modes",
     );
+  });
+});
+
+describe("git status -z parsing", () => {
+  test("parses a normal mix of status entries", () => {
+    // " M file.ts\0?? new.ts\0A  added.ts\0"
+    const stdout = " M file.ts\0?? new.ts\0A  added.ts\0";
+    expect(parseStatusEntriesZ(stdout)).toEqual([
+      { code: " M", path: "file.ts" },
+      { code: "??", path: "new.ts" },
+      { code: "A ", path: "added.ts" },
+    ]);
+  });
+
+  test("consumes the original-path field for renames without emitting a phantom entry", () => {
+    // Rename: "R  new.ts\0old.ts\0", then a following modified file.
+    const stdout = "R  new.ts\0old.ts\0 M after.ts\0";
+    expect(parseStatusEntriesZ(stdout)).toEqual([
+      { code: "R ", path: "new.ts" },
+      { code: " M", path: "after.ts" },
+    ]);
+  });
+
+  test("handles rename and copy codes in either index or worktree position", () => {
+    const stdout = [
+      "R  staged-new\0staged-old",
+      " R worktree-new\0worktree-old",
+      "C  copy-new\0copy-src",
+      " M plain",
+      "",
+    ].join("\0");
+    expect(parseStatusEntriesZ(stdout)).toEqual([
+      { code: "R ", path: "staged-new" },
+      { code: " R", path: "worktree-new" },
+      { code: "C ", path: "copy-new" },
+      { code: " M", path: "plain" },
+    ]);
+  });
+
+  test("returns an empty list for empty output", () => {
+    expect(parseStatusEntriesZ("")).toEqual([]);
   });
 });

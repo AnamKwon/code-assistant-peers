@@ -20,9 +20,16 @@ const EXCLUDED_DIRS = new Set([
   ".turbo",
 ]);
 
-const MAX_FILES = Number(process.env.CODE_ASSISTANT_PEERS_NONGIT_MAX_FILES ?? 500);
-const MAX_TEXT_BYTES = Number(process.env.CODE_ASSISTANT_PEERS_NONGIT_MAX_TEXT_BYTES ?? 200_000);
-const MAX_DIFF_TEXT_CHARS = Number(process.env.CODE_ASSISTANT_PEERS_NONGIT_DIFF_TEXT_CHARS ?? 8_000);
+// Guard against non-numeric env overrides: a NaN limit would silently disable the
+// cap (e.g. `captured >= NaN` is always false), letting the walk read the entire tree.
+function positiveIntEnv(value: string | undefined, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
+const MAX_FILES = positiveIntEnv(process.env.CODE_ASSISTANT_PEERS_NONGIT_MAX_FILES, 500);
+const MAX_TEXT_BYTES = positiveIntEnv(process.env.CODE_ASSISTANT_PEERS_NONGIT_MAX_TEXT_BYTES, 200_000);
+const MAX_DIFF_TEXT_CHARS = positiveIntEnv(process.env.CODE_ASSISTANT_PEERS_NONGIT_DIFF_TEXT_CHARS, 8_000);
 
 export async function captureWorkspaceSnapshot(cwd: string): Promise<WorkspaceSnapshot> {
   const files: Record<string, FileSnapshotEntry> = {};
@@ -64,8 +71,14 @@ export async function diffWorkspaceSnapshot(
   baseline: WorkspaceSnapshot,
 ): Promise<{ diff: string; changedFiles: string[]; warning?: string }> {
   const warnings: string[] = [];
+  const current = await captureWorkspaceSnapshot(cwd);
+
+  // Baseline-tracked files that the bounded walk did not capture (truncated, deleted,
+  // or excluded) are read individually here. Files already present in `current` are
+  // reused instead of being read a second time.
   const currentBaselinePaths: Record<string, FileSnapshotEntry> = {};
   for (const path of Object.keys(baseline.files)) {
+    if (current.files[path]) continue;
     try {
       currentBaselinePaths[path] = await readSnapshotEntry(cwd, path);
     } catch (error) {
@@ -75,7 +88,6 @@ export async function diffWorkspaceSnapshot(
     }
   }
 
-  const current = await captureWorkspaceSnapshot(cwd);
   const paths = new Set([
     ...Object.keys(baseline.files),
     ...(!baseline.truncated ? Object.keys(current.files) : []),
@@ -85,7 +97,7 @@ export async function diffWorkspaceSnapshot(
 
   for (const path of [...paths].sort()) {
     const before = baseline.files[path];
-    const after = currentBaselinePaths[path] ?? current.files[path];
+    const after = current.files[path] ?? currentBaselinePaths[path];
     const sensitivePossibleChange = Boolean(before?.sensitive || after?.sensitive) && Boolean(before && after);
     if (!sensitivePossibleChange && before && after && fingerprintOf(before) === fingerprintOf(after)) continue;
 

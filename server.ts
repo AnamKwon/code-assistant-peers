@@ -38,6 +38,7 @@ import {
   saveTask,
 } from "./shared/store.ts";
 import { getAssistantAdapter, getGeminiAuthReadiness, loadAssistantRegistry, peersFor } from "./shared/assistants.ts";
+import { spawnWithTimeout } from "./shared/process.ts";
 import { areConfiguredAssistantsReady, resolveMultiPeerTaskStatus, shouldRunCodexSelfReview, summarizeMultiPeerAvailability } from "./shared/multi-peer.ts";
 import type { AssistantHost, NewPeerReviewFinding, PeerReviewResult, PeerTask, PeerWorkflow, ReviewMode, ReviewRequestOptions, ReviewScope } from "./shared/types.ts";
 
@@ -1715,13 +1716,15 @@ function normalizeReviewModels(value: unknown): Record<string, string> | undefin
 }
 
 function parseReviewMode(value: unknown): ReviewMode | undefined {
-  return value === "normal" || value === "adversarial" || value === "gate" || value === "collaborative"
-    ? value
-    : DEFAULT_REVIEW_MODE;
+  if (value === undefined || value === null) return DEFAULT_REVIEW_MODE;
+  if (value === "normal" || value === "adversarial" || value === "gate" || value === "collaborative") return value;
+  throw new Error("mode must be one of: normal, adversarial, gate, collaborative");
 }
 
 function parseReviewScope(value: unknown): ReviewScope | undefined {
-  return value === "auto" || value === "working-tree" || value === "branch" ? value : undefined;
+  if (value === undefined || value === null) return undefined;
+  if (value === "auto" || value === "working-tree" || value === "branch") return value;
+  throw new Error("scope must be one of: auto, working-tree, branch");
 }
 
 function normalizeWorkflow(value: string | undefined): PeerWorkflow {
@@ -1826,14 +1829,13 @@ async function runModelProbeCommand(
   const command = buildReviewCommand(reviewer, model);
   const prompt = "Reply with exactly OK.";
   const finalCommand = adapter.prompt_transport === "argv" ? [...command, prompt] : command;
-  let proc: any;
+  let result: Awaited<ReturnType<typeof spawnWithTimeout>>;
   try {
-    proc = Bun.spawn(finalCommand, {
+    result = await spawnWithTimeout(finalCommand, {
       cwd: process.cwd(),
-      stdin: adapter.prompt_transport === "stdin" ? "pipe" : "ignore",
-      stdout: "pipe",
-      stderr: "pipe",
       env: buildReviewCommandEnv(adapter),
+      stdin: adapter.prompt_transport === "stdin" ? prompt : null,
+      timeoutMs: MODEL_PROBE_TIMEOUT_MS,
     });
   } catch (error) {
     return {
@@ -1842,63 +1844,24 @@ async function runModelProbeCommand(
       stderr: `model probe failed to start: ${error instanceof Error ? error.message : String(error)}`,
     };
   }
-  if (adapter.prompt_transport === "stdin") {
-    proc.stdin?.write(prompt);
-    proc.stdin?.end();
-  }
-  let timedOut = false;
-  let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = setTimeout(() => {
-    timedOut = true;
-    proc.kill("SIGTERM");
-    forceKillTimer = setTimeout(() => proc.kill("SIGKILL"), 5000);
-  }, MODEL_PROBE_TIMEOUT_MS);
-  try {
-    const [stdout, stderr, exitCode] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-      proc.exited,
-    ]);
-    return {
-      exitCode: timedOut ? 1 : exitCode,
-      stdout,
-      stderr: timedOut
-        ? [stderr.trim(), `model probe timed out after ${MODEL_PROBE_TIMEOUT_MS}ms`].filter(Boolean).join("\n\n")
-        : stderr,
-    };
-  } finally {
-    clearTimeout(timeout);
-    if (forceKillTimer) clearTimeout(forceKillTimer);
-  }
+  return {
+    exitCode: result.timedOut ? 1 : result.exitCode,
+    stdout: result.stdout,
+    stderr: result.timedOut
+      ? [result.stderr.trim(), `model probe timed out after ${MODEL_PROBE_TIMEOUT_MS}ms`].filter(Boolean).join("\n\n")
+      : result.stderr,
+  };
 }
 
 async function assistantHelpMentionsArg(adapter: ReturnType<typeof getAssistantAdapter>, arg: string): Promise<boolean> {
   const helpCommand = buildAssistantHelpCommand(adapter);
   if (!helpCommand) return false;
   try {
-    const proc = Bun.spawn(helpCommand, {
-      stdout: "pipe",
-      stderr: "pipe",
+    const result = await spawnWithTimeout(helpCommand, {
       env: buildMinimalHelpEnv(),
+      timeoutMs: MODEL_PROBE_TIMEOUT_MS,
     });
-    let timedOut = false;
-    let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
-    const timeoutTimer = setTimeout(() => {
-      timedOut = true;
-      proc.kill("SIGTERM");
-      forceKillTimer = setTimeout(() => proc.kill("SIGKILL"), 5000);
-    }, MODEL_PROBE_TIMEOUT_MS);
-    try {
-      const [stdout, stderr] = await Promise.all([
-        new Response(proc.stdout).text(),
-        new Response(proc.stderr).text(),
-        proc.exited,
-      ]);
-      return !timedOut && `${stdout}\n${stderr}`.includes(arg);
-    } finally {
-      clearTimeout(timeoutTimer);
-      if (forceKillTimer) clearTimeout(forceKillTimer);
-    }
+    return !result.timedOut && `${result.stdout}\n${result.stderr}`.includes(arg);
   } catch {
     return false;
   }

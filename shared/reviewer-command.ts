@@ -1,5 +1,6 @@
 import type { AssistantAdapter, AssistantHost } from "./types.ts";
 import { getAssistantAdapter } from "./assistants.ts";
+import { spawnWithTimeout } from "./process.ts";
 import { REVIEWER_SYSTEM_PROMPT } from "./review-prompts.ts";
 import { parseSerenaCommand } from "./semantic.ts";
 
@@ -75,14 +76,13 @@ export async function runReviewCommand(
   }
   const finalCommand = adapter.prompt_transport === "argv" ? [...command, prompt] : command;
   const timeoutMs = resolveReviewCommandTimeoutMs(adapter);
-  let proc: any;
+  let result: Awaited<ReturnType<typeof spawnWithTimeout>>;
   try {
-    proc = Bun.spawn(finalCommand, {
+    result = await spawnWithTimeout(finalCommand, {
       cwd,
-      stdin: adapter.prompt_transport === "stdin" ? "pipe" : "ignore",
-      stdout: "pipe",
-      stderr: "pipe",
       env,
+      stdin: adapter.prompt_transport === "stdin" ? prompt : null,
+      timeoutMs,
     });
   } catch (error) {
     return {
@@ -93,39 +93,17 @@ export async function runReviewCommand(
     };
   }
 
-  if (adapter.prompt_transport === "stdin") {
-    proc.stdin?.write(prompt);
-    proc.stdin?.end();
+  if (!result.timedOut) {
+    return { exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr, command: recordedCommand };
   }
 
-  let timedOut = false;
-  let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
-  const timeoutTimer = setTimeout(() => {
-    timedOut = true;
-    proc.kill("SIGTERM");
-    forceKillTimer = setTimeout(() => proc.kill("SIGKILL"), 5000);
-  }, timeoutMs);
-
-  try {
-    const [stdout, stderr, exitCode] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-      proc.exited,
-    ]);
-
-    if (!timedOut) return { exitCode, stdout, stderr, command: recordedCommand };
-
-    const timeoutMessage = `Review command timed out after ${timeoutMs}ms and was terminated. Set CODE_ASSISTANT_PEERS_REVIEW_TIMEOUT_MS to adjust this limit.`;
-    return {
-      exitCode: 1,
-      stdout,
-      stderr: stderr.trim() ? `${stderr.trim()}\n\n${timeoutMessage}` : timeoutMessage,
-      command: recordedCommand,
-    };
-  } finally {
-    clearTimeout(timeoutTimer);
-    if (forceKillTimer) clearTimeout(forceKillTimer);
-  }
+  const timeoutMessage = `Review command timed out after ${timeoutMs}ms and was terminated. Set CODE_ASSISTANT_PEERS_REVIEW_TIMEOUT_MS to adjust this limit.`;
+  return {
+    exitCode: 1,
+    stdout: result.stdout,
+    stderr: result.stderr.trim() ? `${result.stderr.trim()}\n\n${timeoutMessage}` : timeoutMessage,
+    command: recordedCommand,
+  };
 }
 
 export function buildReviewCommandEnv(adapter: AssistantAdapter, sourceEnv: NodeJS.ProcessEnv = process.env): Record<string, string> {

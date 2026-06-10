@@ -10,20 +10,34 @@ export async function getGitRoot(cwd: string): Promise<string | null> {
 export async function getStatusEntries(cwd: string): Promise<GitStatusEntry[]> {
   const result = await runGit(["status", "--porcelain=v1", "-z"], cwd);
   if (result.exitCode !== 0 || !result.stdout) return [];
-
-  return result.stdout
-    .split("\0")
-    .filter(Boolean)
-    .map((entry) => ({
-      code: entry.slice(0, 2),
-      path: entry.slice(3),
-    }));
+  return parseStatusEntriesZ(result.stdout);
 }
 
-export async function getUncommittedDiff(cwd: string): Promise<string> {
-  const staged = await runGit(["diff", "--cached", "--no-ext-diff"], cwd);
-  const unstaged = await runGit(["diff", "--no-ext-diff"], cwd);
-  const untracked = await getUntrackedFileSummaries(cwd);
+/**
+ * Parse `git status --porcelain=v1 -z` output. In `-z` mode a rename/copy entry is
+ * emitted as two NUL-separated fields: the status record (`R  <new>`) followed by the
+ * original path. The trailing original-path field is consumed so it is not parsed as a
+ * phantom entry.
+ */
+export function parseStatusEntriesZ(stdout: string): GitStatusEntry[] {
+  const segments = stdout.split("\0");
+  const entries: GitStatusEntry[] = [];
+  for (let i = 0; i < segments.length; i++) {
+    const segment = segments[i];
+    if (!segment) continue;
+    const code = segment.slice(0, 2);
+    entries.push({ code, path: segment.slice(3) });
+    if (code.includes("R") || code.includes("C")) i++;
+  }
+  return entries;
+}
+
+export async function getUncommittedDiff(cwd: string, statusEntries?: GitStatusEntry[]): Promise<string> {
+  const [staged, unstaged, untracked] = await Promise.all([
+    runGit(["diff", "--cached", "--no-ext-diff"], cwd),
+    runGit(["diff", "--no-ext-diff"], cwd),
+    getUntrackedFileSummaries(cwd, statusEntries),
+  ]);
 
   const parts = [];
   if (staged.stdout.trim()) parts.push(`# Staged diff\n\n${staged.stdout}`);
@@ -72,9 +86,7 @@ export async function getReviewDiff(
     const resolvedBase = base ?? await detectDefaultBranch(cwd);
     if (!resolvedBase) {
       return {
-        label: "working tree diff",
-        diff: await getUncommittedDiff(cwd),
-        changedFiles: await getChangedFiles(cwd),
+        ...await getWorkingTreeReview(cwd),
         warning: "Branch review was requested, but no default branch could be detected. Fell back to working tree review.",
       };
     }
@@ -92,11 +104,18 @@ export async function getReviewDiff(
     };
   }
 
-  return {
-    label: "working tree diff",
-    diff: await getUncommittedDiff(cwd),
-    changedFiles: await getChangedFiles(cwd),
-  };
+  return await getWorkingTreeReview(cwd);
+}
+
+async function getWorkingTreeReview(cwd: string): Promise<{ label: string; diff: string; changedFiles: string[] }> {
+  // Collect status once and reuse it for the untracked-file summaries instead of
+  // re-running `git status`, and run the diff and changed-file collection concurrently.
+  const statusEntries = await getStatusEntries(cwd);
+  const [diff, changedFiles] = await Promise.all([
+    getUncommittedDiff(cwd, statusEntries),
+    getChangedFiles(cwd),
+  ]);
+  return { label: "working tree diff", diff, changedFiles };
 }
 
 export function formatStatus(entries: GitStatusEntry[]): string {
@@ -104,20 +123,16 @@ export function formatStatus(entries: GitStatusEntry[]): string {
   return entries.map((entry) => `${entry.code} ${entry.path}`).join("\n");
 }
 
-async function getUntrackedFileSummaries(cwd: string): Promise<string> {
-  const status = await getStatusEntries(cwd);
+async function getUntrackedFileSummaries(cwd: string, statusEntries?: GitStatusEntry[]): Promise<string> {
+  const status = statusEntries ?? await getStatusEntries(cwd);
   const untracked = status.filter((entry) => entry.code === "??").map((entry) => entry.path);
   if (untracked.length === 0) return "";
 
-  const lines: string[] = [];
-  for (const path of untracked.slice(0, 40)) {
+  const summaries = await Promise.all(untracked.slice(0, 40).map(async (path) => {
     const result = await runGit(["--no-pager", "diff", "--no-index", "--", "/dev/null", path], cwd);
-    if (result.stdout.trim()) {
-      lines.push(result.stdout);
-    } else {
-      lines.push(`Untracked: ${path}`);
-    }
-  }
+    return result.stdout.trim() ? result.stdout : `Untracked: ${path}`;
+  }));
+  const lines = [...summaries];
   if (untracked.length > 40) {
     lines.push(`... ${untracked.length - 40} more untracked file(s) omitted`);
   }
