@@ -114,6 +114,14 @@ If the broker or the reviewer worker is unavailable, `runReviewCommand` **falls 
 `claude -p`** (logs the reason to stderr). So the gate degrades to current behavior rather than
 failing — at the cost of the credit pool for that one review.
 
+## review_model and the live session
+
+`review_model` / `review_models` (host-selected reviewer models) apply to **spawned CLI
+reviewers**. The live channel session reviews with whatever model it is running, so a requested
+model is logged-and-ignored on the broker path and only takes effect if that review falls back to
+spawning `claude -p`. To change the live reviewer's model, switch it in the tmux session
+(`/model`) or relaunch the worker with `CODE_ASSISTANT_PEERS_REVIEWER_CLAUDE_ARGS='... --model opus'`.
+
 ## Verification checklist (the remaining empirical step)
 
 Run with the worker up and `PEER_ASSISTANTS=claude-live`:

@@ -283,6 +283,10 @@ function initDb(): void {
       created_at TEXT NOT NULL
     )
   `);
+  // review_findings is scanned by task_id (and task_id+status) on every status read;
+  // without an index those lookups degrade to full table scans as the store grows.
+  db.run("CREATE INDEX IF NOT EXISTS idx_review_findings_task ON review_findings(task_id, status)");
+  db.run("CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at DESC)");
 }
 
 function database(): Database {

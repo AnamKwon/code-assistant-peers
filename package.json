@@ -26,6 +26,7 @@
     "review-gate"
   ],
   "bin": {
+    "mcp-code-assistant-peers": "./cli.ts",
     "code-assistant-peers": "./cli.ts",
     "code-assistant-peers-server": "./server.ts"
   },

@@ -10,12 +10,16 @@ import { formatStatus, getGitRoot, getReviewDiff, getStatusEntries, getUncommitt
 import { captureWorkspaceSnapshot, emptyWorkspaceSnapshot } from "./shared/workspace-snapshot.ts";
 import {
   COLLABORATIVE_REVIEW_PROMPT,
+  buildReviewCommand,
+  buildReviewCommandEnv,
+  buildReviewModelRoutingContext,
   buildReviewPromptFromSnapshot,
   formatMultiPeerReviewOutputs,
   normalizeHost,
   normalizeReviewFocus,
   peerFor,
   prepareReviewPromptSnapshot,
+  resolveReviewerModel,
   runReviewCommand,
   truncateForReview,
   type ReviewPromptSnapshotSeed,
@@ -34,8 +38,14 @@ import {
   saveTask,
 } from "./shared/store.ts";
 import { getAssistantAdapter, getGeminiAuthReadiness, loadAssistantRegistry, peersFor } from "./shared/assistants.ts";
+import { spawnWithTimeout } from "./shared/process.ts";
 import { areConfiguredAssistantsReady, resolveMultiPeerTaskStatus, shouldRunCodexSelfReview, summarizeMultiPeerAvailability } from "./shared/multi-peer.ts";
 import type { AssistantHost, NewPeerReviewFinding, PeerReviewResult, PeerTask, PeerWorkflow, ReviewMode, ReviewRequestOptions, ReviewScope } from "./shared/types.ts";
+
+if (process.env.CODE_ASSISTANT_PEERS_REVIEWER_SUBPROCESS === "1") {
+  console.error("Refusing to start code-assistant-peers inside a reviewer subprocess to avoid recursive peer-review MCP calls.");
+  process.exit(2);
+}
 
 const assistantRegistry = loadAssistantRegistry();
 const host = normalizeHost(process.env.HOST_ASSISTANT, assistantRegistry);
@@ -46,6 +56,7 @@ const INCLUDE_SUCCESS_STDERR = process.env.CODE_ASSISTANT_PEERS_INCLUDE_SUCCESS_
 const DEFAULT_WORKFLOW = normalizeWorkflow(process.env.CODE_ASSISTANT_PEERS_WORKFLOW);
 const DEFAULT_REVIEW_MODE = normalizeDefaultReviewMode(process.env.CODE_ASSISTANT_PEERS_REVIEW_MODE);
 const STALE_REVIEW_RECOVERY_MS = parsePositiveInteger(process.env.CODE_ASSISTANT_PEERS_STALE_REVIEW_MS) ?? defaultStaleReviewRecoveryMs();
+const MODEL_PROBE_TIMEOUT_MS = parsePositiveInteger(process.env.CODE_ASSISTANT_PEERS_MODEL_PROBE_TIMEOUT_MS) ?? 30000;
 
 type ReviewRoundOutcome = {
   reviewer: AssistantHost;
@@ -67,6 +78,31 @@ function log(message: string): void {
   console.error(`[code-assistant-peers] ${message}`);
 }
 
+const REVIEW_MODEL_INPUT_PROPERTIES = {
+  review_model: {
+    type: "string" as const,
+    description: "Optional reviewer model selected by the host coding agent for this request. Omit to use each reviewer CLI default. Use an explicit model id only when that same id is valid for every targeted reviewer CLI. Prefer review_models for mixed reviewer providers. Use \"auto\" only when the host wants this MCP server to choose from known model routing.",
+  },
+  review_models: {
+    type: "object" as const,
+    additionalProperties: { type: "string" as const },
+    description: "Optional per-reviewer model mapping selected by the host coding agent, such as {\"claude\":\"opus\",\"codex\":\"gpt-5.5\"}. This overrides review_model for matching reviewers. A per-reviewer value of \"auto\" delegates only that reviewer to MCP automatic routing.",
+  },
+};
+
+const HOST_MODEL_SELECTION_GUIDANCE = [
+  "Host model selection policy:",
+  "- Prefer explicit review_models when the host coding agent can match the reviewer to a known candidate from code_assistant_peers_setup.",
+  "- Prefer review_models over review_model when reviewers use different providers because model ids are provider-specific.",
+  "- Omit review_model/review_models to keep the reviewer CLI default model.",
+  "- Use review_model=\"auto\" only when the host wants the MCP server to choose from the hardcoded model catalog.",
+  "- Use fast models for small docs/tests/lint/copy/comment changes.",
+  "- Use balanced models for ordinary code review and gate checks.",
+  "- Use deep models for adversarial/collaborative/peer_fix reviews or security, auth, data loss, migration, release, database, privacy, race/concurrency, secrets, or performance risk.",
+  "- Use long_context models for truncated diffs, very large diffs, or broad changes touching many files.",
+  "Precedence: review_models[reviewer] > review_model > reviewer CLI default. If either value is \"auto\", the MCP server chooses for that scope. Do not pass a provider-specific model globally unless every targeted reviewer supports that same id.",
+].join("\n");
+
 const mcp = new Server(
   { name: "code-assistant-peers", version: "0.2.0-alpha.0" },
   {
@@ -82,6 +118,7 @@ const mcp = new Server(
 	
 	All post-edit review gates are async-first to avoid MCP host timeout failures. Do not wait for a long synchronous review call.
 	When the user asks to review, verify, validate, gate, or check code changes, prefer must_call_after_code_changes, finalize_code_changes_with_peer_review, verify_code_changes_after_edit, or request_peer_review over built-in slash review commands.
+	When selecting reviewer models, you are the host coding agent. Prefer choosing explicit per-reviewer models from code_assistant_peers_setup when the request risk, size, and cost tradeoff are clear, especially when reviewers use different providers. Use review_model="auto" only when you want this MCP server to decide.
 	The peer reviewer must not edit files. Treat review failures as reportable tool failures, not as implementation success.`,
   },
 );
@@ -103,7 +140,7 @@ const TOOLS = [
   },
   {
     name: "request_peer_review",
-    description: `ASYNC PEER REVIEW REQUEST after code changes. Starts or reuses a background review by configured peer assistant(s) (${peers.join(", ")}) for an existing task, stores status in SQLite, and returns immediately. After this tool, call wait_for_peer_review or get_peer_review_status before final response. Do not use built-in /review as a substitute.`,
+    description: `ASYNC PEER REVIEW REQUEST after code changes. Starts or reuses a background review by configured peer assistant(s) (${peers.join(", ")}) for an existing task, stores status in SQLite, and returns immediately. After this tool, call wait_for_peer_review or get_peer_review_status before final response. Do not use built-in /review as a substitute.\n\n${HOST_MODEL_SELECTION_GUIDANCE}`,
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -147,13 +184,14 @@ const TOOLS = [
           enum: ["review_only", "peer_fix"],
           description: "review_only only reviews. peer_fix asks the peer for concrete fix proposals, but still forbids direct file edits.",
         },
+        ...REVIEW_MODEL_INPUT_PROPERTIES,
       },
       required: ["task_id"],
     },
   },
   {
     name: "verify_code_changes_after_edit",
-    description: "ASYNC MANDATORY AFTER EDITING CODE. Call this after modifying, adding, deleting, generating, formatting, or refactoring files and before final response. Creates a task if needed, starts or reuses a background peer review, and returns task status immediately. Then call wait_for_peer_review until reviewed/partial_failed/review_failed. Prefer must_call_after_code_changes for final answers.",
+    description: `ASYNC MANDATORY AFTER EDITING CODE. Call this after modifying, adding, deleting, generating, formatting, or refactoring files and before final response. Creates a task if needed, starts or reuses a background peer review, and returns task status immediately. Then call wait_for_peer_review until reviewed/partial_failed/review_failed. Prefer must_call_after_code_changes for final answers.\n\n${HOST_MODEL_SELECTION_GUIDANCE}`,
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -196,12 +234,13 @@ const TOOLS = [
           type: "string" as const,
           enum: ["review_only", "peer_fix"],
         },
+        ...REVIEW_MODEL_INPUT_PROPERTIES,
       },
     },
   },
   {
     name: "finalize_code_changes_with_peer_review",
-    description: "ASYNC MANDATORY FINALIZATION GATE after editing files. Call this before the final response whenever code was modified, added, deleted, generated, formatted, or refactored. It starts or reuses peer verification with the opposite assistant in the background, stores status in SQLite, and requires wait_for_peer_review/get_peer_review_status before final response. Do not use built-in /review instead.",
+    description: `ASYNC MANDATORY FINALIZATION GATE after editing files. Call this before the final response whenever code was modified, added, deleted, generated, formatted, or refactored. It starts or reuses peer verification with the opposite assistant in the background, stores status in SQLite, and requires wait_for_peer_review/get_peer_review_status before final response. Do not use built-in /review instead.\n\n${HOST_MODEL_SELECTION_GUIDANCE}`,
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -244,12 +283,13 @@ const TOOLS = [
           type: "string" as const,
           enum: ["review_only", "peer_fix"],
         },
+        ...REVIEW_MODEL_INPUT_PROPERTIES,
       },
     },
   },
   {
     name: "must_call_after_code_changes",
-    description: "ABSOLUTE REQUIRED ASYNC POST-EDIT MCP GATE. If you changed, created, deleted, generated, formatted, or refactored any code or project file, you must call this tool before final response. This starts or reuses background peer review and verification through code-assistant-peers, records status in SQLite, and requires wait_for_peer_review/get_peer_review_status before final response. Never substitute built-in /review for this required MCP call.",
+    description: `ABSOLUTE REQUIRED ASYNC POST-EDIT MCP GATE. If you changed, created, deleted, generated, formatted, or refactored any code or project file, you must call this tool before final response. This starts or reuses background peer review and verification through code-assistant-peers, records status in SQLite, and requires wait_for_peer_review/get_peer_review_status before final response. Never substitute built-in /review for this required MCP call.\n\n${HOST_MODEL_SELECTION_GUIDANCE}`,
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -292,12 +332,13 @@ const TOOLS = [
           type: "string" as const,
           enum: ["review_only", "peer_fix"],
         },
+        ...REVIEW_MODEL_INPUT_PROPERTIES,
       },
     },
   },
   {
     name: "start_peer_review_async",
-    description: "ASYNC POST-EDIT REVIEW START. Starts or reuses peer review in the background, stores queued/running/reviewed/partial_failed/review_failed state in SQLite, and returns immediately with a task id. After calling this, you MUST call wait_for_peer_review or get_peer_review_status before final response.",
+    description: `ASYNC POST-EDIT REVIEW START. Starts or reuses peer review in the background, stores queued/running/reviewed/partial_failed/review_failed state in SQLite, and returns immediately with a task id. After calling this, you MUST call wait_for_peer_review or get_peer_review_status before final response.\n\n${HOST_MODEL_SELECTION_GUIDANCE}`,
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -340,6 +381,7 @@ const TOOLS = [
           type: "string" as const,
           enum: ["review_only", "peer_fix"],
         },
+        ...REVIEW_MODEL_INPUT_PROPERTIES,
       },
     },
   },
@@ -743,6 +785,8 @@ function buildReviewRequestSignatureFromState(
     focus: normalizeReviewFocus(options.focus ?? process.env.CODE_ASSISTANT_PEERS_REVIEW_FOCUS),
     semantic_context: options.semantic_context ?? null,
     self_review: options.self_review ?? false,
+    review_model: options.review_model ?? null,
+    review_models: options.review_models ?? {},
     git_status: reviewState.statusEntries,
     git_diff: reviewState.diff,
   };
@@ -1162,7 +1206,12 @@ async function runPeerReviewTool(
   const promptSnapshot = await prepareReviewPromptSnapshot(task, options, promptSnapshotSeed);
   const startedAt = new Date().toISOString();
   const { prompt, warning } = buildReviewPromptFromSnapshot(task, options, promptSnapshot);
-  const result = await runReviewCommand(task.peer, task.cwd, prompt);
+  const result = await runReviewCommand(
+    task.peer,
+    task.cwd,
+    prompt,
+    resolveReviewerModel(task.peer, options, buildReviewModelRoutingContext(options, promptSnapshot)),
+  );
   const completedAt = new Date().toISOString();
 
   const commitResult = await withReviewCommitLock(task.id, expectedSignature, async (current) => {
@@ -1321,7 +1370,12 @@ async function runMultiPeerReviewTool(
   const aggregatePromptResult = await buildMultiPeerAggregatePrompt(task, options, peerResults, skippedPeers, selfReviewResult, snapshot);
   const aggregatePrompt = aggregatePromptResult.prompt;
   const aggregateStartedAt = new Date().toISOString();
-  const aggregateResult = await runReviewCommand(task.host, task.cwd, aggregatePrompt);
+  const aggregateResult = await runReviewCommand(
+    task.host,
+    task.cwd,
+    aggregatePrompt,
+    resolveReviewerModel(task.host, options, buildReviewModelRoutingContext(options, snapshot)),
+  );
   const aggregateCompletedAt = new Date().toISOString();
   const aggregateWarning = [aggregatePromptResult.warning, selfReviewFailureWarning].filter(Boolean).join("\n") || undefined;
   const aggregateReview: PeerReviewResult = {
@@ -1388,7 +1442,12 @@ async function runSinglePeerRound(
   const startedAt = new Date().toISOString();
   const snapshot = promptSnapshot ?? await prepareReviewPromptSnapshot(task, options);
   const { prompt, warning } = buildReviewPromptFromSnapshot(roundTask, options, snapshot);
-  const result = await runReviewCommand(reviewer, task.cwd, prompt);
+  const result = await runReviewCommand(
+    reviewer,
+    task.cwd,
+    prompt,
+    resolveReviewerModel(reviewer, options, buildReviewModelRoutingContext(options, snapshot)),
+  );
   const completedAt = new Date().toISOString();
   const review: PeerReviewResult = {
     reviewer,
@@ -1421,7 +1480,12 @@ async function runCollaborativeReviewTool(
     ...options,
     mode: "collaborative",
   }, promptSnapshot);
-  const peerResult = await runReviewCommand(task.peer, task.cwd, peerPromptResult.prompt);
+  const peerResult = await runReviewCommand(
+    task.peer,
+    task.cwd,
+    peerPromptResult.prompt,
+    resolveReviewerModel(task.peer, options, buildReviewModelRoutingContext({ ...options, mode: "collaborative" }, promptSnapshot)),
+  );
   const peerCompletedAt = new Date().toISOString();
   const peerReview = {
     reviewer: task.peer,
@@ -1466,7 +1530,12 @@ async function runCollaborativeReviewTool(
 
   const hostPrompt = buildHostComparisonPrompt(task, options, peerReview.stdout || peerReview.stderr, promptSnapshot);
   const hostStartedAt = new Date().toISOString();
-  const hostResult = await runReviewCommand(task.host, task.cwd, hostPrompt);
+  const hostResult = await runReviewCommand(
+    task.host,
+    task.cwd,
+    hostPrompt,
+    resolveReviewerModel(task.host, options, buildReviewModelRoutingContext(options, promptSnapshot)),
+  );
   const hostCompletedAt = new Date().toISOString();
   const hostReview = {
     reviewer: task.host,
@@ -1612,17 +1681,50 @@ function parseReviewOptions(args: unknown): ReviewRequestOptions {
     semantic_context: obj.semantic_context === undefined || obj.semantic_context === null
       ? null
       : String(obj.semantic_context),
+    review_model: normalizeReviewModel(obj.review_model),
+    review_models: normalizeReviewModels(obj.review_models),
   };
 }
 
+function normalizeReviewModel(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  const model = String(value).trim();
+  if (!model) return null;
+  if (!/^[A-Za-z0-9._:[\]-]+$/.test(model)) {
+    throw new Error("review_model may contain only letters, numbers, dot, underscore, hyphen, colon, and square brackets.");
+  }
+  return model;
+}
+
+function normalizeReviewModels(value: unknown): Record<string, string> | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("review_models must be an object mapping assistant id to model.");
+  }
+  const result: Record<string, string> = {};
+  for (const [assistant, rawModel] of Object.entries(value as Record<string, unknown>)) {
+    const id = String(assistant).trim().toLowerCase();
+    const model = normalizeReviewModel(rawModel);
+    if (!id || !model) continue;
+    if (!assistantRegistry[id]) {
+      const available = Object.keys(assistantRegistry).sort().join(", ");
+      throw new Error(`review_models contains unknown assistant '${assistant}'. Available assistants: ${available}`);
+    }
+    result[id] = model;
+  }
+  return Object.keys(result).length ? result : undefined;
+}
+
 function parseReviewMode(value: unknown): ReviewMode | undefined {
-  return value === "normal" || value === "adversarial" || value === "gate" || value === "collaborative"
-    ? value
-    : DEFAULT_REVIEW_MODE;
+  if (value === undefined || value === null) return DEFAULT_REVIEW_MODE;
+  if (value === "normal" || value === "adversarial" || value === "gate" || value === "collaborative") return value;
+  throw new Error("mode must be one of: normal, adversarial, gate, collaborative");
 }
 
 function parseReviewScope(value: unknown): ReviewScope | undefined {
-  return value === "auto" || value === "working-tree" || value === "branch" ? value : undefined;
+  if (value === undefined || value === null) return undefined;
+  if (value === "auto" || value === "working-tree" || value === "branch") return value;
+  throw new Error("scope must be one of: auto, working-tree, branch");
 }
 
 function normalizeWorkflow(value: string | undefined): PeerWorkflow {
@@ -1640,6 +1742,7 @@ async function buildSetupStatus() {
     return [adapter.id, {
       ...adapter,
       available: await isAssistantAvailable(adapter.id),
+      model_selection: await getAssistantModelSelectionStatus(adapter.id),
       command_preview: adapter.command,
     }];
   })));
@@ -1655,12 +1758,131 @@ async function buildSetupStatus() {
       available_tool: "must_call_after_code_changes",
       note: "MCP cannot technically force every final response through review, but this required post-edit tool is exposed with strong schema and starts or reuses async peer review jobs.",
     },
+    model_routing: {
+      request_options: ["review_model", "review_models"],
+      host_selection_policy: {
+        selector: "host coding agent",
+        default_behavior: "omit review_model/review_models to keep each reviewer CLI default model",
+        explicit_selection: "set review_models for per-reviewer choices when the host can choose from assistants.*.model_selection.known_models",
+        global_selection_warning: "use review_model with an explicit id only when every targeted reviewer CLI supports the same model id; otherwise use review_models",
+        delegation: "set review_model or a per-reviewer review_models value to \"auto\" only when the host wants the MCP server to choose",
+        precedence: ["review_models[reviewer]", "review_model", "reviewer CLI default"],
+      },
+      examples: {
+        automatic: { review_model: "auto" },
+        automatic_for_one_reviewer: { review_models: { claude: "auto", codex: "gpt-5.4" } },
+        per_reviewer: { review_models: { claude: "opus", codex: "gpt-5.5" } },
+      },
+      auto_strategy: {
+        fast: "small docs/tests/lint/copy/comment changes",
+        balanced: "normal, gate, and self-review requests",
+        deep: "adversarial/collaborative/peer_fix or high-risk focus areas",
+        long_context: "truncated diffs, very large diffs, or many changed files",
+      },
+      host_selection_hints: {
+        fast: "choose for small docs/tests/lint/copy/comment changes when low cost and latency matter",
+        balanced: "choose for ordinary code review and compact gate checks",
+        deep: "choose for adversarial, collaborative, peer_fix, security, auth, data loss, migration, release, database, privacy, race/concurrency, secrets, or performance risk",
+        long_context: "choose for truncated diffs, very large diffs, or broad changes touching many files",
+      },
+      probe_note: "Known model candidates are listed at setup. Set CODE_ASSISTANT_PEERS_PROBE_MODELS=1 before starting the MCP server to verify candidate model access with live probe calls.",
+    },
     next_steps: [
       assistants[host]?.available.ok ? null : `Install or fix host assistant CLI: ${host}.`,
       ...peers.map((reviewer) => assistants[reviewer]?.available.ok ? null : `Install or fix peer assistant CLI: ${reviewer}.`),
       "Use must_call_after_code_changes after edits, then call wait_for_peer_review until the task reaches a terminal state.",
     ].filter(Boolean),
   };
+}
+
+async function getAssistantModelSelectionStatus(reviewer: AssistantHost) {
+  const adapter = getAssistantAdapter(reviewer, assistantRegistry);
+  const supportsModelOption = adapter.model_arg ? await assistantHelpMentionsArg(adapter, adapter.model_arg) : false;
+  const knownModels = adapter.models ?? [];
+  const probeModels = process.env.CODE_ASSISTANT_PEERS_PROBE_MODELS === "1";
+  const modelAvailability = probeModels && supportsModelOption && knownModels.length > 0
+    ? Object.fromEntries(await Promise.all(knownModels.map(async (model) => {
+      const result = await runModelProbeCommand(reviewer, model.id);
+      return [model.id, {
+        available: result.exitCode === 0,
+        detail: result.exitCode === 0
+          ? "probe succeeded"
+          : compactForToolResult(result.stderr || result.stdout || "probe failed", 500),
+      }];
+    })))
+    : null;
+
+  return {
+    supports_model_option: supportsModelOption,
+    model_arg: adapter.model_arg ?? null,
+    known_models: knownModels,
+    availability_checked: Boolean(modelAvailability),
+    availability: modelAvailability,
+  };
+}
+
+async function runModelProbeCommand(
+  reviewer: AssistantHost,
+  model: string,
+): Promise<{ exitCode: number | null; stdout: string; stderr: string }> {
+  const adapter = getAssistantAdapter(reviewer, assistantRegistry);
+  const command = buildReviewCommand(reviewer, model);
+  const prompt = "Reply with exactly OK.";
+  const finalCommand = adapter.prompt_transport === "argv" ? [...command, prompt] : command;
+  let result: Awaited<ReturnType<typeof spawnWithTimeout>>;
+  try {
+    result = await spawnWithTimeout(finalCommand, {
+      cwd: process.cwd(),
+      env: buildReviewCommandEnv(adapter),
+      stdin: adapter.prompt_transport === "stdin" ? prompt : null,
+      timeoutMs: MODEL_PROBE_TIMEOUT_MS,
+    });
+  } catch (error) {
+    return {
+      exitCode: 1,
+      stdout: "",
+      stderr: `model probe failed to start: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+  return {
+    exitCode: result.timedOut ? 1 : result.exitCode,
+    stdout: result.stdout,
+    stderr: result.timedOut
+      ? [result.stderr.trim(), `model probe timed out after ${MODEL_PROBE_TIMEOUT_MS}ms`].filter(Boolean).join("\n\n")
+      : result.stderr,
+  };
+}
+
+async function assistantHelpMentionsArg(adapter: ReturnType<typeof getAssistantAdapter>, arg: string): Promise<boolean> {
+  const helpCommand = buildAssistantHelpCommand(adapter);
+  if (!helpCommand) return false;
+  try {
+    const result = await spawnWithTimeout(helpCommand, {
+      env: buildMinimalHelpEnv(),
+      timeoutMs: MODEL_PROBE_TIMEOUT_MS,
+    });
+    return !result.timedOut && `${result.stdout}\n${result.stderr}`.includes(arg);
+  } catch {
+    return false;
+  }
+}
+
+function buildAssistantHelpCommand(adapter: ReturnType<typeof getAssistantAdapter>): string[] | null {
+  const command = adapter.command.find((part) => part !== "{system_prompt}");
+  if (!command) return null;
+  if (adapter.id === "codex") return [command, "exec", "--help"];
+  return [command, "--help"];
+}
+
+function buildMinimalHelpEnv(): Record<string, string> {
+  return Object.fromEntries([
+    "PATH",
+    "HOME",
+    "USER",
+    "SHELL",
+    "TERM",
+    "TMPDIR",
+  ].map((key) => [key, process.env[key]]).filter((entry): entry is [string, string] => entry[1] !== undefined));
 }
 
 async function isAssistantAvailable(reviewer: AssistantHost): Promise<{ ok: boolean; detail: string }> {

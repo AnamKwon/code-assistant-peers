@@ -4,9 +4,17 @@ import { homedir } from "node:os";
 export const BUILTIN_ASSISTANTS: Record<string, AssistantAdapter> = {
   codex: {
     id: "codex",
-    command: ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check", "-"],
+    command: ["codex", "exec", "--ignore-user-config", "--ignore-rules", "--sandbox", "read-only", "--skip-git-repo-check", "-"],
     prompt_transport: "stdin",
     description: "OpenAI Codex CLI in read-only exec mode.",
+    model_arg: "-m",
+    models: [
+      { id: "gpt-5.5", quality: "highest", cost: "high", latency: "high", routing: ["deep", "long_context"], description: "Newest frontier model candidate for the highest-risk Codex reviews." },
+      { id: "gpt-5.4", quality: "highest", cost: "high", latency: "medium", routing: ["balanced", "long_context"], description: "Frontier model candidate for strong general Codex review and broad contexts." },
+      { id: "gpt-5.3-codex", quality: "highest", cost: "high", latency: "high", routing: ["deep", "balanced"], description: "Codex-optimized model candidate for agentic coding and deep code review." },
+      { id: "gpt-5.4-mini", quality: "high", cost: "medium", latency: "low", routing: ["fast", "balanced"], description: "Lower-latency GPT-5.4 family model candidate for routine review." },
+      { id: "gpt-5.4-nano", quality: "medium", cost: "low", latency: "low", routing: ["fast"], description: "Lowest-cost GPT-5.4 family model candidate for small low-risk diffs." },
+    ],
     env_allowlist: [
       "PATH",
       "HOME",
@@ -62,6 +70,16 @@ export const BUILTIN_ASSISTANTS: Record<string, AssistantAdapter> = {
     ],
     prompt_transport: "stdin",
     description: "Claude Code print mode with read-only review tools.",
+    model_arg: "--model",
+    models: [
+      { id: "haiku", quality: "medium", cost: "low", latency: "low", routing: ["fast"], description: "Fast review for docs and small low-risk diffs." },
+      { id: "sonnet", quality: "high", cost: "medium", latency: "medium", routing: ["balanced"], description: "Balanced default review model." },
+      { id: "opus", quality: "highest", cost: "high", latency: "high", routing: ["deep"], description: "Deep review for security, migrations, large diffs, and release gates." },
+      { id: "best", quality: "highest", cost: "high", latency: "high", routing: ["deep"], description: "Claude Code alias for the most capable available model." },
+      { id: "sonnet[1m]", quality: "high", cost: "high", latency: "medium", routing: ["balanced", "long_context"], description: "Long-context Sonnet alias for large review contexts." },
+      { id: "opus[1m]", quality: "highest", cost: "high", latency: "high", routing: ["deep", "long_context"], description: "Long-context Opus alias for broad or truncated review contexts." },
+      { id: "opusplan", quality: "highest", cost: "high", latency: "high", routing: ["deep"], description: "Claude Code planning alias that uses Opus for planning and Sonnet for execution." },
+    ],
     env_allowlist: [
       "PATH",
       "HOME",
@@ -80,6 +98,18 @@ export const BUILTIN_ASSISTANTS: Record<string, AssistantAdapter> = {
     prompt_transport: "stdin",
     description: "Gemini CLI headless review mode.",
     timeout_ms: 180000,
+    model_arg: "--model",
+    models: [
+      { id: "auto", quality: "high", cost: "medium", latency: "medium", routing: ["balanced"], description: "Gemini CLI automatic model selection." },
+      { id: "pro", quality: "highest", cost: "high", latency: "high", routing: ["deep"], description: "Gemini CLI Pro alias for complex reasoning review." },
+      { id: "flash", quality: "high", cost: "low", latency: "low", routing: ["balanced", "fast"], description: "Gemini CLI Flash alias for fast balanced review." },
+      { id: "flash-lite", quality: "medium", cost: "low", latency: "low", routing: ["fast"], description: "Gemini CLI Flash Lite alias for small low-risk review." },
+      { id: "gemini-3-pro-preview", quality: "highest", cost: "high", latency: "high", routing: ["deep"], description: "Gemini 3 Pro preview model candidate." },
+      { id: "gemini-3-flash-preview", quality: "high", cost: "medium", latency: "low", routing: ["balanced", "fast"], description: "Gemini 3 Flash preview model candidate." },
+      { id: "gemini-2.5-pro", quality: "highest", cost: "high", latency: "high", routing: ["deep"], description: "Gemini 2.5 Pro model candidate." },
+      { id: "gemini-2.5-flash", quality: "high", cost: "low", latency: "low", routing: ["balanced", "fast"], description: "Gemini 2.5 Flash model candidate." },
+      { id: "gemini-2.5-flash-lite", quality: "medium", cost: "low", latency: "low", routing: ["fast"], description: "Gemini 2.5 Flash Lite model candidate." },
+    ],
     env_allowlist: [
       "PATH",
       "HOME",
@@ -233,9 +263,52 @@ function parseCustomAssistants(value: string | undefined): Record<string, Assist
       description: config.description === undefined ? undefined : String(config.description),
       timeout_ms: parseOptionalTimeoutMs(id, config.timeout_ms),
       env_allowlist: parseOptionalEnvAllowlist(id, config.env_allowlist),
+      model_arg: config.model_arg === undefined ? undefined : String(config.model_arg),
+      models: parseOptionalModels(id, config.models),
     };
   }
   return result;
+}
+
+function parseOptionalModels(id: string, value: unknown) {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) {
+    throw new Error(`Assistant '${id}' models must be an array.`);
+  }
+  return value.map((item, index) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      throw new Error(`Assistant '${id}' model at index ${index} must be an object.`);
+    }
+    const config = item as Record<string, unknown>;
+    const modelId = typeof config.id === "string" ? config.id.trim() : "";
+    if (!modelId) throw new Error(`Assistant '${id}' model at index ${index} requires an id.`);
+    return {
+      id: modelId,
+      aliases: Array.isArray(config.aliases) ? config.aliases.map(String).filter(Boolean) : undefined,
+      quality: parseTier(config.quality, ["low", "medium", "high", "highest"]),
+      cost: parseTier(config.cost, ["low", "medium", "high"]),
+      latency: parseTier(config.latency, ["low", "medium", "high"]),
+      routing: parseOptionalRouting(id, index, config.routing),
+      description: config.description === undefined ? undefined : String(config.description),
+    };
+  });
+}
+
+function parseOptionalRouting(id: string, index: number, value: unknown) {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) {
+    throw new Error(`Assistant '${id}' model at index ${index} routing must be an array.`);
+  }
+  const allowed = ["fast", "balanced", "deep", "long_context"] as const;
+  const parsed = value.map(String).filter((item): item is typeof allowed[number] => {
+    return (allowed as readonly string[]).includes(item);
+  });
+  return parsed.length ? parsed : undefined;
+}
+
+function parseTier<T extends string>(value: unknown, allowed: readonly T[]): T | undefined {
+  if (value === undefined) return undefined;
+  return allowed.includes(String(value) as T) ? String(value) as T : undefined;
 }
 
 function parseOptionalEnvAllowlist(id: string, value: unknown): string[] | undefined {
