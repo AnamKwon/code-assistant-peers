@@ -61,6 +61,8 @@ Then, inside Claude Code or Codex, make a code change and ask the assistant to v
 ## Features
 
 - CLI assistant peer review routing with built-in Claude Code and Codex adapters.
+- `claude-live` adapter that routes Claude reviews to a backgrounded interactive Claude session
+  (subscription pool, no `claude -p`), with auto-start and `claude -p` fallback.
 - Custom assistant adapters for CLIs that accept prompts through stdin or argv.
 - Mandatory post-edit gate tool with strong MCP descriptions.
 - Review modes: `normal`, `adversarial`, `gate`, and `collaborative`.
@@ -279,10 +281,20 @@ codex  -> codex exec --ignore-user-config --ignore-rules --sandbox read-only --s
 gemini -> gemini --skip-trust --approval-mode plan -p ""  # prompt over stdin
 ```
 
+A fourth built-in, `claude-live`, routes the Claude review to a **backgrounded interactive Claude
+session** through a localhost broker instead of spawning `claude -p`, so Claude reviews stay on
+the subscription pool rather than the Agent SDK credit pool. The broker and reviewer worker
+auto-start on the first `claude-live` review, sessions are per-repo and read-only, and any
+broker/session failure falls back to spawning `claude -p`. Use it anywhere you would use
+`claude` as a peer (`PEER_ASSISTANTS=claude-live` or `codex,claude-live`). See
+[broker/REVIEWER.md](broker/REVIEWER.md) for setup details, tuning, and the billing verification
+checklist.
+
 For other CLIs, set `CODE_ASSISTANT_PEERS_ASSISTANTS` to a JSON object. Each adapter needs:
 
 - `command`: argv array used to launch the assistant.
-- `prompt_transport`: `stdin` or `argv`.
+- `prompt_transport`: `stdin`, `argv`, or `channel` (`channel` routes reviews through the
+  live-reviewer broker instead of spawning `command`; see [broker/REVIEWER.md](broker/REVIEWER.md)).
 - `description`: optional human-readable label.
 - `model_arg`: optional CLI flag used before the model id, such as `--model` or `-m`.
 - `models`: optional model metadata shown in `code_assistant_peers_setup` and used by `review_model: "auto"`.
@@ -674,6 +686,11 @@ Main cost drivers:
 - `serena-auto` may add semantic context. `CODE_ASSISTANT_PEERS_SERENA_CONTEXT_BUDGET` defaults to `8000` characters.
 - Reviewers are allowed to inspect the repository directly when the included diff is insufficient, so Claude print mode or Codex exec may read additional files.
 - Previous review memory is included in later rounds so reviewers can verify earlier findings.
+
+Billing pool note: starting 2026-06-15, spawned `claude -p` reviews draw from the separate Agent
+SDK monthly credit instead of the Claude subscription. The `claude-live` adapter keeps Claude
+reviews on the subscription pool by routing them to a backgrounded interactive session — see
+[broker/REVIEWER.md](broker/REVIEWER.md).
 
 Low-token recommended setup:
 
