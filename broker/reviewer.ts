@@ -415,7 +415,6 @@ async function main(): Promise<void> {
 
   const baseCwd = process.env.CODE_ASSISTANT_PEERS_REVIEWER_CWD ?? process.cwd();
   const sessionBaseName = process.env.CODE_ASSISTANT_PEERS_TMUX_SESSION ?? "peer-reviewer";
-  const promptDir = process.env.CODE_ASSISTANT_PEERS_REVIEWER_PROMPT_DIR ?? join(tmpdir(), "peer-reviewer-prompts");
 
   // One session per (reviewer kind, repo cwd): a job's reviewer picks the CLI, its cwd pins the
   // session to that repo, and the worker caches/reuses the pair.
@@ -426,11 +425,12 @@ async function main(): Promise<void> {
       throw new Error(`reviewer '${reviewer}' has no live CLI mapping (known: ${Object.keys(LIVE_CLI_KINDS).join(", ")})`);
     }
     const repoCwd = cwd || baseCwd;
+    const kindPromptDir = process.env.CODE_ASSISTANT_PEERS_REVIEWER_PROMPT_DIR ?? kind.promptDir(repoCwd);
     return new TmuxCliSession({
       sessionName: sessionNameFor(sessionBaseName, kind.slug, repoCwd),
       cwd: repoCwd,
-      launchCommand: kind.launchCommand(promptDir),
-      promptDir,
+      launchCommand: kind.launchCommand(repoCwd, kindPromptDir),
+      promptDir: kindPromptDir,
       clearCommand: kind.clearCommand,
       // "never" keeps the session's conversation memory across reviews; anything else clears.
       clearBetweenReviews: process.env.CODE_ASSISTANT_PEERS_REVIEWER_CLEAR !== "never",
@@ -460,14 +460,21 @@ async function main(): Promise<void> {
 
 export interface LiveCliKind {
   slug: string; // session-name segment, e.g. peer-reviewer-<slug>-<repo>-<hash>
-  launchCommand: (promptDir: string) => string[];
+  // Parent dir for the per-job prompt file. The session must be able to Read it: claude grants
+  // it via --add-dir; gemini puts it INSIDE the (trusted) repo cwd to avoid a second trust
+  // prompt that --include-directories would raise; codex reads absolute paths under its sandbox.
+  promptDir: (cwd: string) => string;
+  launchCommand: (cwd: string, promptDir: string) => string[];
   clearCommand: string | null;
 }
+
+const SHARED_PROMPT_DIR = join(tmpdir(), "peer-reviewer-prompts");
 
 export const LIVE_CLI_KINDS: Record<string, LiveCliKind> = {
   "claude-live": {
     slug: "claude",
-    launchCommand: (promptDir) => [
+    promptDir: () => SHARED_PROMPT_DIR,
+    launchCommand: (_cwd, promptDir) => [
       "claude",
       ...(parseArgsEnv(process.env.CODE_ASSISTANT_PEERS_REVIEWER_CLAUDE_ARGS) ?? DEFAULT_REVIEWER_CLAUDE_ARGS),
       "--add-dir",
@@ -477,16 +484,18 @@ export const LIVE_CLI_KINDS: Record<string, LiveCliKind> = {
   },
   "gemini-live": {
     slug: "gemini",
-    launchCommand: (promptDir) => [
+    // Inside the repo cwd (already trusted via --skip-trust) so gemini can Read it without the
+    // separate `--include-directories` trust prompt that stalls a detached session.
+    promptDir: (cwd) => join(cwd, ".peer-review"),
+    launchCommand: () => [
       "gemini",
       ...(parseArgsEnv(process.env.CODE_ASSISTANT_PEERS_REVIEWER_GEMINI_ARGS) ?? ["--skip-trust", "--approval-mode", "plan"]),
-      "--include-directories",
-      promptDir,
     ],
     clearCommand: "/clear",
   },
   "codex-live": {
     slug: "codex",
+    promptDir: () => SHARED_PROMPT_DIR,
     launchCommand: () => [
       "codex",
       ...(parseArgsEnv(process.env.CODE_ASSISTANT_PEERS_REVIEWER_CODEX_ARGS) ?? ["--sandbox", "read-only"]),

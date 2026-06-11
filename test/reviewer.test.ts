@@ -173,14 +173,23 @@ describe("reviewer worker loop", () => {
     }
   });
 
-  test("LIVE_CLI_KINDS maps each built-in live adapter to its CLI launch + reset", () => {
+  test("LIVE_CLI_KINDS maps each built-in live adapter to its CLI launch + reset + prompt dir", () => {
     expect(Object.keys(LIVE_CLI_KINDS).sort()).toEqual(["claude-live", "codex-live", "gemini-live"]);
-    expect(liveCliKindFor("claude-live")!.launchCommand("/tmp/p")[0]).toBe("claude");
-    expect(liveCliKindFor("claude-live")!.launchCommand("/tmp/p")).toContain("--add-dir");
-    expect(liveCliKindFor("gemini-live")!.launchCommand("/tmp/p")[0]).toBe("gemini");
-    expect(liveCliKindFor("gemini-live")!.launchCommand("/tmp/p")).toContain("--include-directories");
-    expect(liveCliKindFor("codex-live")!.launchCommand("/tmp/p")[0]).toBe("codex");
-    expect(liveCliKindFor("codex-live")!.clearCommand).toBe("/new");
+
+    const claude = liveCliKindFor("claude-live")!;
+    expect(claude.launchCommand("/repo", claude.promptDir("/repo"))[0]).toBe("claude");
+    expect(claude.launchCommand("/repo", claude.promptDir("/repo"))).toContain("--add-dir");
+
+    const gemini = liveCliKindFor("gemini-live")!;
+    expect(gemini.promptDir("/repo")).toBe("/repo/.peer-review"); // inside the trusted cwd
+    const gemCmd = gemini.launchCommand("/repo", gemini.promptDir("/repo"));
+    expect(gemCmd[0]).toBe("gemini");
+    expect(gemCmd).not.toContain("--include-directories"); // avoids the second trust prompt
+
+    const codex = liveCliKindFor("codex-live")!;
+    expect(codex.launchCommand("/repo", codex.promptDir("/repo"))[0]).toBe("codex");
+    expect(codex.clearCommand).toBe("/new");
+
     expect(liveCliKindFor("unknown-live")).toBeNull();
   });
 

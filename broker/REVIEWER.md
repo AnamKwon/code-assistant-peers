@@ -42,7 +42,7 @@ claude.ai (OAuth). The worker prints a warning if it sees `ANTHROPIC_API_KEY`.
 | **auto-start backend on first live review** (`ensureChannelBackend`) | ✅ implemented + tested; verified end-to-end live |
 | live tmux round-trip: `claude-live` | ✅ verified (review returned, `command = ["<broker>","claude-live"]`, repo unchanged) |
 | live tmux round-trip: `codex-live` | ✅ verified (real Codex TUI driven via tmux, review returned) |
-| live tmux round-trip: `gemini-live` | ⬜ implemented + unit-tested; **not live-verified** (gemini CLI not installed on the dev machine) |
+| live tmux round-trip: `gemini-live` | ✅ verified (real Gemini CLI driven via tmux, review returned) |
 | **host-side passes via live session** (`CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS=1`) | ✅ implemented + tested (self-review, aggregate, collaborative host pass) |
 | **billing actually = subscription** | ⬜ **confirm on the Anthropic usage dashboard** (strongly inferred: interactive TUI + no API key) |
 
@@ -72,13 +72,20 @@ appears on demand. The MCP server logs one line to stderr when it auto-starts th
 ## Other live reviewers: `gemini-live`, `codex-live`
 
 The worker is generic over the reviewer CLI: `gemini-live` drives an interactive Gemini CLI
-session (`--approval-mode plan`, prompt dir granted via `--include-directories`, reset with
-`/clear`) and `codex-live` drives an interactive Codex TUI (`--sandbox read-only`, reset with
-`/new`). Unlike Claude there is **no known headless-vs-interactive billing split** for these —
-the benefit is a persistent per-repo session whose conversation memory can be kept across
-reviews (`CODE_ASSISTANT_PEERS_REVIEWER_CLEAR=never`). Both fall back to their headless CLI if
-the broker/session is unavailable. `codex-live` is live-verified; `gemini-live` is implemented
-and unit-tested but not yet live-verified.
+session (`--skip-trust --approval-mode plan`, reset with `/clear`) and `codex-live` drives an
+interactive Codex TUI (`--sandbox read-only`, reset with `/new`). Unlike Claude there is **no
+known headless-vs-interactive billing split** for these — the benefit is a persistent per-repo
+session whose conversation memory can be kept across reviews
+(`CODE_ASSISTANT_PEERS_REVIEWER_CLEAR=never`). Both fall back to their headless CLI if the
+broker/session is unavailable. Both are live-verified.
+
+Prompt-file location differs by CLI to satisfy each one's read-permission model: claude/codex
+read it from a shared tmp dir (claude grants it with `--add-dir`); **gemini reads it from a
+`.peer-review/` dir inside the repo cwd** — gemini's `--include-directories` would otherwise
+raise a second "trust this folder?" prompt that stalls a detached session, and the repo cwd is
+already trusted via `--skip-trust`. The per-job file is deleted after each review; the empty
+`.peer-review/` dir is untracked by git. Gemini must be authenticated once interactively
+(`gemini` → login, or set `GEMINI_API_KEY`); the cached creds then work in the detached session.
 
 ## Host-side passes on the live session
 
