@@ -1,5 +1,6 @@
 import type { AssistantAdapter, AssistantHost } from "./types.ts";
 import { getAssistantAdapter } from "./assistants.ts";
+import { ensureChannelBackend, reviewViaBroker } from "./broker-client.ts";
 import { spawnWithTimeout } from "./process.ts";
 import { REVIEWER_SYSTEM_PROMPT } from "./review-prompts.ts";
 import { parseSerenaCommand } from "./semantic.ts";
@@ -53,9 +54,34 @@ export async function runReviewCommand(
   prompt: string,
   model?: string | null,
 ): Promise<{ exitCode: number | null; stdout: string; stderr: string; command: string[] }> {
-  const command = buildReviewCommand(reviewer, model);
   const adapter = getAssistantAdapter(reviewer);
-  const recordedCommand = adapter.prompt_transport === "argv" ? [...command, "<prompt>"] : command;
+  const timeoutMs = resolveReviewCommandTimeoutMs(adapter);
+
+  // Channel transport: route the review to a backgrounded live reviewer session via the broker
+  // (subscription pool, no `claude -p`). On any broker/session failure, fall back to spawning
+  // the adapter's CLI command over stdin (graceful degradation to the original behavior).
+  let transport: "stdin" | "argv" = adapter.prompt_transport === "argv" ? "argv" : "stdin";
+  if (adapter.prompt_transport === "channel") {
+    if (model?.trim()) {
+      // The live session reviews with whatever model it is running; review_model only applies
+      // to the spawned-CLI fallback path.
+      console.error(`[code-assistant-peers] review_model '${model.trim()}' is not applied to the live channel session for ${reviewer}; it will be used only if the review falls back to spawning the CLI.`);
+    }
+    // Auto-start the broker + backgrounded reviewer worker if they are not already running, so a
+    // host only has to pick `claude-live` — no manual daemon launch. Idempotent + reused.
+    await ensureChannelBackend(cwd);
+    const reply = await reviewViaBroker(reviewer, prompt, resolveChannelTimeoutMs(), cwd);
+    if (reply.ok) {
+      return { exitCode: 0, stdout: reply.text, stderr: "", command: ["<broker>", reviewer] };
+    }
+    console.error(`[code-assistant-peers] broker channel unavailable (${reply.error}); falling back to spawning ${reviewer}.`);
+    transport = "stdin";
+  }
+
+  // Built only after the channel branch so a successful broker route does no wasted command
+  // construction.
+  const command = buildReviewCommand(reviewer, model);
+  const recordedCommand = transport === "argv" ? [...command, "<prompt>"] : command;
   if (model?.trim() && !adapter.model_arg) {
     return {
       exitCode: 1,
@@ -66,7 +92,7 @@ export async function runReviewCommand(
   }
   const env = buildReviewCommandEnv(adapter);
   const argvPromptBytes = byteLength(prompt);
-  if (adapter.prompt_transport === "argv" && argvPromptBytes > ARGV_PROMPT_BUDGET) {
+  if (transport === "argv" && argvPromptBytes > ARGV_PROMPT_BUDGET) {
     return {
       exitCode: 1,
       stdout: "",
@@ -74,14 +100,13 @@ export async function runReviewCommand(
       command: recordedCommand,
     };
   }
-  const finalCommand = adapter.prompt_transport === "argv" ? [...command, prompt] : command;
-  const timeoutMs = resolveReviewCommandTimeoutMs(adapter);
+  const finalCommand = transport === "argv" ? [...command, prompt] : command;
   let result: Awaited<ReturnType<typeof spawnWithTimeout>>;
   try {
     result = await spawnWithTimeout(finalCommand, {
       cwd,
       env,
-      stdin: adapter.prompt_transport === "stdin" ? prompt : null,
+      stdin: transport === "stdin" ? prompt : null,
       timeoutMs,
     });
   } catch (error) {
@@ -142,6 +167,19 @@ function findModelArgInsertIndex(command: string[]): number {
 function resolveReviewCommandTimeoutMs(adapter: AssistantAdapter): number {
   const configured = parsePositiveInteger(process.env.CODE_ASSISTANT_PEERS_REVIEW_TIMEOUT_MS);
   return configured ?? adapter.timeout_ms ?? DEFAULT_REVIEW_COMMAND_TIMEOUT_MS;
+}
+
+// The client-side poll budget for the broker (channel) path. It must be strictly LONGER than the
+// reviewer worker's per-review deliver timeout: the worker bounds the review by the same
+// CODE_ASSISTANT_PEERS_REVIEW_TIMEOUT_MS (default DEFAULT_REVIEW_COMMAND_TIMEOUT_MS) but its clock
+// only starts after the job is claimed and the TUI cold-boots, whereas the client's clock starts
+// at submit. Without the extra slack the client would abandon the live session and fall back to
+// `claude -p` exactly when the review was about to complete. Deliberately ignores the adapter's
+// headless `timeout_ms` (e.g. gemini's 180s) — that bounds the spawn fallback, not the live path.
+const CHANNEL_BOOT_SLACK_MS = 120_000;
+function resolveChannelTimeoutMs(): number {
+  const configured = parsePositiveInteger(process.env.CODE_ASSISTANT_PEERS_REVIEW_TIMEOUT_MS);
+  return (configured ?? DEFAULT_REVIEW_COMMAND_TIMEOUT_MS) + CHANNEL_BOOT_SLACK_MS;
 }
 
 function parsePositiveInteger(value: string | undefined): number | undefined {

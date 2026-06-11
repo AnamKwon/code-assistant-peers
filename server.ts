@@ -37,9 +37,9 @@ import {
   loadTask,
   saveTask,
 } from "./shared/store.ts";
-import { getAssistantAdapter, getGeminiAuthReadiness, loadAssistantRegistry, peersFor } from "./shared/assistants.ts";
+import { getAssistantAdapter, getGeminiAuthReadiness, liveHostReviewer, loadAssistantRegistry, peersFor } from "./shared/assistants.ts";
 import { spawnWithTimeout } from "./shared/process.ts";
-import { areConfiguredAssistantsReady, resolveMultiPeerTaskStatus, shouldRunCodexSelfReview, summarizeMultiPeerAvailability } from "./shared/multi-peer.ts";
+import { areConfiguredAssistantsReady, resolveMultiPeerTaskStatus, shouldRunHostSelfReview, summarizeMultiPeerAvailability } from "./shared/multi-peer.ts";
 import type { AssistantHost, NewPeerReviewFinding, PeerReviewResult, PeerTask, PeerWorkflow, ReviewMode, ReviewRequestOptions, ReviewScope } from "./shared/types.ts";
 
 if (process.env.CODE_ASSISTANT_PEERS_REVIEWER_SUBPROCESS === "1") {
@@ -1166,7 +1166,7 @@ async function runPeerReviewTool(
   promptSnapshotSeed?: ReviewPromptSnapshotSeed,
 ) {
   const taskPeers = task.peers?.length ? task.peers : [task.peer];
-  if (taskPeers.length > 1 || shouldRunCodexSelfReview(task.host, options.mode)) {
+  if (taskPeers.length > 1 || shouldRunHostSelfReview(task.host, options.mode)) {
     const promptSnapshot = await prepareReviewPromptSnapshot(task, options, promptSnapshotSeed);
     return await runMultiPeerReviewTool(task, options, taskPeers, promptSnapshot, expectedSignature);
   }
@@ -1266,7 +1266,7 @@ async function runMultiPeerReviewTool(
   promptSnapshot?: Awaited<ReturnType<typeof prepareReviewPromptSnapshot>>,
   expectedSignature?: string,
 ) {
-  const selfReviewEnabled = shouldRunCodexSelfReview(task.host, options.mode);
+  const selfReviewEnabled = shouldRunHostSelfReview(task.host, options.mode);
   const [hostAvailability, peerAvailability] = await Promise.all([
     isAssistantAvailable(task.host),
     Promise.all(taskPeers.map(async (reviewer) => ({
@@ -1312,7 +1312,9 @@ async function runMultiPeerReviewTool(
 
   const snapshot = promptSnapshot ?? await prepareReviewPromptSnapshot(task, options);
   const selfReviewPromise = selfReviewEnabled
-    ? runSinglePeerRound(task, { ...options, self_review: true }, task.host, `${task.host} self-review`, snapshot, expectedSignature)
+    // liveHostReviewer routes the self-review through the host's live (tmux) session when
+    // CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS=1 and a <host>-live adapter is registered.
+    ? runSinglePeerRound(task, { ...options, self_review: true }, liveHostReviewer(task.host), `${task.host} self-review`, snapshot, expectedSignature)
     : Promise.resolve<ReviewRoundOutcome | null>(null);
   const [peerResults, selfReviewResult] = await Promise.all([
     Promise.all(availablePeers.map((reviewer) => runSinglePeerRound(task, options, reviewer, reviewer, snapshot, expectedSignature))),
@@ -1321,7 +1323,7 @@ async function runMultiPeerReviewTool(
   const reviewResults = [...peerResults, ...(selfReviewResult ? [selfReviewResult] : [])];
   const statusResults = reviewResults;
   const selfReviewFailureWarning = selfReviewResult && selfReviewResult.review.exit_code !== 0
-    ? `Codex self-review round ${selfReviewResult.round.round} exited ${selfReviewResult.review.exit_code}`
+    ? `${task.host} self-review round ${selfReviewResult.round.round} exited ${selfReviewResult.review.exit_code}`
     : null;
 
   if (peerResults.some((result) => result.round.round < 0) || (selfReviewResult && selfReviewResult.round.round < 0)) {
@@ -1358,7 +1360,7 @@ async function runMultiPeerReviewTool(
     }
 
     const body = [
-      `Codex self-review completed for task ${task.id}.`,
+      `${task.host} self-review completed for task ${task.id}.`,
       `Requested peers: ${taskPeers.join(", ")}`,
       `Reviewed by: ${reviewResults.map((result) => result.label).join(", ")}`,
       skippedPeers.length ? `Skipped unavailable peers:\n${skippedPeers.map((item) => `- ${item.reviewer}: ${item.available.detail}`).join("\n")}` : "",
@@ -1380,11 +1382,14 @@ async function runMultiPeerReviewTool(
   const aggregatePromptResult = await buildMultiPeerAggregatePrompt(task, options, peerResults, skippedPeers, selfReviewResult, snapshot);
   const aggregatePrompt = aggregatePromptResult.prompt;
   const aggregateStartedAt = new Date().toISOString();
+  // The aggregate pass runs as the HOST — for a claude host that spawns `claude -p` (credit
+  // pool). liveHostReviewer optionally routes it through the host's live session instead.
+  const aggregateReviewer = liveHostReviewer(task.host);
   const aggregateResult = await runReviewCommand(
-    task.host,
+    aggregateReviewer,
     task.cwd,
     aggregatePrompt,
-    resolveReviewerModel(task.host, options, buildReviewModelRoutingContext(options, snapshot)),
+    resolveReviewerModel(aggregateReviewer, options, buildReviewModelRoutingContext(options, snapshot)),
   );
   const aggregateCompletedAt = new Date().toISOString();
   const aggregateWarning = [aggregatePromptResult.warning, selfReviewFailureWarning].filter(Boolean).join("\n") || undefined;
@@ -1540,11 +1545,14 @@ async function runCollaborativeReviewTool(
 
   const hostPrompt = buildHostComparisonPrompt(task, options, peerReview.stdout || peerReview.stderr, promptSnapshot);
   const hostStartedAt = new Date().toISOString();
+  // Collaborative host comparison also runs as the HOST — route via the live session when
+  // CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS=1 (avoids `claude -p` for claude hosts).
+  const hostComparisonReviewer = liveHostReviewer(task.host);
   const hostResult = await runReviewCommand(
-    task.host,
+    hostComparisonReviewer,
     task.cwd,
     hostPrompt,
-    resolveReviewerModel(task.host, options, buildReviewModelRoutingContext(options, promptSnapshot)),
+    resolveReviewerModel(hostComparisonReviewer, options, buildReviewModelRoutingContext(options, promptSnapshot)),
   );
   const hostCompletedAt = new Date().toISOString();
   const hostReview = {

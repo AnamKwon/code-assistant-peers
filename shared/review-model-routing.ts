@@ -17,7 +17,11 @@ export function resolveReviewerModel(
   options: Pick<ReviewRequestOptions, "review_model" | "review_models">,
   context: ReviewModelRoutingContext = {},
 ): string | null {
-  const explicit = options.review_models?.[reviewer]?.trim();
+  // Host coding agents key review_models by the BASE adapter id they know from setup (e.g.
+  // {"claude":"opus"}). When a host-side pass is diverted to the live adapter (claude-live) via
+  // CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS, fall back to the base id so the requested model is
+  // still honored on the spawn-fallback path.
+  const explicit = (options.review_models?.[reviewer] ?? baseReviewerModel(reviewer, options.review_models))?.trim();
   if (explicit) {
     return explicit === "auto" ? selectAutoReviewerModel(reviewer, context) : explicit;
   }
@@ -25,6 +29,12 @@ export function resolveReviewerModel(
   if (global && global !== "auto") return global;
   if (global !== "auto") return null;
   return selectAutoReviewerModel(reviewer, context);
+}
+
+// review_models lookup keyed by the base id for a "<base>-live" reviewer (e.g. claude-live -> claude).
+function baseReviewerModel(reviewer: string, models?: Record<string, string>): string | undefined {
+  if (!models || !reviewer.endsWith("-live")) return undefined;
+  return models[reviewer.slice(0, -"-live".length)];
 }
 
 export function buildReviewModelRoutingContext(
