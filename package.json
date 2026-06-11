@@ -1,6 +1,6 @@
 {
   "name": "mcp-code-assistant-peers",
-  "version": "0.2.0-alpha.0",
+  "version": "0.2.0-alpha.1",
   "description": "MCP review gate that lets Claude Code, Codex, Gemini, and other CLI coding agents review each other",
   "type": "module",
   "license": "MIT",
@@ -26,9 +26,9 @@
     "review-gate"
   ],
   "bin": {
-    "mcp-code-assistant-peers": "./cli.ts",
-    "code-assistant-peers": "./cli.ts",
-    "code-assistant-peers-server": "./server.ts"
+    "mcp-code-assistant-peers": "cli.ts",
+    "code-assistant-peers": "cli.ts",
+    "code-assistant-peers-server": "server.ts"
   },
   "engines": {
     "bun": ">=1.0"

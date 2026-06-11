@@ -78,24 +78,34 @@ function log(message: string): void {
   console.error(`[code-assistant-peers] ${message}`);
 }
 
+function formatKnownReviewerModels(): string {
+  return Object.values(assistantRegistry)
+    .filter((adapter) => adapter.model_arg && adapter.models?.length)
+    .sort((a, b) => a.id.localeCompare(b.id))
+    .map((adapter) => `${adapter.id}: ${adapter.models?.map((model) => model.id).join(", ")}`)
+    .join("; ");
+}
+
 const REVIEW_MODEL_INPUT_PROPERTIES = {
   review_model: {
     type: "string" as const,
-    description: "Optional reviewer model selected by the host coding agent for this request. Omit to use each reviewer CLI default. Use an explicit model id only when that same id is valid for every targeted reviewer CLI. Prefer review_models for mixed reviewer providers. Use \"auto\" only when the host wants this MCP server to choose from known model routing.",
+    description: `Reviewer model selected by the host coding agent for this request. Pass an explicit model id when the same id is valid for every targeted reviewer, pass "auto" to delegate importance-based routing to this MCP server, or omit only when intentionally using each reviewer CLI default. Prefer review_models for mixed reviewer providers. Known model candidates are loaded from shared/reviewer-models.json plus custom adapter metadata: ${formatKnownReviewerModels()}.`,
   },
   review_models: {
     type: "object" as const,
     additionalProperties: { type: "string" as const },
-    description: "Optional per-reviewer model mapping selected by the host coding agent, such as {\"claude\":\"opus\",\"codex\":\"gpt-5.5\"}. This overrides review_model for matching reviewers. A per-reviewer value of \"auto\" delegates only that reviewer to MCP automatic routing.",
+    description: `Per-reviewer model mapping selected by the host coding agent, such as {"claude":"opus","codex":"gpt-5.5"}. Use this when reviewers use different providers or model ids. This overrides review_model for matching reviewers. A per-reviewer value of "auto" delegates only that reviewer to MCP automatic routing. Known model candidates are loaded from shared/reviewer-models.json plus custom adapter metadata: ${formatKnownReviewerModels()}.`,
   },
 };
 
 const HOST_MODEL_SELECTION_GUIDANCE = [
   "Host model selection policy:",
-  "- Prefer explicit review_models when the host coding agent can match the reviewer to a known candidate from code_assistant_peers_setup.",
+  `- Known reviewer model candidates are loaded from shared/reviewer-models.json plus custom adapter metadata: ${formatKnownReviewerModels()}.`,
+  "- When requesting review, actively choose reviewer models based on risk, size, latency, and cost instead of relying on CLI defaults by accident.",
+  "- Pass explicit review_models when the host coding agent can match each reviewer to a known candidate from code_assistant_peers_setup.",
   "- Prefer review_models over review_model when reviewers use different providers because model ids are provider-specific.",
-  "- Omit review_model/review_models to keep the reviewer CLI default model.",
-  "- Use review_model=\"auto\" only when the host wants the MCP server to choose from the hardcoded model catalog.",
+  "- Pass review_model=\"auto\" or review_models[reviewer]=\"auto\" when the host wants this MCP server to choose from the shared/reviewer-models.json model list.",
+  "- Omit review_model/review_models only when intentionally keeping each reviewer CLI default model.",
   "- Use fast models for small docs/tests/lint/copy/comment changes.",
   "- Use balanced models for ordinary code review and gate checks.",
   "- Use deep models for adversarial/collaborative/peer_fix reviews or security, auth, data loss, migration, release, database, privacy, race/concurrency, secrets, or performance risk.",
@@ -104,7 +114,7 @@ const HOST_MODEL_SELECTION_GUIDANCE = [
 ].join("\n");
 
 const mcp = new Server(
-  { name: "code-assistant-peers", version: "0.2.0-alpha.0" },
+  { name: "code-assistant-peers", version: "0.2.0-alpha.1" },
   {
     capabilities: { tools: {} },
     instructions: `You are connected to the code-assistant-peers workflow as ${host}.

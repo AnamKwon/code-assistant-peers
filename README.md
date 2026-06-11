@@ -454,14 +454,14 @@ If the local CLI expects the model as a positional argument instead of a flag, u
 
 ### Reviewer Model Selection
 
-`code_assistant_peers_setup` reports whether each configured assistant CLI supports model selection, the known model candidates, and whether live model probing was enabled. By default it performs no live model probes because those can spend tokens; set `CODE_ASSISTANT_PEERS_PROBE_MODELS=1` before starting the MCP server if you want setup to test known model candidates with small probe calls.
+`code_assistant_peers_setup` reports whether each configured assistant CLI supports model selection, the known model candidates, and whether live model probing was enabled. Built-in candidates live in `shared/reviewer-models.json`, so routine model-list updates should edit that file instead of code. By default setup performs no live model probes because those can spend tokens; set `CODE_ASSISTANT_PEERS_PROBE_MODELS=1` before starting the MCP server if you want setup to test known model candidates with small probe calls.
 
 Built-in model flags:
 
 ```text
-claude -> --model <model>  # known candidates: haiku, sonnet, opus, best, sonnet[1m], opus[1m], opusplan
-codex  -> -m <model>       # known candidates: gpt-5.5, gpt-5.4, gpt-5.3-codex, gpt-5.4-mini, gpt-5.4-nano
-gemini -> --model <model>  # known candidates: auto, pro, flash, flash-lite, gemini-3-pro-preview, gemini-3-flash-preview, gemini-2.5-pro, gemini-2.5-flash, gemini-2.5-flash-lite
+claude -> --model <model>
+codex  -> -m <model>
+gemini -> --model <model>
 ```
 
 The host coding agent that calls the MCP review tool should choose the reviewer model when it has enough context. The MCP server exposes the known candidates in `code_assistant_peers_setup`, including `quality`, `cost`, `latency`, and `routing` metadata.
@@ -499,7 +499,7 @@ Use automatic model routing only when the host wants to delegate the choice to t
 }
 ```
 
-With `auto`, the server chooses from the hardcoded candidate list per reviewer:
+With `auto`, the server chooses from the candidate list in `shared/reviewer-models.json` per reviewer:
 
 - `fast`: small docs, tests, lint, copy, or low-risk diffs.
 - `balanced`: normal review, gate review, and self-review.

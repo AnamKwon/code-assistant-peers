@@ -25,11 +25,30 @@ describe("server tool descriptions", () => {
     expect(source).toContain("Host model selection policy:");
     expect(source).toContain("selector: \"host coding agent\"");
     expect(source).toContain("review_models[reviewer]");
-    expect(source).toContain("Use review_model=\\\"auto\\\" only when the host wants the MCP server to choose");
-    expect(source).toContain("review_models for per-reviewer choices");
+    expect(source).toContain("Known reviewer model candidates");
+    expect(source).toContain("shared/reviewer-models.json");
+    expect(source).toContain("formatKnownReviewerModels");
+    expect(source).toContain("adapter.models?.map");
+    expect(source).toContain("actively choose reviewer models based on risk, size, latency, and cost");
+    expect(source).toContain("Pass review_model=\\\"auto\\\" or review_models[reviewer]=\\\"auto\\\"");
+    expect(source).toContain("Pass explicit review_models");
     expect(source).toContain("Prefer review_models over review_model when reviewers use different providers");
     expect(source).toContain("global_selection_warning");
     expect(source).not.toContain('all_reviewers: { review_model: "sonnet" }');
+
+    const assistantsSource = await Bun.file(new URL("../shared/assistants.ts", import.meta.url).pathname).text();
+    expect(assistantsSource).toContain("reviewer-models.json");
+    expect(assistantsSource).not.toContain('models: [');
+
+    const modelListSource = await Bun.file(new URL("../shared/reviewer-models.json", import.meta.url).pathname).text();
+    expect(modelListSource).toContain("gpt-5.5");
+    expect(modelListSource).toContain("opus");
+    expect(modelListSource).toContain("flash-lite");
+    const models = JSON.parse(modelListSource);
+    expect(models.codex[0].routing).toContain("deep");
+    expect(models.claude[1].routing).toContain("balanced");
+    expect(models.gemini[3].routing).toContain("fast");
+    expect(assistantsSource).toContain("loadBuiltinReviewerModels");
   });
 
   test("keeps installed project rules aligned with async-first review gates", async () => {
