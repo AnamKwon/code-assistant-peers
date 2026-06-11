@@ -28,8 +28,20 @@ export function areConfiguredAssistantsReady(
   return Boolean(assistants[host]?.available?.ok && peers.every((reviewer) => Boolean(assistants[reviewer]?.available?.ok)));
 }
 
-export function shouldRunCodexSelfReview(host: AssistantHost, mode?: ReviewMode): boolean {
-  return host === "codex" && mode !== "collaborative" && mode !== "gate";
+// Which hosts run a self-review (the host reviews its own patch, merged into the aggregate pass).
+// Controlled by CODE_ASSISTANT_PEERS_SELF_REVIEW:
+//   unset (default) -> "codex"   (backwards compatible)
+//   "all" / "*"     -> every host
+//   "none" / "off"  -> disabled
+//   comma list      -> those hosts, e.g. "claude,codex"
+// Self-review never runs in collaborative or gate modes (the host already participates there).
+export function shouldRunHostSelfReview(host: AssistantHost, mode?: ReviewMode, env: NodeJS.ProcessEnv = process.env): boolean {
+  if (mode === "collaborative" || mode === "gate") return false;
+  const raw = env.CODE_ASSISTANT_PEERS_SELF_REVIEW?.trim().toLowerCase();
+  if (!raw) return host === "codex";
+  if (raw === "none" || raw === "off") return false;
+  if (raw === "all" || raw === "*") return true;
+  return raw.split(",").map((part) => part.trim()).filter(Boolean).includes(host.toLowerCase());
 }
 
 export function summarizeMultiPeerAvailability(

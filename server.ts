@@ -39,7 +39,7 @@ import {
 } from "./shared/store.ts";
 import { getAssistantAdapter, getGeminiAuthReadiness, liveHostReviewer, loadAssistantRegistry, peersFor } from "./shared/assistants.ts";
 import { spawnWithTimeout } from "./shared/process.ts";
-import { areConfiguredAssistantsReady, resolveMultiPeerTaskStatus, shouldRunCodexSelfReview, summarizeMultiPeerAvailability } from "./shared/multi-peer.ts";
+import { areConfiguredAssistantsReady, resolveMultiPeerTaskStatus, shouldRunHostSelfReview, summarizeMultiPeerAvailability } from "./shared/multi-peer.ts";
 import type { AssistantHost, NewPeerReviewFinding, PeerReviewResult, PeerTask, PeerWorkflow, ReviewMode, ReviewRequestOptions, ReviewScope } from "./shared/types.ts";
 
 if (process.env.CODE_ASSISTANT_PEERS_REVIEWER_SUBPROCESS === "1") {
@@ -1156,7 +1156,7 @@ async function runPeerReviewTool(
   promptSnapshotSeed?: ReviewPromptSnapshotSeed,
 ) {
   const taskPeers = task.peers?.length ? task.peers : [task.peer];
-  if (taskPeers.length > 1 || shouldRunCodexSelfReview(task.host, options.mode)) {
+  if (taskPeers.length > 1 || shouldRunHostSelfReview(task.host, options.mode)) {
     const promptSnapshot = await prepareReviewPromptSnapshot(task, options, promptSnapshotSeed);
     return await runMultiPeerReviewTool(task, options, taskPeers, promptSnapshot, expectedSignature);
   }
@@ -1256,7 +1256,7 @@ async function runMultiPeerReviewTool(
   promptSnapshot?: Awaited<ReturnType<typeof prepareReviewPromptSnapshot>>,
   expectedSignature?: string,
 ) {
-  const selfReviewEnabled = shouldRunCodexSelfReview(task.host, options.mode);
+  const selfReviewEnabled = shouldRunHostSelfReview(task.host, options.mode);
   const [hostAvailability, peerAvailability] = await Promise.all([
     isAssistantAvailable(task.host),
     Promise.all(taskPeers.map(async (reviewer) => ({
@@ -1313,7 +1313,7 @@ async function runMultiPeerReviewTool(
   const reviewResults = [...peerResults, ...(selfReviewResult ? [selfReviewResult] : [])];
   const statusResults = reviewResults;
   const selfReviewFailureWarning = selfReviewResult && selfReviewResult.review.exit_code !== 0
-    ? `Codex self-review round ${selfReviewResult.round.round} exited ${selfReviewResult.review.exit_code}`
+    ? `${task.host} self-review round ${selfReviewResult.round.round} exited ${selfReviewResult.review.exit_code}`
     : null;
 
   if (peerResults.some((result) => result.round.round < 0) || (selfReviewResult && selfReviewResult.round.round < 0)) {
@@ -1350,7 +1350,7 @@ async function runMultiPeerReviewTool(
     }
 
     const body = [
-      `Codex self-review completed for task ${task.id}.`,
+      `${task.host} self-review completed for task ${task.id}.`,
       `Requested peers: ${taskPeers.join(", ")}`,
       `Reviewed by: ${reviewResults.map((result) => result.label).join(", ")}`,
       skippedPeers.length ? `Skipped unavailable peers:\n${skippedPeers.map((item) => `- ${item.reviewer}: ${item.available.detail}`).join("\n")}` : "",
