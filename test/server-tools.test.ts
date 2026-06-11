@@ -30,7 +30,10 @@ describe("server tool descriptions", () => {
     expect(source).toContain("formatKnownReviewerModels");
     expect(source).toContain('adapter.prompt_transport !== "channel"');
     expect(source).toContain("adapter.models?.map");
-    expect(source).toContain("actively choose reviewer models based on risk, size, latency, and cost");
+    expect(source).toContain("pass the chosen model ids in the SAME review tool call");
+    expect(source).toContain("based on review type, risk, size, latency, and cost");
+    expect(source).toContain("Example high-risk call");
+    expect(source).toContain("actively choose reviewer models based on review type, risk, size, latency, and cost");
     expect(source).toContain("Pass review_model=\\\"auto\\\" or review_models[reviewer]=\\\"auto\\\"");
     expect(source).toContain("Pass explicit review_models");
     expect(source).toContain("Prefer review_models over review_model when reviewers use different providers");

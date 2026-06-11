@@ -167,6 +167,86 @@ describe("server integration", () => {
     }
   });
 
+  test("passes review_models from the MCP tool call into the reviewer command", async () => {
+    const storeDir = await mkdtemp(join(tmpdir(), "cap-review-models-"));
+    const transport = new StdioClientTransport({
+      command: "bun",
+      args: ["server.ts"],
+      cwd: PROJECT_ROOT,
+      env: {
+        HOST_ASSISTANT: "host",
+        PEER_ASSISTANT: "peer",
+        CODE_ASSISTANT_PEERS_HOME: storeDir,
+        CODE_ASSISTANT_PEERS_ASSISTANTS: JSON.stringify({
+          host: {
+            command: ["bun", "--eval", "await new Response(Bun.stdin).text(); console.log('host aggregate')"],
+            prompt_transport: "stdin",
+            model_arg: "--model",
+          },
+          peer: {
+            command: ["bun", "--eval", "await new Response(Bun.stdin).text(); console.log('No findings.\\npatch is correct')"],
+            prompt_transport: "stdin",
+            model_arg: "--model",
+            models: [
+              { id: "peer-fast", routing: ["fast"], latency: "low" },
+              { id: "peer-deep", routing: ["deep"], quality: "highest" },
+            ],
+          },
+        }),
+      },
+      stderr: "pipe",
+    });
+    const client = new Client({ name: "integration-test", version: "1.0.0" });
+
+    try {
+      await client.connect(transport);
+
+      const startResult = await client.callTool({
+        name: "start_peer_review_async",
+        arguments: {
+          prompt: "exercise explicit per-reviewer model selection",
+          mode: "adversarial",
+          focus: "security",
+          review_models: {
+            peer: "peer-deep",
+          },
+        },
+      });
+      const taskId = extractTaskId(textFromToolResult(startResult));
+
+      const waitResult = await client.callTool({
+        name: "wait_for_peer_review",
+        arguments: {
+          task_id: taskId,
+          poll_interval_ms: 100,
+          timeout_seconds: 10,
+        },
+      });
+      const waitJson = parseJsonObject(textFromToolResult(waitResult));
+      expect(waitJson.status).toBe("reviewed");
+
+      const roundResult = await client.callTool({
+        name: "get_peer_review_round",
+        arguments: {
+          task_id: taskId,
+          round: 1,
+        },
+      });
+      const round = parseJsonObject(textFromToolResult(roundResult));
+      expect(round.reviewer).toBe("peer");
+      expect(round.command).toEqual([
+        "bun",
+        "--eval",
+        "await new Response(Bun.stdin).text(); console.log('No findings.\\npatch is correct')",
+        "--model",
+        "peer-deep",
+      ]);
+    } finally {
+      await transport.close();
+      await rm(storeDir, { recursive: true, force: true });
+    }
+  });
+
   test("recovers a stale running review after a new server process starts", async () => {
     const storeDir = await mkdtemp(join(tmpdir(), "cap-stale-review-"));
     const slowEnv = {

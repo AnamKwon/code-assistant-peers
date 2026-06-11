@@ -101,7 +101,8 @@ const REVIEW_MODEL_INPUT_PROPERTIES = {
 const HOST_MODEL_SELECTION_GUIDANCE = [
   "Host model selection policy:",
   `- Known reviewer model candidates are loaded from shared/reviewer-models.json plus custom adapter metadata: ${formatKnownReviewerModels()}.`,
-  "- When requesting review, actively choose reviewer models based on risk, size, latency, and cost instead of relying on CLI defaults by accident.",
+  "- Before requesting review, inspect code_assistant_peers_setup when model choices are unclear, then pass the chosen model ids in the SAME review tool call.",
+  "- When requesting review, actively choose reviewer models based on review type, risk, size, latency, and cost instead of relying on CLI defaults by accident.",
   "- Pass explicit review_models when the host coding agent can match each reviewer to a known candidate from code_assistant_peers_setup.",
   "- Prefer review_models over review_model when reviewers use different providers because model ids are provider-specific.",
   "- Pass review_model=\"auto\" or review_models[reviewer]=\"auto\" when the host wants this MCP server to choose from the shared/reviewer-models.json model list.",
@@ -110,6 +111,8 @@ const HOST_MODEL_SELECTION_GUIDANCE = [
   "- Use balanced models for ordinary code review and gate checks.",
   "- Use deep models for adversarial/collaborative/peer_fix reviews or security, auth, data loss, migration, release, database, privacy, race/concurrency, secrets, or performance risk.",
   "- Use long_context models for truncated diffs, very large diffs, or broad changes touching many files.",
+  "- Example normal/gate call: {\"mode\":\"gate\",\"review_models\":{\"claude\":\"sonnet\",\"gemini\":\"flash\"}}.",
+  "- Example high-risk call: {\"mode\":\"adversarial\",\"focus\":\"security migration\",\"review_models\":{\"claude\":\"opus\",\"gemini\":\"pro\"}}.",
   "Precedence: review_models[reviewer] > review_model > reviewer CLI default. If either value is \"auto\", the MCP server chooses for that scope. Do not pass a provider-specific model globally unless every targeted reviewer supports that same id.",
 ].join("\n");
 
