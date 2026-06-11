@@ -70,4 +70,14 @@ describe("server tool descriptions", () => {
     expect(source).toContain("PEER_ASSISTANTS");
     expect(source).toContain("CODE_ASSISTANT_PEERS_[A-Z0-9_]+");
   });
+
+  test("keeps runtime support files in the npm package", async () => {
+    const packageJson = JSON.parse(await Bun.file(new URL("../package.json", import.meta.url).pathname).text());
+
+    expect(packageJson.files).toContain("shared");
+    expect(packageJson.files).toContain("broker");
+    expect(await Bun.file(new URL("../shared/reviewer-models.json", import.meta.url).pathname).exists()).toBe(true);
+    expect(await Bun.file(new URL("../broker/server.ts", import.meta.url).pathname).exists()).toBe(true);
+    expect(await Bun.file(new URL("../broker/reviewer.ts", import.meta.url).pathname).exists()).toBe(true);
+  });
 });

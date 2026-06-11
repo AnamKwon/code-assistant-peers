@@ -41,6 +41,7 @@
     "server.ts",
     "cli.ts",
     "shared",
+    "broker",
     "scripts",
     "docs"
   ],
