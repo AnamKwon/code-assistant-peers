@@ -80,7 +80,7 @@ function log(message: string): void {
 
 function formatKnownReviewerModels(): string {
   return Object.values(assistantRegistry)
-    .filter((adapter) => adapter.model_arg && adapter.models?.length)
+    .filter((adapter) => adapter.prompt_transport !== "channel" && adapter.model_arg && adapter.models?.length)
     .sort((a, b) => a.id.localeCompare(b.id))
     .map((adapter) => `${adapter.id}: ${adapter.models?.map((model) => model.id).join(", ")}`)
     .join("; ");

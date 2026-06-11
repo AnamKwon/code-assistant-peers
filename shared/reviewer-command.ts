@@ -30,7 +30,7 @@ export function buildReviewCommand(reviewer: AssistantHost, model?: string | nul
   const adapter = getAssistantAdapter(reviewer);
   let command = adapter.command.map((part) => part === "{system_prompt}" ? REVIEWER_SYSTEM_PROMPT : part);
   command = insertModelArg(command, adapter, model);
-  if (reviewer !== "claude") return command;
+  if (reviewer !== "claude" && reviewer !== "claude-live") return command;
 
   const serenaCommand = parseSerenaCommand(process.env.CODE_ASSISTANT_PEERS_SERENA_COMMAND);
   const mcpConfig = JSON.stringify({

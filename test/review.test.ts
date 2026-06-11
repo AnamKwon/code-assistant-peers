@@ -492,6 +492,30 @@ describe("review command construction", () => {
     }
   });
 
+  test("claude-live fallback mounts Serena MCP config like the claude reviewer", () => {
+    const previous = process.env.CODE_ASSISTANT_PEERS_SERENA_COMMAND;
+    process.env.CODE_ASSISTANT_PEERS_SERENA_COMMAND = '["serena","start-mcp-server","--project-from-cwd"]';
+    try {
+      const command = buildReviewCommand("claude-live");
+      const mcpConfigIndex = command.indexOf("--mcp-config");
+      expect(command.slice(0, 2)).toEqual(["claude", "-p"]);
+      expect(command).toContain("--strict-mcp-config");
+      expect(mcpConfigIndex).toBeGreaterThan(0);
+      expect(mcpConfigIndex).toBeLessThan(command.indexOf("--system-prompt"));
+      expect(JSON.parse(command[mcpConfigIndex + 1])).toEqual({
+        mcpServers: {
+          serena: {
+            command: "serena",
+            args: ["start-mcp-server", "--project-from-cwd"],
+          },
+        },
+      });
+    } finally {
+      if (previous === undefined) delete process.env.CODE_ASSISTANT_PEERS_SERENA_COMMAND;
+      else process.env.CODE_ASSISTANT_PEERS_SERENA_COMMAND = previous;
+    }
+  });
+
   test("review model selection inserts provider model arguments before prompt transport", () => {
     expect(buildReviewCommand("claude", "sonnet").slice(0, 7)).toEqual([
       "claude",
@@ -547,7 +571,7 @@ describe("review command construction", () => {
     expect(resolveReviewerModel("claude-live", { review_models: { "claude-live": "sonnet", claude: "opus" } })).toBe("sonnet");
   });
 
-  test("auto review model selection uses hardcoded reviewer model tiers", () => {
+  test("auto review model selection uses the reviewer model list tiers", () => {
     expect(selectAutoReviewerModel("claude", { diffLength: 1000, changedFileCount: 1, focus: "docs" })).toBe("haiku");
     expect(selectAutoReviewerModel("claude", { focus: "security and data loss", diffLength: 1000 })).toBe("opus");
     // diffWasTruncated alone (diffLength=0) no longer forces long_context → balanced

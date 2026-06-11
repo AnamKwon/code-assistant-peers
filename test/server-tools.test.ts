@@ -28,6 +28,7 @@ describe("server tool descriptions", () => {
     expect(source).toContain("Known reviewer model candidates");
     expect(source).toContain("shared/reviewer-models.json");
     expect(source).toContain("formatKnownReviewerModels");
+    expect(source).toContain('adapter.prompt_transport !== "channel"');
     expect(source).toContain("adapter.models?.map");
     expect(source).toContain("actively choose reviewer models based on risk, size, latency, and cost");
     expect(source).toContain("Pass review_model=\\\"auto\\\" or review_models[reviewer]=\\\"auto\\\"");
