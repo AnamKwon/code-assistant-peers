@@ -76,7 +76,7 @@ export function formatMultiPeerReviewOutputs(
     }).join("\n\n")
     : "(none)";
   const selfReviewSection = selfReviewResult
-    ? `\n\nHost self-review output:\n--- ${selfReviewResult.label ?? selfReviewResult.reviewer} round ${selfReviewResult.round.round} exit ${selfReviewResult.review.exit_code} ---\n${truncateForReview(selfReviewResult.review.stdout || selfReviewResult.review.stderr || "(no output)", REVIEW_OUTPUT_BUDGET)}`
+    ? `\n\nCodex self-review output:\n--- ${selfReviewResult.label ?? selfReviewResult.reviewer} round ${selfReviewResult.round.round} exit ${selfReviewResult.review.exit_code} ---\n${truncateForReview(selfReviewResult.review.stdout || selfReviewResult.review.stderr || "(no output)", REVIEW_OUTPUT_BUDGET)}`
     : "";
   return `Peer review outputs:\n${peerOutput}${selfReviewSection}`;
 }
@@ -162,7 +162,7 @@ export function buildReviewPromptFromSnapshot(
   const selfReview = options.self_review ?? false;
   const workflow = selfReview ? "review_only" : options.workflow ?? "review_only";
   if (selfReview && (mode === "gate" || mode === "collaborative")) {
-    throw new Error("Self-review is only supported for normal and adversarial review modes");
+    throw new Error("Codex self-review is only supported for normal and adversarial review modes");
   }
   const focus = normalizeReviewFocus(options.focus ?? process.env.CODE_ASSISTANT_PEERS_REVIEW_FOCUS);
   const reviewContext = snapshot.reviewContext;

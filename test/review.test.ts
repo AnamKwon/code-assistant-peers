@@ -27,7 +27,7 @@ import {
   truncateForReview,
 } from "../shared/review.ts";
 import { getGeminiAuthReadiness, hasNonBlankEnv, isTruthyEnv, loadAssistantRegistry, getAssistantAdapter, peersFor } from "../shared/assistants.ts";
-import { areConfiguredAssistantsReady, resolveMultiPeerTaskStatus, shouldRunHostSelfReview, summarizeMultiPeerAvailability } from "../shared/multi-peer.ts";
+import { areConfiguredAssistantsReady, resolveMultiPeerTaskStatus, shouldRunCodexSelfReview, summarizeMultiPeerAvailability } from "../shared/multi-peer.ts";
 import {
   buildSemanticContext,
   buildSerenaFindSymbolArgs,
@@ -61,26 +61,14 @@ describe("assistant routing", () => {
     expect(peerFor("codex")).toBe("claude");
   });
 
-  test("defaults self-review to Codex host only (no env)", () => {
-    const env = {} as NodeJS.ProcessEnv;
-    expect(shouldRunHostSelfReview("codex", undefined, env)).toBe(true);
-    expect(shouldRunHostSelfReview("codex", "normal", env)).toBe(true);
-    expect(shouldRunHostSelfReview("codex", "adversarial", env)).toBe(true);
-    expect(shouldRunHostSelfReview("codex", "gate", env)).toBe(false);
-    expect(shouldRunHostSelfReview("codex", "collaborative", env)).toBe(false);
-    expect(shouldRunHostSelfReview("claude", undefined, env)).toBe(false);
-    expect(shouldRunHostSelfReview("gemini", undefined, env)).toBe(false);
-  });
-
-  test("CODE_ASSISTANT_PEERS_SELF_REVIEW opts other hosts in/out", () => {
-    const list = { CODE_ASSISTANT_PEERS_SELF_REVIEW: "claude,gemini" } as NodeJS.ProcessEnv;
-    expect(shouldRunHostSelfReview("claude", "normal", list)).toBe(true);
-    expect(shouldRunHostSelfReview("gemini", "adversarial", list)).toBe(true);
-    expect(shouldRunHostSelfReview("codex", "normal", list)).toBe(false); // not in the list
-    expect(shouldRunHostSelfReview("claude", "gate", list)).toBe(false); // mode still excluded
-
-    expect(shouldRunHostSelfReview("claude", "normal", { CODE_ASSISTANT_PEERS_SELF_REVIEW: "all" } as NodeJS.ProcessEnv)).toBe(true);
-    expect(shouldRunHostSelfReview("codex", "normal", { CODE_ASSISTANT_PEERS_SELF_REVIEW: "none" } as NodeJS.ProcessEnv)).toBe(false);
+  test("enables Codex self-review only for Codex host", () => {
+    expect(shouldRunCodexSelfReview("codex")).toBe(true);
+    expect(shouldRunCodexSelfReview("codex", "normal")).toBe(true);
+    expect(shouldRunCodexSelfReview("codex", "adversarial")).toBe(true);
+    expect(shouldRunCodexSelfReview("codex", "gate")).toBe(false);
+    expect(shouldRunCodexSelfReview("codex", "collaborative")).toBe(false);
+    expect(shouldRunCodexSelfReview("claude")).toBe(false);
+    expect(shouldRunCodexSelfReview("gemini")).toBe(false);
   });
 
   test("exposes Gemini CLI as a built-in adapter", () => {
@@ -536,15 +524,6 @@ describe("review command construction", () => {
       review_models: { claude: "opus" },
     })).toBe("sonnet");
     expect(resolveReviewerModel("gemini", {})).toBeNull();
-  });
-
-  test("a -live reviewer resolves the model keyed by its base id (liveHostReviewer divert)", () => {
-    // Hosts key review_models by the BASE id from setup ({claude:"opus"}); a host-side pass
-    // diverted to claude-live must still honor that on the spawn-fallback path.
-    expect(resolveReviewerModel("claude-live", { review_models: { claude: "opus" } })).toBe("opus");
-    expect(resolveReviewerModel("codex-live", { review_models: { codex: "gpt-5.5" } })).toBe("gpt-5.5");
-    // An exact -live key still wins when explicitly provided.
-    expect(resolveReviewerModel("claude-live", { review_models: { "claude-live": "sonnet", claude: "opus" } })).toBe("sonnet");
   });
 
   test("auto review model selection uses hardcoded reviewer model tiers", () => {
@@ -1354,7 +1333,7 @@ describe("review prompt shaping", () => {
     });
 
     expect(output).toContain("Peer review outputs:\n(none)");
-    expect(output).toContain("Host self-review output:");
+    expect(output).toContain("Codex self-review output:");
     expect(output).toContain("Self review found no blocking issues.");
   });
 
@@ -1392,7 +1371,7 @@ describe("review prompt shaping", () => {
     expect(output).toContain("Peer review outputs:");
     expect(output).toContain("--- claude peer review round 1 exit 0 ---");
     expect(output).toContain("Claude peer review output.");
-    expect(output).toContain("Host self-review output:");
+    expect(output).toContain("Codex self-review output:");
     expect(output).toContain("Self review found no blocking issues.");
   });
 
@@ -1479,10 +1458,10 @@ describe("review prompt shaping", () => {
     };
 
     await expect(buildReviewPrompt(task, { self_review: true, mode: "gate" })).rejects.toThrow(
-      "Self-review is only supported for normal and adversarial review modes",
+      "Codex self-review is only supported for normal and adversarial review modes",
     );
     await expect(buildReviewPrompt(task, { self_review: true, mode: "collaborative" })).rejects.toThrow(
-      "Self-review is only supported for normal and adversarial review modes",
+      "Codex self-review is only supported for normal and adversarial review modes",
     );
   });
 });

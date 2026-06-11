@@ -61,8 +61,6 @@ Then, inside Claude Code or Codex, make a code change and ask the assistant to v
 ## Features
 
 - CLI assistant peer review routing with built-in Claude Code and Codex adapters.
-- `claude-live` adapter that routes Claude reviews to a backgrounded interactive Claude session
-  (subscription pool, no `claude -p`), with auto-start and `claude -p` fallback.
 - Custom assistant adapters for CLIs that accept prompts through stdin or argv.
 - Mandatory post-edit gate tool with strong MCP descriptions.
 - Review modes: `normal`, `adversarial`, `gate`, and `collaborative`.
@@ -165,7 +163,7 @@ For a web-friendly one-line setup that also verifies Serena registration and pat
 curl -fsSL https://raw.githubusercontent.com/AnamKwon/code-assistant-peers/main/scripts/web-setup.sh | sh
 ```
 
-The web setup script clones the project into `~/mcp-code-assistant-peers` when needed, runs `bun install`, registers Codex by default, enables `serena-auto` when Serena or `uvx` is available, patches Codex to a 30-minute MCP timeout, and prints the relevant config lines. Useful variants:
+The web setup script clones the project into `~/mcp-code-assistant-peers` when needed, runs `bun install`, registers Codex by default, enables `serena-auto` when Serena or `uvx` is available, patches Codex to a 30 minute MCP timeout, and prints the relevant config lines. Useful variants:
 
 ```bash
 # Use an existing checkout and set Codex MCP timeout to 30 minutes
@@ -281,28 +279,10 @@ codex  -> codex exec --ignore-user-config --ignore-rules --sandbox read-only --s
 gemini -> gemini --skip-trust --approval-mode plan -p ""  # prompt over stdin
 ```
 
-A fourth built-in, `claude-live`, routes the Claude review to a **backgrounded interactive Claude
-session** through a localhost broker instead of spawning `claude -p`, so Claude reviews stay on
-the subscription pool rather than the Agent SDK credit pool. The broker and reviewer worker
-auto-start on the first `claude-live` review, sessions are per-repo and read-only, and any
-broker/session failure falls back to spawning `claude -p`. Use it anywhere you would use
-`claude` as a peer (`PEER_ASSISTANTS=claude-live` or `codex,claude-live`). See
-[broker/REVIEWER.md](broker/REVIEWER.md) for setup details, tuning, and the billing verification
-checklist.
-
-`gemini-live` and `codex-live` route the same way (interactive Gemini / Codex sessions via the
-broker), each falling back to its headless CLI if the broker/session is unavailable. Unlike
-Claude there is no headless-vs-interactive billing split for these — the benefit is a persistent
-per-repo session whose conversation memory can be kept across reviews
-(`CODE_ASSISTANT_PEERS_REVIEWER_CLEAR=never`). Host-side passes (self-review, the aggregate pass,
-collaborative comparison) can also run on the host's live session with
-`CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS=1`. See [broker/REVIEWER.md](broker/REVIEWER.md).
-
 For other CLIs, set `CODE_ASSISTANT_PEERS_ASSISTANTS` to a JSON object. Each adapter needs:
 
 - `command`: argv array used to launch the assistant.
-- `prompt_transport`: `stdin`, `argv`, or `channel` (`channel` routes reviews through the
-  live-reviewer broker instead of spawning `command`; see [broker/REVIEWER.md](broker/REVIEWER.md)).
+- `prompt_transport`: `stdin` or `argv`.
 - `description`: optional human-readable label.
 - `model_arg`: optional CLI flag used before the model id, such as `--model` or `-m`.
 - `models`: optional model metadata shown in `code_assistant_peers_setup` and used by `review_model: "auto"`.
@@ -683,22 +663,17 @@ CODE_ASSISTANT_PEERS_REVIEW_FOCUS="migration and rollback risk"
 
 ## Token Cost Control
 
-Peer review can use a lot of tokens because the MCP server sends a full review prompt to each configured reviewer subprocess. In `normal` and `adversarial` modes, the host may also run a host self-review and then run an aggregate pass that merges the peer outputs. With multiple peers, one code change can therefore become several model calls.
+Peer review can use a lot of tokens because the MCP server sends a full review prompt to each configured reviewer subprocess. In `normal` and `adversarial` modes, a Codex host may also run Codex self-review and then run an aggregate pass that merges the peer outputs. With multiple peers, one code change can therefore become several model calls.
 
 Main cost drivers:
 
 - `PEER_ASSISTANTS=claude,codex,gemini` fans out one review prompt per available peer.
-- Host self-review adds another host pass in `normal` and `adversarial` modes. Which hosts self-review is set by `CODE_ASSISTANT_PEERS_SELF_REVIEW` (default `codex`; `all`/`*`, `none`/`off`, or a comma list such as `claude,codex`).
+- Codex host self-review adds another Codex pass in `normal` and `adversarial` modes.
 - The aggregate pass receives peer outputs plus repository/task context.
 - `CODE_ASSISTANT_PEERS_DIFF_BUDGET` controls how much raw diff is included. The default is `12000` characters.
 - `serena-auto` may add semantic context. `CODE_ASSISTANT_PEERS_SERENA_CONTEXT_BUDGET` defaults to `8000` characters.
 - Reviewers are allowed to inspect the repository directly when the included diff is insufficient, so Claude print mode or Codex exec may read additional files.
 - Previous review memory is included in later rounds so reviewers can verify earlier findings.
-
-Billing pool note: starting 2026-06-15, spawned `claude -p` reviews draw from the separate Agent
-SDK monthly credit instead of the Claude subscription. The `claude-live` adapter keeps Claude
-reviews on the subscription pool by routing them to a backgrounded interactive session — see
-[broker/REVIEWER.md](broker/REVIEWER.md).
 
 Low-token recommended setup:
 

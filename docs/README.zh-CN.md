@@ -20,7 +20,6 @@
 ## 功能
 
 - 内置 Claude Code / Codex adapter
-- `claude-live` adapter：把 Claude 审查发送到后台运行的交互式 Claude 会话（使用订阅额度，不使用 `claude -p`，自动启动并支持 `claude -p` fallback）
 - 支持通过 stdin 或 argv 接收 prompt 的自定义 CLI adapter
 - 代码修改后的 mandatory review gate
 - `normal`, `adversarial`, `gate`, `collaborative` 审查模式
@@ -120,21 +119,7 @@ codex  -> codex exec --sandbox read-only --skip-git-repo-check -
 gemini -> gemini --skip-trust --approval-mode plan -p ""  # 提示词通过 stdin 传入
 ```
 
-第四个内置 adapter `claude-live` 不会启动 `claude -p`，而是通过 localhost broker 把审查发送到
-**后台运行的交互式 Claude 会话**，因此 Claude 审查计入**订阅额度**而不是 Agent SDK 信用额度。
-broker 和 reviewer worker 会在第一次 `claude-live` 审查时自动启动；会话按仓库隔离且为只读；
-broker/会话不可用时自动 fallback 到启动 `claude -p`。在原本使用 `claude` 作为 peer 的地方直接
-替换即可（`PEER_ASSISTANTS=claude-live` 或 `codex,claude-live`）。详细配置与计费验证清单见
-[broker/REVIEWER.md](../broker/REVIEWER.md)。
-
-`gemini-live`、`codex-live` 以相同方式路由（交互式 Gemini/Codex 会话，不可用时回退到无头 CLI）。与 Claude
-不同，它们没有计费池差异，好处是**持久会话 + 跨审查记忆**（`CODE_ASSISTANT_PEERS_REVIEWER_CLEAR=never`）。
-self-review 等 host 侧流程也可通过 `CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS=1` 在 host 的实时会话中运行；
-由 `CODE_ASSISTANT_PEERS_SELF_REVIEW`（默认 `codex` / `all` / `none` / `claude,codex` 等）决定哪些 host 自审。
-
-其他 CLI 可以通过 `CODE_ASSISTANT_PEERS_ASSISTANTS` 注册，`prompt_transport` 可取
-`stdin`、`argv` 或 `channel`（`channel` 表示不启动 command，而是把审查发送到 live-reviewer
-broker）：
+其他 CLI 可以通过 `CODE_ASSISTANT_PEERS_ASSISTANTS` 注册：
 
 ```bash
 export CODE_ASSISTANT_PEERS_ASSISTANTS='{

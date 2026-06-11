@@ -20,7 +20,6 @@ CLI 기반 코딩 어시스턴트끼리 서로 코드를 검토하게 만드는 
 ## 주요 기능
 
 - Claude Code/Codex 기본 adapter
-- Claude 리뷰를 백그라운드 인터랙티브 Claude 세션으로 보내는 `claude-live` adapter (구독 풀 사용, `claude -p` 미사용, 자동 시작 + `claude -p` fallback)
 - stdin 또는 argv prompt를 받는 커스텀 CLI adapter
 - 코드 수정 후 호출해야 하는 mandatory review gate
 - `normal`, `adversarial`, `gate`, `collaborative` 리뷰 모드
@@ -124,23 +123,7 @@ codex  -> codex exec --sandbox read-only --skip-git-repo-check -
 gemini -> gemini --skip-trust --approval-mode plan -p ""  # 프롬프트는 stdin으로 전달
 ```
 
-네 번째 기본 adapter인 `claude-live`는 `claude -p`를 실행하지 않고 localhost broker를 통해
-**백그라운드 인터랙티브 Claude 세션**으로 리뷰를 보냅니다. 그래서 Claude 리뷰가 Agent SDK
-크레딧 풀이 아닌 **구독 풀**에 남습니다. broker와 reviewer worker는 첫 `claude-live` 리뷰 때
-자동으로 시작되고, 세션은 repo별 read-only이며, broker/세션 장애 시 `claude -p` 실행으로
-fallback합니다. peer로 `claude`를 쓰던 자리에 그대로 사용하면 됩니다
-(`PEER_ASSISTANTS=claude-live` 또는 `codex,claude-live`). 자세한 설정과 과금 확인 체크리스트는
-[broker/REVIEWER.md](../broker/REVIEWER.md)를 참고하세요.
-
-`gemini-live`, `codex-live`도 같은 방식으로 라우팅됩니다(인터랙티브 Gemini/Codex 세션, 실패 시 헤드리스
-CLI로 폴백). Claude와 달리 과금 분리는 없고, 장점은 **세션 유지 + 리뷰 간 메모리**입니다
-(`CODE_ASSISTANT_PEERS_REVIEWER_CLEAR=never`). 자가리뷰 등 host 측 패스도
-`CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS=1`로 host의 라이브 세션에서 돌릴 수 있고, 자가리뷰 대상은
-`CODE_ASSISTANT_PEERS_SELF_REVIEW`(기본 `codex` / `all` / `none` / `claude,codex` 등)로 정합니다.
-
-다른 CLI는 `CODE_ASSISTANT_PEERS_ASSISTANTS`에 JSON으로 등록합니다. `prompt_transport`는
-`stdin`, `argv`, `channel` 중 하나입니다 (`channel`은 command 실행 대신 live-reviewer broker로
-리뷰를 보냅니다).
+다른 CLI는 `CODE_ASSISTANT_PEERS_ASSISTANTS`에 JSON으로 등록합니다.
 
 ```bash
 export CODE_ASSISTANT_PEERS_ASSISTANTS='{
@@ -261,10 +244,6 @@ peer review는 설정에 따라 토큰을 많이 사용할 수 있습니다. MCP
 - `serena-auto`는 semantic context를 추가할 수 있습니다. `CODE_ASSISTANT_PEERS_SERENA_CONTEXT_BUDGET` 기본값은 `8000`자입니다.
 - reviewer는 diff만으로 부족하면 repository를 직접 inspect할 수 있으므로 Claude print mode나 Codex exec가 추가 파일을 읽을 수 있습니다.
 - 이전 review round memory가 후속 round prompt에 포함되어, 반복 리뷰일수록 prompt가 커질 수 있습니다.
-
-과금 풀 참고: 2026-06-15부터 `claude -p`로 실행되는 리뷰는 Claude 구독이 아닌 별도의 Agent SDK
-월간 크레딧에서 차감됩니다. `claude-live` adapter는 리뷰를 백그라운드 인터랙티브 세션으로
-보내 Claude 리뷰를 구독 풀에 유지합니다 — [broker/REVIEWER.md](../broker/REVIEWER.md) 참고.
 
 저비용 권장 설정:
 
