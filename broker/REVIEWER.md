@@ -89,8 +89,8 @@ already trusted via `--skip-trust`. The per-job file is deleted after each revie
 
 ## Host-side passes on the live session
 
-Codex self-review, the multi-peer **aggregate pass**, and the **collaborative host comparison**
-run as the HOST — for a claude host that normally spawns `claude -p` (credit pool). Set:
+Self-review, the multi-peer **aggregate pass**, and the **collaborative host comparison** run as
+the HOST — for a claude host that normally spawns `claude -p` (credit pool). Set:
 
 ```bash
 CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS=1
@@ -98,6 +98,18 @@ CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS=1
 
 and those passes route through `<host>-live` instead (when that adapter exists), keeping them on
 the persistent session — and, for claude hosts, on the subscription pool.
+
+**Who runs self-review** is controlled by `CODE_ASSISTANT_PEERS_SELF_REVIEW`:
+
+| value | effect |
+|---|---|
+| unset (default) | `codex` host only (backwards compatible) |
+| `all` / `*` | every host self-reviews |
+| `none` / `off` | self-review disabled |
+| comma list | those hosts, e.g. `claude,codex` |
+
+Self-review never runs in `gate` or `collaborative` modes. Combine with `LIVE_HOST_REVIEWS=1` so
+the self-review runs on the host's live tmux session (subscription pool for claude).
 
 ### Manual / advanced (optional)
 
@@ -116,9 +128,12 @@ CODE_ASSISTANT_PEERS_REVIEWER_CWD="$PWD" bun broker/reviewer.ts
 
 | var | default | meaning |
 |---|---|---|
-| `CODE_ASSISTANT_PEERS_TMUX_SESSION` | `peer-reviewer` | tmux session BASE name (per-repo sessions are `<base>-<repo>-<hash>`) |
+| `CODE_ASSISTANT_PEERS_TMUX_SESSION` | `peer-reviewer` | tmux session BASE name (sessions are `<base>-<kind>-<repo>-<hash>`, one per CLI kind + repo) |
 | `CODE_ASSISTANT_PEERS_REVIEWER_CWD` | cwd | repo dir the reviewer runs in |
 | `CODE_ASSISTANT_PEERS_REVIEWER_CLAUDE_ARGS` | read-only flags | override `claude` args (JSON array or space-separated) |
+| `CODE_ASSISTANT_PEERS_REVIEWER_GEMINI_ARGS` | `--skip-trust --approval-mode plan` | override `gemini` args (JSON array or space-separated) |
+| `CODE_ASSISTANT_PEERS_REVIEWER_CODEX_ARGS` | `--sandbox read-only` | override `codex` args (JSON array or space-separated) |
+| `CODE_ASSISTANT_PEERS_REVIEWER_PROMPT_DIR` | per-kind | override where the per-job prompt file is written (claude/codex: a tmp dir; gemini: `<cwd>/.peer-review`) |
 | `CODE_ASSISTANT_PEERS_REVIEWER_CLEAR` | `always` | `never` keeps the session's conversation memory across reviews (richer follow-up context; note the session is per-REPO, so other tasks' history accumulates too, and a long-lived context will eventually auto-compact) |
 | `CODE_ASSISTANT_PEERS_REVIEWER_STARTUP_MS` | `30000` | how long to wait for the TUI to boot |
 | `CODE_ASSISTANT_PEERS_REVIEW_TIMEOUT_MS` | `600000` | per-review deliver timeout |
@@ -168,7 +183,7 @@ Run with the worker up and `PEER_ASSISTANTS=claude-live`:
    a result — confirms broker↔worker↔result wiring. (Covered by tests too.)
 2. **Live round-trip:** a real review reaches the tmux `claude` session and the reply comes back —
    the stored round's `command` is `["<broker>", "claude-live"]`, not a spawned `claude -p`.
-   Watch it live: `tmux ls` to find the `peer-reviewer-<repo>-<hash>` session, then `tmux attach -t <name>`.
+   Watch it live: `tmux ls` to find the `peer-reviewer-<kind>-<repo>-<hash>` session, then `tmux attach -t <name>`.
 3. **No file changes:** `git status` in the project is unchanged after a review.
 4. **Billing = subscription:** the reviewer's usage appears under the Claude **subscription**, NOT
    the Agent-SDK/headless credit pool, and `ANTHROPIC_API_KEY` is unset. This is the load-bearing

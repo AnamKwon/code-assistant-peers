@@ -129,6 +129,12 @@ peer に `claude` を指定していた場所でそのまま使えます（`PEER
 `codex,claude-live`）。詳細な設定と課金確認チェックリストは
 [broker/REVIEWER.md](../broker/REVIEWER.md) を参照してください。
 
+`gemini-live`・`codex-live` も同じ方式でルーティングされます（対話型 Gemini/Codex セッション、失敗時は
+ヘッドレス CLI にフォールバック）。Claude と違い課金の分離はなく、利点は**セッション維持 + レビュー間の
+メモリ**です（`CODE_ASSISTANT_PEERS_REVIEWER_CLEAR=never`）。self-review 等の host 側パスも
+`CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS=1` で host のライブセッション上で実行でき、self-review の対象は
+`CODE_ASSISTANT_PEERS_SELF_REVIEW`（既定 `codex` / `all` / `none` / `claude,codex` など）で指定します。
+
 他の CLI は `CODE_ASSISTANT_PEERS_ASSISTANTS` に JSON で登録します。`prompt_transport` は
 `stdin`, `argv`, `channel` のいずれかです（`channel` は command を起動せず live-reviewer broker
 にレビューを送ります）。

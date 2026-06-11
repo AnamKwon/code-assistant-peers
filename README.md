@@ -290,6 +290,14 @@ broker/session failure falls back to spawning `claude -p`. Use it anywhere you w
 [broker/REVIEWER.md](broker/REVIEWER.md) for setup details, tuning, and the billing verification
 checklist.
 
+`gemini-live` and `codex-live` route the same way (interactive Gemini / Codex sessions via the
+broker), each falling back to its headless CLI if the broker/session is unavailable. Unlike
+Claude there is no headless-vs-interactive billing split for these — the benefit is a persistent
+per-repo session whose conversation memory can be kept across reviews
+(`CODE_ASSISTANT_PEERS_REVIEWER_CLEAR=never`). Host-side passes (self-review, the aggregate pass,
+collaborative comparison) can also run on the host's live session with
+`CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS=1`. See [broker/REVIEWER.md](broker/REVIEWER.md).
+
 For other CLIs, set `CODE_ASSISTANT_PEERS_ASSISTANTS` to a JSON object. Each adapter needs:
 
 - `command`: argv array used to launch the assistant.
@@ -675,12 +683,12 @@ CODE_ASSISTANT_PEERS_REVIEW_FOCUS="migration and rollback risk"
 
 ## Token Cost Control
 
-Peer review can use a lot of tokens because the MCP server sends a full review prompt to each configured reviewer subprocess. In `normal` and `adversarial` modes, a Codex host may also run Codex self-review and then run an aggregate pass that merges the peer outputs. With multiple peers, one code change can therefore become several model calls.
+Peer review can use a lot of tokens because the MCP server sends a full review prompt to each configured reviewer subprocess. In `normal` and `adversarial` modes, the host may also run a host self-review and then run an aggregate pass that merges the peer outputs. With multiple peers, one code change can therefore become several model calls.
 
 Main cost drivers:
 
 - `PEER_ASSISTANTS=claude,codex,gemini` fans out one review prompt per available peer.
-- Codex host self-review adds another Codex pass in `normal` and `adversarial` modes.
+- Host self-review adds another host pass in `normal` and `adversarial` modes. Which hosts self-review is set by `CODE_ASSISTANT_PEERS_SELF_REVIEW` (default `codex`; `all`/`*`, `none`/`off`, or a comma list such as `claude,codex`).
 - The aggregate pass receives peer outputs plus repository/task context.
 - `CODE_ASSISTANT_PEERS_DIFF_BUDGET` controls how much raw diff is included. The default is `12000` characters.
 - `serena-auto` may add semantic context. `CODE_ASSISTANT_PEERS_SERENA_CONTEXT_BUDGET` defaults to `8000` characters.
