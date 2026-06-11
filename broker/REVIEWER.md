@@ -38,9 +38,12 @@ claude.ai (OAuth). The worker prints a warning if it sees `ANTHROPIC_API_KEY`.
 | channel transport client (`shared/broker-client.ts`) | ✅ implemented + tested |
 | `runReviewCommand` channel branch **+ fallback to `claude -p`** | ✅ implemented + tested |
 | broker daemon (`broker/server.ts`) | ✅ implemented (generic relay) |
-| **reviewer worker → live Claude TUI via tmux** (`broker/reviewer.ts`) | ✅ implemented; loop + extraction unit-tested |
-| **auto-start backend on first `claude-live` review** (`ensureChannelBackend`) | ✅ implemented + tested; verified end-to-end live |
-| live tmux↔claude round-trip | ✅ verified (review returned, `command = ["<broker>","claude-live"]`, repo unchanged) |
+| **reviewer worker → live CLI TUIs via tmux** (`broker/reviewer.ts`) | ✅ implemented, generic over claude/gemini/codex; loop + extraction unit-tested |
+| **auto-start backend on first live review** (`ensureChannelBackend`) | ✅ implemented + tested; verified end-to-end live |
+| live tmux round-trip: `claude-live` | ✅ verified (review returned, `command = ["<broker>","claude-live"]`, repo unchanged) |
+| live tmux round-trip: `codex-live` | ✅ verified (real Codex TUI driven via tmux, review returned) |
+| live tmux round-trip: `gemini-live` | ⬜ implemented + unit-tested; **not live-verified** (gemini CLI not installed on the dev machine) |
+| **host-side passes via live session** (`CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS=1`) | ✅ implemented + tested (self-review, aggregate, collaborative host pass) |
 | **billing actually = subscription** | ⬜ **confirm on the Anthropic usage dashboard** (strongly inferred: interactive TUI + no API key) |
 
 The worker loop, broker round-trip (with an `--echo` stand-in), and tmux verbs are tested. The one
@@ -59,11 +62,35 @@ PEER_ASSISTANTS=claude-live          # or codex,claude-live for multi-peer
 claude.ai). That's it — review from Codex or Claude as usual and the backgrounded Claude session
 appears on demand. The MCP server logs one line to stderr when it auto-starts the backend.
 
-- Sessions are per repo, named `peer-reviewer-<repo>-<hash>` — list them with `tmux ls`.
+- Sessions are per CLI kind + repo, named `peer-reviewer-<kind>-<repo>-<hash>` (kind =
+  claude/gemini/codex) — list them with `tmux ls`.
 - Watch a live reviewer think: `tmux attach -t <session name>` (Ctrl-b d to detach).
 - Auto-start logs (broker + worker stdout/stderr): `$TMPDIR/code-assistant-peers-backend.log`.
 - Stop the backend: `tmux kill-session -t <session name>` per session and kill the broker on its port.
 - Disable auto-start (run the daemons yourself): `CODE_ASSISTANT_PEERS_NO_AUTOSTART=1`.
+
+## Other live reviewers: `gemini-live`, `codex-live`
+
+The worker is generic over the reviewer CLI: `gemini-live` drives an interactive Gemini CLI
+session (`--approval-mode plan`, prompt dir granted via `--include-directories`, reset with
+`/clear`) and `codex-live` drives an interactive Codex TUI (`--sandbox read-only`, reset with
+`/new`). Unlike Claude there is **no known headless-vs-interactive billing split** for these —
+the benefit is a persistent per-repo session whose conversation memory can be kept across
+reviews (`CODE_ASSISTANT_PEERS_REVIEWER_CLEAR=never`). Both fall back to their headless CLI if
+the broker/session is unavailable. `codex-live` is live-verified; `gemini-live` is implemented
+and unit-tested but not yet live-verified.
+
+## Host-side passes on the live session
+
+Codex self-review, the multi-peer **aggregate pass**, and the **collaborative host comparison**
+run as the HOST — for a claude host that normally spawns `claude -p` (credit pool). Set:
+
+```bash
+CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS=1
+```
+
+and those passes route through `<host>-live` instead (when that adapter exists), keeping them on
+the persistent session — and, for claude hosts, on the subscription pool.
 
 ### Manual / advanced (optional)
 

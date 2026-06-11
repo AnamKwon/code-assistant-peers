@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { type BackendBootstrapDeps, bootstrapBackend, reviewViaBroker } from "../shared/broker-client.ts";
+import { BUILTIN_ASSISTANTS, liveHostReviewer } from "../shared/assistants.ts";
 import { runReviewCommand } from "../shared/review.ts";
 
 function bootstrapDeps(overrides: Partial<BackendBootstrapDeps> = {}): BackendBootstrapDeps & { spawnCalls: number } {
@@ -104,5 +105,23 @@ describe("channel review transport (broker)", () => {
     } finally {
       server.stop(true);
     }
+  });
+
+  test("gemini-live and codex-live are built-in channel adapters with headless fallbacks", () => {
+    for (const [id, base] of [["gemini-live", "gemini"], ["codex-live", "codex"]] as const) {
+      const adapter = BUILTIN_ASSISTANTS[id];
+      expect(adapter.prompt_transport).toBe("channel");
+      expect(adapter.command).toEqual(BUILTIN_ASSISTANTS[base].command); // fallback spawns the base CLI
+      expect(adapter.id).toBe(id);
+    }
+  });
+
+  test("liveHostReviewer maps the host to its live adapter only when opted in", () => {
+    const registry = BUILTIN_ASSISTANTS;
+    expect(liveHostReviewer("claude", {}, registry)).toBe("claude"); // env off → unchanged
+    expect(liveHostReviewer("claude", { CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS: "1" }, registry)).toBe("claude-live");
+    expect(liveHostReviewer("codex", { CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS: "1" }, registry)).toBe("codex-live");
+    expect(liveHostReviewer("claude-live", { CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS: "1" }, registry)).toBe("claude-live"); // already live
+    expect(liveHostReviewer("glm", { CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS: "1" }, registry)).toBe("glm"); // no live variant
   });
 });

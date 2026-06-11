@@ -1,13 +1,15 @@
 import { describe, expect, test } from "bun:test";
 import {
+  LIVE_CLI_KINDS,
   type ReviewerSession,
   acquireWorkerLock,
   beginMarkerFor,
   claimNextJob,
   doneMarkerFor,
   extractReviewFromCapture,
+  liveCliKindFor,
   runReviewerWorker,
-  sessionNameForCwd,
+  sessionNameFor,
 } from "../broker/reviewer.ts";
 
 interface MockJob {
@@ -111,38 +113,75 @@ describe("reviewer worker loop", () => {
     }
   });
 
-  test("routes jobs to a per-cwd session: one session built per distinct repo, reused", async () => {
+  test("routes jobs per (reviewer kind, cwd): one session per distinct pair, reused", async () => {
     const broker = startMockBroker([
       { id: "a1", reviewer: "claude-live", prompt: "p", cwd: "/repo/a" },
       { id: "b1", reviewer: "claude-live", prompt: "p", cwd: "/repo/b" },
+      { id: "g1", reviewer: "gemini-live", prompt: "p", cwd: "/repo/a" }, // same repo, different CLI
       { id: "a2", reviewer: "claude-live", prompt: "p", cwd: "/repo/a" },
     ]);
     const builtFor: string[] = [];
-    const deliveredBy = new Map<string, string[]>(); // cwd -> jobIds delivered by that session
-    const sessionFor = (cwd: string): ReviewerSession => {
-      builtFor.push(cwd);
-      deliveredBy.set(cwd, []);
+    const deliveredBy = new Map<string, string[]>(); // "reviewer|cwd" -> jobIds delivered
+    const sessionFor = (reviewer: string, cwd: string): ReviewerSession => {
+      const key = `${reviewer}|${cwd}`;
+      builtFor.push(key);
+      deliveredBy.set(key, []);
       return {
         deliver: async (_prompt, jobId) => {
-          deliveredBy.get(cwd)!.push(jobId);
+          deliveredBy.get(key)!.push(jobId);
           return "patch is correct";
         },
       };
     };
     const controller = new AbortController();
     try {
-      // not once: drain all three jobs, then abort when the queue is empty
+      // not once: drain all four jobs, then abort when the queue is empty
       const run = runReviewerWorker({ brokerUrl: broker.url, sessionFor, signal: controller.signal, pollIntervalMs: 5 });
-      await Bun.sleep(120);
+      await Bun.sleep(150);
       controller.abort();
       await run;
-      expect(builtFor.sort()).toEqual(["/repo/a", "/repo/b"]); // one session per distinct cwd
-      expect(deliveredBy.get("/repo/a")).toEqual(["a1", "a2"]); // repo A session reused for a1 + a2
-      expect(deliveredBy.get("/repo/b")).toEqual(["b1"]);
+      expect(builtFor.sort()).toEqual(["claude-live|/repo/a", "claude-live|/repo/b", "gemini-live|/repo/a"]);
+      expect(deliveredBy.get("claude-live|/repo/a")).toEqual(["a1", "a2"]); // reused for a1 + a2
+      expect(deliveredBy.get("claude-live|/repo/b")).toEqual(["b1"]);
+      expect(deliveredBy.get("gemini-live|/repo/a")).toEqual(["g1"]); // same repo, separate session
     } finally {
       controller.abort();
       broker.server.stop(true);
     }
+  });
+
+  test("an unsupported reviewer becomes a job error, not a worker crash", async () => {
+    const broker = startMockBroker([
+      { id: "u1", reviewer: "mystery-live", prompt: "p", cwd: "/repo/a" },
+      { id: "ok1", reviewer: "claude-live", prompt: "p", cwd: "/repo/a" },
+    ]);
+    const sessionFor = (reviewer: string): ReviewerSession => {
+      if (!liveCliKindFor(reviewer)) throw new Error(`reviewer '${reviewer}' has no live CLI mapping`);
+      return { deliver: async () => "patch is correct" };
+    };
+    const controller = new AbortController();
+    try {
+      const run = runReviewerWorker({ brokerUrl: broker.url, sessionFor, signal: controller.signal, pollIntervalMs: 5 });
+      await Bun.sleep(120);
+      controller.abort();
+      await run;
+      expect(broker.results.get("u1")?.error).toContain("no live CLI mapping");
+      expect(broker.results.get("ok1")?.result).toContain("patch is correct"); // worker kept going
+    } finally {
+      controller.abort();
+      broker.server.stop(true);
+    }
+  });
+
+  test("LIVE_CLI_KINDS maps each built-in live adapter to its CLI launch + reset", () => {
+    expect(Object.keys(LIVE_CLI_KINDS).sort()).toEqual(["claude-live", "codex-live", "gemini-live"]);
+    expect(liveCliKindFor("claude-live")!.launchCommand("/tmp/p")[0]).toBe("claude");
+    expect(liveCliKindFor("claude-live")!.launchCommand("/tmp/p")).toContain("--add-dir");
+    expect(liveCliKindFor("gemini-live")!.launchCommand("/tmp/p")[0]).toBe("gemini");
+    expect(liveCliKindFor("gemini-live")!.launchCommand("/tmp/p")).toContain("--include-directories");
+    expect(liveCliKindFor("codex-live")!.launchCommand("/tmp/p")[0]).toBe("codex");
+    expect(liveCliKindFor("codex-live")!.clearCommand).toBe("/new");
+    expect(liveCliKindFor("unknown-live")).toBeNull();
   });
 
   test("claimNextJob returns null when the broker is unreachable", async () => {
@@ -162,13 +201,16 @@ describe("reviewer worker loop", () => {
     release3?.();
   });
 
-  test("sessionNameForCwd is stable, tmux-safe, and distinct per path", () => {
-    const a = sessionNameForCwd("peer-reviewer", "/Users/me/work/repo-a");
-    const b = sessionNameForCwd("peer-reviewer", "/Users/me/work/repo-b");
-    expect(a).toBe(sessionNameForCwd("peer-reviewer", "/Users/me/work/repo-a")); // stable
+  test("sessionNameFor is stable, tmux-safe, distinct per path AND per CLI kind", () => {
+    const a = sessionNameFor("peer-reviewer", "claude", "/Users/me/work/repo-a");
+    const b = sessionNameFor("peer-reviewer", "claude", "/Users/me/work/repo-b");
+    const g = sessionNameFor("peer-reviewer", "gemini", "/Users/me/work/repo-a");
+    expect(a).toBe(sessionNameFor("peer-reviewer", "claude", "/Users/me/work/repo-a")); // stable
     expect(a).not.toBe(b); // distinct per path
+    expect(a).not.toBe(g); // distinct per CLI kind in the same repo
     expect(a).toMatch(/^[A-Za-z0-9_-]+$/); // tmux-safe
     expect(a).toContain("repo-a");
+    expect(a).toContain("claude");
   });
 });
 

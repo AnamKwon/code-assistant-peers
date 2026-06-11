@@ -42,10 +42,11 @@ export interface ReviewerSession {
 
 export interface ReviewerWorkerOptions {
   brokerUrl: string;
-  // Build (or look up) the reviewer session for a given repo cwd. The worker caches one session
-  // per distinct cwd, so each repo gets its own backgrounded Claude session pinned to that repo,
-  // and concurrently reviewed repos never share a working directory.
-  sessionFor: (cwd: string) => ReviewerSession;
+  // Build (or look up) the reviewer session for a given reviewer kind + repo cwd. The worker
+  // caches one session per distinct (reviewer, cwd) pair, so each CLI kind and each repo gets
+  // its own backgrounded session, and concurrent reviews never share a working directory or a
+  // TUI. May throw for an unsupported reviewer — the worker reports that as a job error.
+  sessionFor: (reviewer: string, cwd: string) => ReviewerSession;
   signal: AbortSignal;
   pollIntervalMs?: number;
   once?: boolean;
@@ -91,13 +92,14 @@ export async function runReviewerWorker(options: ReviewerWorkerOptions): Promise
   const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
   const log = options.log ?? (() => {});
 
-  // One session per distinct repo cwd, created lazily and reused for every review of that repo.
+  // One session per distinct (reviewer kind, repo cwd) pair, created lazily and reused.
   const sessions = new Map<string, ReviewerSession>();
-  const resolveSession = (cwd: string): ReviewerSession => {
-    let session = sessions.get(cwd);
+  const resolveSession = (reviewer: string, cwd: string): ReviewerSession => {
+    const key = `${reviewer}|${cwd}`;
+    let session = sessions.get(key);
     if (!session) {
-      session = sessionFor(cwd);
-      sessions.set(cwd, session);
+      session = sessionFor(reviewer, cwd);
+      sessions.set(key, session);
     }
     return session;
   };
@@ -113,7 +115,7 @@ export async function runReviewerWorker(options: ReviewerWorkerOptions): Promise
 
       log(`claimed job ${job.id} (${job.reviewer}, cwd=${job.cwd || "(default)"})`);
       try {
-        const review = await resolveSession(job.cwd).deliver(job.prompt, job.id, signal);
+        const review = await resolveSession(job.reviewer, job.cwd).deliver(job.prompt, job.id, signal);
         await postResult(brokerUrl, job.id, review);
         log(`job ${job.id} reviewed (${review.length} chars)`);
       } catch (error) {
@@ -196,19 +198,24 @@ function cleanCapturedReview(text: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// tmux-driven interactive Claude session (the real backend)
+// tmux-driven interactive CLI session (the real backend) — generic over the reviewer CLI
+// (claude / gemini / codex), parameterized by launch command and conversation-reset command.
 // ---------------------------------------------------------------------------
 
 export interface TmuxSessionConfig {
   sessionName: string;
   cwd: string;
-  claudeArgs: string[];
-  // Dir the per-job prompt files are written to. Granted to the session via `--add-dir` so the
-  // read-only reviewer can Read it without a permission prompt (it lives outside the repo cwd).
+  // Full argv launched inside the tmux session (CLI binary + read-only flags + any prompt-dir
+  // access grant such as claude's --add-dir or gemini's --include-directories).
+  launchCommand: string[];
+  // Dir the per-job prompt files are written to. Must be readable by the session (see above).
   promptDir: string;
-  // Send `/clear` before each review (default true). False keeps the live session's conversation
-  // memory across reviews of this repo — richer follow-up context at the cost of cross-task
-  // bleed and unbounded context growth.
+  // Slash command that resets the TUI's conversation (claude/gemini: "/clear", codex: "/new").
+  // null = the CLI has no known reset command; reviews then share the conversation.
+  clearCommand: string | null;
+  // Send the clear command before each review (default true). False keeps the live session's
+  // conversation memory across reviews of this repo — richer follow-up context at the cost of
+  // cross-task bleed and unbounded context growth.
   clearBetweenReviews: boolean;
   startupTimeoutMs: number;
   deliverTimeoutMs: number;
@@ -226,7 +233,7 @@ export const DEFAULT_REVIEWER_CLAUDE_ARGS = [
   "Edit,Write,MultiEdit,NotebookEdit",
 ];
 
-export class TmuxClaudeSession implements ReviewerSession {
+export class TmuxCliSession implements ReviewerSession {
   private ready = false;
   constructor(private readonly config: TmuxSessionConfig) {}
 
@@ -249,16 +256,16 @@ export class TmuxClaudeSession implements ReviewerSession {
 
     try {
       // Reset the reused session's CONVERSATION before each review (default): this single live
-      // session serves every review, so without `/clear` its context grows unbounded and earlier
+      // session serves every review, so without a reset its context grows unbounded and earlier
       // reviews bleed into later ones. Opt out (CODE_ASSISTANT_PEERS_REVIEWER_CLEAR=never) to
       // keep the session's memory across reviews — e.g. follow-up rounds that benefit from what
-      // the reviewer already read. NOTE the session is per-REPO, not per-task, so without /clear
-      // history from other tasks in the same repo accumulates too.
-      if (this.config.clearBetweenReviews) {
-        await tmux(["send-keys", "-t", sessionName, "-l", "--", "/clear"]);
+      // the reviewer already read. NOTE the session is per-REPO, not per-task, so without a
+      // reset history from other tasks in the same repo accumulates too.
+      if (this.config.clearBetweenReviews && this.config.clearCommand) {
+        await tmux(["send-keys", "-t", sessionName, "-l", "--", this.config.clearCommand]);
         await sleep(150, signal);
         await tmux(["send-keys", "-t", sessionName, "Enter"]);
-        await sleep(600, signal); // let /clear settle before we wipe scrollback
+        await sleep(600, signal); // let the reset settle before we wipe scrollback
       }
       // Always drop prior tmux scrollback so the capture is bounded to this job. This wipes the
       // rendered pane history only — NOT the session's conversation memory — so it is safe (and
@@ -288,21 +295,21 @@ export class TmuxClaudeSession implements ReviewerSession {
     await tmux(["kill-session", "-t", this.config.sessionName]).catch(() => {});
   }
 
-  // Ensure a tmux session running the interactive `claude` TUI exists and is ready for input.
+  // Ensure a tmux session running the interactive reviewer TUI exists and is ready for input.
   // If the session already exists we reuse it (the user may have launched it themselves).
   private async ensureSession(signal: AbortSignal): Promise<void> {
     if (this.ready) return;
-    const { sessionName, cwd, claudeArgs, promptDir, startupTimeoutMs } = this.config;
+    const { sessionName, cwd, launchCommand, promptDir, startupTimeoutMs } = this.config;
 
     const exists = (await tmux(["has-session", "-t", sessionName])).code === 0;
     if (!exists) {
       await mkdir(promptDir, { recursive: true });
       // Wide window => less line wrapping => cleaner capture. `--` ends tmux option parsing so
-      // the rest is the command run inside the session. `--add-dir promptDir` lets the read-only
-      // session Read the prompt files (which live outside the repo cwd) without a prompt.
+      // the rest is the command run inside the session. launchCommand must already include the
+      // CLI's prompt-dir access grant (e.g. --add-dir / --include-directories).
       const created = await tmux([
         "new-session", "-d", "-s", sessionName, "-c", cwd, "-x", "400", "-y", "120",
-        "--", "claude", ...claudeArgs, "--add-dir", promptDir,
+        "--", ...launchCommand,
       ]);
       if (created.code !== 0) {
         throw new Error(`failed to start tmux session '${sessionName}': ${created.stderr.trim() || `exit ${created.code}`}`);
@@ -408,19 +415,23 @@ async function main(): Promise<void> {
 
   const baseCwd = process.env.CODE_ASSISTANT_PEERS_REVIEWER_CWD ?? process.cwd();
   const sessionBaseName = process.env.CODE_ASSISTANT_PEERS_TMUX_SESSION ?? "peer-reviewer";
-  const claudeArgs = parseClaudeArgs(process.env.CODE_ASSISTANT_PEERS_REVIEWER_CLAUDE_ARGS) ?? DEFAULT_REVIEWER_CLAUDE_ARGS;
   const promptDir = process.env.CODE_ASSISTANT_PEERS_REVIEWER_PROMPT_DIR ?? join(tmpdir(), "peer-reviewer-prompts");
 
-  // One session per repo cwd: a job's cwd selects (and the worker caches) a tmux `claude` pinned
-  // to that repo, so reviews for different repos run in the correct working directory.
-  const sessionFor = (cwd: string): ReviewerSession => {
+  // One session per (reviewer kind, repo cwd): a job's reviewer picks the CLI, its cwd pins the
+  // session to that repo, and the worker caches/reuses the pair.
+  const sessionFor = (reviewer: string, cwd: string): ReviewerSession => {
     if (echo) return new EchoSession();
+    const kind = liveCliKindFor(reviewer);
+    if (!kind) {
+      throw new Error(`reviewer '${reviewer}' has no live CLI mapping (known: ${Object.keys(LIVE_CLI_KINDS).join(", ")})`);
+    }
     const repoCwd = cwd || baseCwd;
-    return new TmuxClaudeSession({
-      sessionName: sessionNameForCwd(sessionBaseName, repoCwd),
+    return new TmuxCliSession({
+      sessionName: sessionNameFor(sessionBaseName, kind.slug, repoCwd),
       cwd: repoCwd,
-      claudeArgs,
+      launchCommand: kind.launchCommand(promptDir),
       promptDir,
+      clearCommand: kind.clearCommand,
       // "never" keeps the session's conversation memory across reviews; anything else clears.
       clearBetweenReviews: process.env.CODE_ASSISTANT_PEERS_REVIEWER_CLEAR !== "never",
       startupTimeoutMs: envInt("CODE_ASSISTANT_PEERS_REVIEWER_STARTUP_MS", 30_000),
@@ -429,7 +440,7 @@ async function main(): Promise<void> {
     });
   };
 
-  console.error(`[reviewer] worker started (broker=${brokerUrl}, session=${echo ? "echo" : "tmux/claude per repo"}${once ? ", once" : ""})`);
+  console.error(`[reviewer] worker started (broker=${brokerUrl}, session=${echo ? "echo" : "tmux per reviewer kind + repo"}${once ? ", once" : ""})`);
   await runReviewerWorker({
     brokerUrl,
     sessionFor,
@@ -440,11 +451,60 @@ async function main(): Promise<void> {
   releaseLock?.();
 }
 
-// Stable, tmux-safe session name per repo cwd: "<base>-<repo-slug>-<hash>". The hash disambiguates
-// same-named repos in different paths; the slug keeps it human-readable in `tmux ls`.
-export function sessionNameForCwd(base: string, cwd: string): string {
+// ---------------------------------------------------------------------------
+// Live CLI kinds — which interactive TUI a channel reviewer id maps to, how to launch it
+// read-only with access to the prompt dir, and how to reset its conversation between reviews.
+// Generic: any `<cli>-live` adapter routes here; unknown ids surface as a job error so the host
+// falls back to spawning that adapter's headless CLI.
+// ---------------------------------------------------------------------------
+
+export interface LiveCliKind {
+  slug: string; // session-name segment, e.g. peer-reviewer-<slug>-<repo>-<hash>
+  launchCommand: (promptDir: string) => string[];
+  clearCommand: string | null;
+}
+
+export const LIVE_CLI_KINDS: Record<string, LiveCliKind> = {
+  "claude-live": {
+    slug: "claude",
+    launchCommand: (promptDir) => [
+      "claude",
+      ...(parseArgsEnv(process.env.CODE_ASSISTANT_PEERS_REVIEWER_CLAUDE_ARGS) ?? DEFAULT_REVIEWER_CLAUDE_ARGS),
+      "--add-dir",
+      promptDir,
+    ],
+    clearCommand: "/clear",
+  },
+  "gemini-live": {
+    slug: "gemini",
+    launchCommand: (promptDir) => [
+      "gemini",
+      ...(parseArgsEnv(process.env.CODE_ASSISTANT_PEERS_REVIEWER_GEMINI_ARGS) ?? ["--skip-trust", "--approval-mode", "plan"]),
+      "--include-directories",
+      promptDir,
+    ],
+    clearCommand: "/clear",
+  },
+  "codex-live": {
+    slug: "codex",
+    launchCommand: () => [
+      "codex",
+      ...(parseArgsEnv(process.env.CODE_ASSISTANT_PEERS_REVIEWER_CODEX_ARGS) ?? ["--sandbox", "read-only"]),
+    ],
+    clearCommand: "/new",
+  },
+};
+
+export function liveCliKindFor(reviewer: string): LiveCliKind | null {
+  return LIVE_CLI_KINDS[reviewer] ?? null;
+}
+
+// Stable, tmux-safe session name per CLI kind + repo cwd: "<base>-<kind>-<repo-slug>-<hash>".
+// The hash disambiguates same-named repos in different paths; the slug keeps it human-readable
+// in `tmux ls`.
+export function sessionNameFor(base: string, kind: string, cwd: string): string {
   const slug = (cwd.split("/").filter(Boolean).pop() ?? "repo").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 24) || "repo";
-  return `${base}-${slug}-${shortHash(cwd)}`;
+  return `${base}-${kind}-${slug}-${shortHash(cwd)}`;
 }
 
 function shortHash(value: string): string {
@@ -496,7 +556,7 @@ function lockHolderAlive(lockPath: string): boolean {
   }
 }
 
-function parseClaudeArgs(value: string | undefined): string[] | undefined {
+function parseArgsEnv(value: string | undefined): string[] | undefined {
   if (!value?.trim()) return undefined;
   try {
     const parsed = JSON.parse(value) as unknown;

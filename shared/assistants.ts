@@ -127,15 +127,42 @@ export const BUILTIN_ASSISTANTS: Record<string, AssistantAdapter> = {
   },
 };
 
-// Claude reviewer routed to a backgrounded interactive Claude session via the broker
-// (subscription pool, no `claude -p`). Reuses the `claude` command/env as the fallback that
-// runReviewCommand spawns when the broker / live session is unavailable.
+// Reviewers routed to a backgrounded interactive CLI session via the broker. Each reuses its
+// base adapter's command/env as the fallback that runReviewCommand spawns when the broker /
+// live session is unavailable. For Claude the live session additionally keeps reviews on the
+// subscription pool (no `claude -p`); for Gemini/Codex the benefit is a persistent session
+// whose conversation memory can be kept across reviews (CODE_ASSISTANT_PEERS_REVIEWER_CLEAR).
 BUILTIN_ASSISTANTS["claude-live"] = {
   ...BUILTIN_ASSISTANTS.claude,
   id: "claude-live",
   prompt_transport: "channel",
   description: "Claude review routed to a backgrounded interactive Claude session via the broker (subscription pool, no `claude -p`); falls back to spawning `claude -p` if the broker/session is unavailable.",
 };
+
+BUILTIN_ASSISTANTS["gemini-live"] = {
+  ...BUILTIN_ASSISTANTS.gemini,
+  id: "gemini-live",
+  prompt_transport: "channel",
+  description: "Gemini review routed to a backgrounded interactive Gemini CLI session via the broker (persistent session/memory); falls back to spawning headless gemini if the broker/session is unavailable.",
+};
+
+BUILTIN_ASSISTANTS["codex-live"] = {
+  ...BUILTIN_ASSISTANTS.codex,
+  id: "codex-live",
+  prompt_transport: "channel",
+  description: "Codex review routed to a backgrounded interactive Codex TUI session via the broker (persistent session/memory); falls back to spawning `codex exec` if the broker/session is unavailable.",
+};
+
+// Host-side review passes (codex self-review, the aggregate pass, collaborative host rounds)
+// normally spawn the HOST's headless CLI — for a claude host that is `claude -p` (credit pool).
+// With CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS=1, those passes route through the host's live
+// adapter instead, keeping the session persistent (and, for claude, on the subscription pool).
+export function liveHostReviewer(host: AssistantHost, env: NodeJS.ProcessEnv = process.env, registry = loadAssistantRegistry()): AssistantHost {
+  if (env.CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS !== "1") return host;
+  if (host.endsWith("-live")) return host;
+  const live = `${host}-live`;
+  return registry[live] ? live : host;
+}
 
 let cachedCustomConfig: string | undefined;
 let cachedRegistry: Record<string, AssistantAdapter> | null = null;
