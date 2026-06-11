@@ -70,7 +70,7 @@ export async function runReviewCommand(
     // Auto-start the broker + backgrounded reviewer worker if they are not already running, so a
     // host only has to pick `claude-live` — no manual daemon launch. Idempotent + reused.
     await ensureChannelBackend(cwd);
-    const reply = await reviewViaBroker(reviewer, prompt, timeoutMs, cwd);
+    const reply = await reviewViaBroker(reviewer, prompt, resolveChannelTimeoutMs(), cwd);
     if (reply.ok) {
       return { exitCode: 0, stdout: reply.text, stderr: "", command: ["<broker>", reviewer] };
     }
@@ -167,6 +167,19 @@ function findModelArgInsertIndex(command: string[]): number {
 function resolveReviewCommandTimeoutMs(adapter: AssistantAdapter): number {
   const configured = parsePositiveInteger(process.env.CODE_ASSISTANT_PEERS_REVIEW_TIMEOUT_MS);
   return configured ?? adapter.timeout_ms ?? DEFAULT_REVIEW_COMMAND_TIMEOUT_MS;
+}
+
+// The client-side poll budget for the broker (channel) path. It must be strictly LONGER than the
+// reviewer worker's per-review deliver timeout: the worker bounds the review by the same
+// CODE_ASSISTANT_PEERS_REVIEW_TIMEOUT_MS (default DEFAULT_REVIEW_COMMAND_TIMEOUT_MS) but its clock
+// only starts after the job is claimed and the TUI cold-boots, whereas the client's clock starts
+// at submit. Without the extra slack the client would abandon the live session and fall back to
+// `claude -p` exactly when the review was about to complete. Deliberately ignores the adapter's
+// headless `timeout_ms` (e.g. gemini's 180s) — that bounds the spawn fallback, not the live path.
+const CHANNEL_BOOT_SLACK_MS = 120_000;
+function resolveChannelTimeoutMs(): number {
+  const configured = parsePositiveInteger(process.env.CODE_ASSISTANT_PEERS_REVIEW_TIMEOUT_MS);
+  return (configured ?? DEFAULT_REVIEW_COMMAND_TIMEOUT_MS) + CHANNEL_BOOT_SLACK_MS;
 }
 
 function parsePositiveInteger(value: string | undefined): number | undefined {

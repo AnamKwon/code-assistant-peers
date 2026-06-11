@@ -116,9 +116,20 @@ function spawnBackend(cwd: string): void {
   const logPath = join(tmpdir(), "code-assistant-peers-backend.log");
   const fd = openSync(logPath, "a");
   const base = brokerUrl();
+  // The broker server binds CODE_ASSISTANT_PEERS_BROKER_PORT; the client/worker target
+  // CODE_ASSISTANT_PEERS_BROKER_URL. Derive the port FROM the URL so a custom broker URL
+  // auto-starts a broker on the matching port (otherwise it would bind the default 7899 while
+  // the client polls the configured port, and every review would fall back to `claude -p`).
+  let portFromUrl: string | undefined;
+  try {
+    portFromUrl = new URL(base).port || "7899";
+  } catch {
+    portFromUrl = undefined; // malformed URL — leave any pre-set BROKER_PORT untouched
+  }
   const childEnv = {
     ...process.env,
     CODE_ASSISTANT_PEERS_BROKER_URL: base,
+    ...(portFromUrl ? { CODE_ASSISTANT_PEERS_BROKER_PORT: portFromUrl } : {}),
     CODE_ASSISTANT_PEERS_REVIEWER_CWD: cwd,
   } as Record<string, string>;
   const opts = { cwd, env: childEnv, stdin: "ignore", stdout: fd, stderr: fd } as const;
@@ -127,7 +138,7 @@ function spawnBackend(cwd: string): void {
   console.error(
     `[code-assistant-peers] auto-started channel backend (broker + reviewer worker) in ${cwd}. ` +
       `It runs backgrounded INTERACTIVE Claude sessions, one per reviewed repo (subscription pool, not 'claude -p'). ` +
-      `Logs: ${logPath}. List the reviewer sessions: tmux ls (named peer-reviewer-<repo>-<hash>); ` +
+      `Logs: ${logPath}. List the reviewer sessions: tmux ls (named peer-reviewer-<kind>-<repo>-<hash>, one per reviewer CLI kind + repo); ` +
       `watch one live: tmux attach -t <name>. Stop everything: tmux kill-session per session and kill the broker on ${base}.`,
   );
 }

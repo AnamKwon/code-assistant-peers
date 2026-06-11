@@ -326,6 +326,9 @@ export class TmuxCliSession implements ReviewerSession {
     let previous = "";
     let stableReads = 0;
     while (Date.now() < deadline) {
+      // Bail out promptly on shutdown — sleep() resolves immediately when aborted, so without
+      // this guard the loop would busy-spin spawning `tmux capture-pane` until the deadline.
+      if (signal.aborted) return;
       await sleep(700, signal);
       const current = await this.capture();
       if (current.trim().length > 0 && current === previous) {

@@ -538,6 +538,15 @@ describe("review command construction", () => {
     expect(resolveReviewerModel("gemini", {})).toBeNull();
   });
 
+  test("a -live reviewer resolves the model keyed by its base id (liveHostReviewer divert)", () => {
+    // Hosts key review_models by the BASE id from setup ({claude:"opus"}); a host-side pass
+    // diverted to claude-live must still honor that on the spawn-fallback path.
+    expect(resolveReviewerModel("claude-live", { review_models: { claude: "opus" } })).toBe("opus");
+    expect(resolveReviewerModel("codex-live", { review_models: { codex: "gpt-5.5" } })).toBe("gpt-5.5");
+    // An exact -live key still wins when explicitly provided.
+    expect(resolveReviewerModel("claude-live", { review_models: { "claude-live": "sonnet", claude: "opus" } })).toBe("sonnet");
+  });
+
   test("auto review model selection uses hardcoded reviewer model tiers", () => {
     expect(selectAutoReviewerModel("claude", { diffLength: 1000, changedFileCount: 1, focus: "docs" })).toBe("haiku");
     expect(selectAutoReviewerModel("claude", { focus: "security and data loss", diffLength: 1000 })).toBe("opus");

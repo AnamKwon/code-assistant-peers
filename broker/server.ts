@@ -42,7 +42,7 @@ Bun.serve({
       const body = (await req.json().catch(() => ({}))) as { reviewer?: string; prompt?: string; cwd?: string };
       if (!body.prompt) return json({ error: "prompt required" }, 400);
       const id = `job_${Date.now().toString(36)}_${seq++}`;
-      jobs.set(id, { id, reviewer: String(body.reviewer ?? "claude"), prompt: body.prompt, cwd: String(body.cwd ?? ""), status: "pending", createdAt: Date.now() });
+      jobs.set(id, { id, reviewer: String(body.reviewer ?? "claude-live"), prompt: body.prompt, cwd: String(body.cwd ?? ""), status: "pending", createdAt: Date.now() });
       return json({ id, status: "pending" });
     }
 
