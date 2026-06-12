@@ -727,6 +727,8 @@ CODE_ASSISTANT_PEERS_DIFF_BUDGET=4000        # cap included diff (only truncates
 CODE_ASSISTANT_PEERS_CONTEXT_PROVIDER=off    # drop semantic context entirely (serena-auto already
                                              # skips small changes on its own)
 CODE_ASSISTANT_PEERS_MEMORY_ROUNDS=2         # inline fewer prior rounds (open findings always included)
+CODE_ASSISTANT_PEERS_REVIEWER_CLEAR=always   # live sessions: reset conversation per review — the
+                                             # keep-memory default re-reads a growing context each round
 ```
 
 Notes:

@@ -316,12 +316,11 @@ export class TmuxCliSession implements ReviewerSession {
       `then exactly ${done} on the final line.`;
 
     try {
-      // Reset the reused session's CONVERSATION before each review (default): this single live
-      // session serves every review, so without a reset its context grows unbounded and earlier
-      // reviews bleed into later ones. Opt out (CODE_ASSISTANT_PEERS_REVIEWER_CLEAR=never) to
-      // keep the session's memory across reviews — e.g. follow-up rounds that benefit from what
-      // the reviewer already read. NOTE the session is per-REPO, not per-task, so without a
-      // reset history from other tasks in the same repo accumulates too.
+      // Conversation reset is OPT-IN (CODE_ASSISTANT_PEERS_REVIEWER_CLEAR=always): by default the
+      // session keeps its memory across reviews so follow-up rounds benefit from what the
+      // reviewer already read. NOTE the session is per-REPO, not per-task, so the default also
+      // accumulates other tasks' history and a long-lived context will eventually auto-compact —
+      // use "always" for isolated, bounded-context rounds.
       if (this.config.clearBetweenReviews && this.config.kind.clearCommand) {
         await tmux(["send-keys", "-t", sessionName, "-l", "--", this.config.kind.clearCommand]);
         await sleep(150, signal);
@@ -551,8 +550,9 @@ async function main(): Promise<void> {
 
   if (process.env.ANTHROPIC_API_KEY && !echo) {
     console.error(
-      "[reviewer] WARNING: ANTHROPIC_API_KEY is set — Claude Code will bill to the API key, NOT your subscription. " +
-        "Unset it (and log in via claude.ai) for subscription billing.",
+      "[reviewer] note: ANTHROPIC_API_KEY is set in the worker environment, but reviewer sessions are " +
+        "launched with an isolated env that strips it — claude sessions stay on subscription auth. " +
+        "Unset it anyway to keep spawn-fallback reviews (claude -p) off API-key billing.",
     );
   }
 
