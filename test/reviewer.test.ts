@@ -10,6 +10,7 @@ import {
   liveCliKindFor,
   runReviewerWorker,
   sessionNameFor,
+  stripRenderedLineNumbers,
 } from "../broker/reviewer.ts";
 
 interface MockJob {
@@ -150,6 +151,41 @@ describe("reviewer worker loop", () => {
     }
   });
 
+  test("distinct sessions run in PARALLEL; same-session jobs stay serialized", async () => {
+    const broker = startMockBroker([
+      { id: "c1", reviewer: "claude-live", prompt: "p", cwd: "/repo/a" },
+      { id: "g1", reviewer: "gemini-live", prompt: "p", cwd: "/repo/a" }, // different session → parallel
+      { id: "c2", reviewer: "claude-live", prompt: "p", cwd: "/repo/a" }, // same session as c1 → after c1
+    ]);
+    const events: Array<{ job: string; type: "start" | "end"; at: number }> = [];
+    const sessionFor = (reviewer: string): ReviewerSession => ({
+      deliver: async (_prompt, jobId) => {
+        events.push({ job: jobId, type: "start", at: Date.now() });
+        await Bun.sleep(120);
+        events.push({ job: jobId, type: "end", at: Date.now() });
+        return `done by ${reviewer}`;
+      },
+    });
+    const controller = new AbortController();
+    try {
+      const run = runReviewerWorker({ brokerUrl: broker.url, sessionFor, signal: controller.signal, pollIntervalMs: 5 });
+      await Bun.sleep(450);
+      controller.abort();
+      await run;
+      const at = (job: string, type: "start" | "end") => events.find((e) => e.job === job && e.type === type)!.at;
+      // parallel: gemini started BEFORE claude's first job finished
+      expect(at("g1", "start")).toBeLessThan(at("c1", "end"));
+      // serialized: c2 (same session as c1) started only after c1 ended
+      expect(at("c2", "start")).toBeGreaterThanOrEqual(at("c1", "end"));
+      expect(broker.results.get("c1")?.result).toContain("done");
+      expect(broker.results.get("g1")?.result).toContain("done");
+      expect(broker.results.get("c2")?.result).toContain("done");
+    } finally {
+      controller.abort();
+      broker.server.stop(true);
+    }
+  });
+
   test("an unsupported reviewer becomes a job error, not a worker crash", async () => {
     const broker = startMockBroker([
       { id: "u1", reviewer: "mystery-live", prompt: "p", cwd: "/repo/a" },
@@ -275,5 +311,17 @@ describe("review extraction from a captured pane", () => {
   test("both markers contain no markdown/TUI-special characters", () => {
     expect(beginMarkerFor("job-1")).toMatch(/^[A-Za-z0-9_-]+$/);
     expect(doneMarkerFor("job-1")).toMatch(/^[A-Za-z0-9_-]+$/);
+  });
+
+  // Regression: the Gemini TUI renders responses with leading line numbers, which leaked into
+  // the extracted review ("2 I am Gemini..."). Strip only under the conservative signature.
+  test("strips Gemini's rendered line numbers but never genuine content", () => {
+    expect(stripRenderedLineNumbers(" 2 I am Gemini, trained by Google.\n 3 The channel works.")).toBe(
+      "I am Gemini, trained by Google.\nThe channel works.",
+    );
+    expect(stripRenderedLineNumbers(" 2 Only one numbered line")).toBe(" 2 Only one numbered line"); // single line — left alone
+    expect(stripRenderedLineNumbers("No findings.\npatch is correct")).toBe("No findings.\npatch is correct");
+    expect(stripRenderedLineNumbers("1. first item\n2. second item")).toBe("1. first item\n2. second item"); // markdown list
+    expect(stripRenderedLineNumbers("3 issues found\n2 tests failed")).toBe("3 issues found\n2 tests failed"); // not increasing
   });
 });

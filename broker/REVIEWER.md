@@ -194,6 +194,6 @@ Run with the worker up and `PEER_ASSISTANTS=claude-live`:
 | | `claude -p` | tmux + live session |
 |---|---|---|
 | billing | credit pool (after 2026-06-15) ❌ | subscription ✅ (inferred; verify) |
-| concurrency | parallel (fresh process each) | serialized (one session) |
+| concurrency | parallel (fresh process each) | parallel across sessions (reviewer kind × repo); serialized within one session |
 | availability | always spawnable | session must be up (else fallback) |
 | stability | stable | TUI scraping is best-effort |

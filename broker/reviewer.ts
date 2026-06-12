@@ -87,6 +87,12 @@ async function postError(brokerUrl: string, jobId: string, error: string): Promi
 // The worker loop: claim → deliver to the live session → report result/error. Bounded only by
 // the abort signal. A failed delivery is reported as a job error (not a crash) so one bad review
 // never takes the worker down.
+//
+// Concurrency model: jobs for DIFFERENT sessions (reviewer kind × repo) run in PARALLEL — a
+// multi-peer review that fans out to claude-live + gemini-live + codex-live boots and runs all
+// three TUIs concurrently instead of paying their wall-clock times in sequence. Jobs for the
+// SAME session are serialized via a per-session promise chain, because one TUI cannot interleave
+// two reviews (send-keys/capture would corrupt both).
 export async function runReviewerWorker(options: ReviewerWorkerOptions): Promise<void> {
   const { brokerUrl, sessionFor, signal } = options;
   const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
@@ -104,6 +110,24 @@ export async function runReviewerWorker(options: ReviewerWorkerOptions): Promise
     return session;
   };
 
+  // processJob never rejects — failures are reported to the broker as job errors.
+  const processJob = async (job: ReviewJob): Promise<void> => {
+    log(`claimed job ${job.id} (${job.reviewer}, cwd=${job.cwd || "(default)"})`);
+    try {
+      const review = await resolveSession(job.reviewer, job.cwd).deliver(job.prompt, job.id, signal);
+      await postResult(brokerUrl, job.id, review);
+      log(`job ${job.id} reviewed (${review.length} chars)`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await postError(brokerUrl, job.id, `reviewer worker failed: ${message}`).catch(() => {});
+      log(`job ${job.id} failed: ${message}`);
+    }
+  };
+
+  // Tail of the in-order work chain per session key. Chaining serializes same-session jobs while
+  // distinct sessions proceed independently (= in parallel).
+  const chains = new Map<string, Promise<void>>();
+
   try {
     while (!signal.aborted) {
       const job = await claimNextJob(brokerUrl, signal);
@@ -113,20 +137,19 @@ export async function runReviewerWorker(options: ReviewerWorkerOptions): Promise
         continue;
       }
 
-      log(`claimed job ${job.id} (${job.reviewer}, cwd=${job.cwd || "(default)"})`);
-      try {
-        const review = await resolveSession(job.reviewer, job.cwd).deliver(job.prompt, job.id, signal);
-        await postResult(brokerUrl, job.id, review);
-        log(`job ${job.id} reviewed (${review.length} chars)`);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        await postError(brokerUrl, job.id, `reviewer worker failed: ${message}`).catch(() => {});
-        log(`job ${job.id} failed: ${message}`);
+      if (options.once) {
+        await processJob(job);
+        return;
       }
 
-      if (options.once) return;
+      const key = `${job.reviewer}|${job.cwd}`;
+      const next = (chains.get(key) ?? Promise.resolve()).then(() => processJob(job));
+      chains.set(key, next);
+      // Loop straight back to claim the next job — concurrent sessions start immediately.
     }
   } finally {
+    // Let in-flight reviews finish reporting before tearing the sessions down.
+    await Promise.allSettled([...chains.values()]);
     for (const session of sessions.values()) await session.close?.();
   }
 }
@@ -171,7 +194,28 @@ export function extractReviewFromCapture(capture: string, jobId: string): string
   if (lastDone <= lastBegin) return null; // mid-repaint / out-of-order — keep polling
 
   const between = capture.slice(lastBegin + begin.length, lastDone);
-  return cleanCapturedReview(between);
+  return stripRenderedLineNumbers(cleanCapturedReview(between));
+}
+
+// The Gemini TUI renders responses with leading line numbers (" 2 I am Gemini...", " 3 ..."),
+// which leak into the captured body. Strip them only under a conservative signature so genuine
+// content is never mangled: at least two non-empty lines AND every non-empty line starts with a
+// bare integer (followed by whitespace) AND those integers are strictly increasing. Markdown
+// lists ("1. foo") don't match (dot, not whitespace, follows the digits).
+export function stripRenderedLineNumbers(text: string): string {
+  const lines = text.split("\n");
+  const numbered = lines
+    .map((line) => /^\s*(\d+)(\s|$)/.exec(line))
+    .map((match, index) => ({ match, index, blank: lines[index].trim() === "" }));
+  const nonBlank = numbered.filter((entry) => !entry.blank);
+  if (nonBlank.length < 2 || nonBlank.some((entry) => !entry.match)) return text;
+  for (let i = 1; i < nonBlank.length; i++) {
+    if (Number(nonBlank[i].match![1]) <= Number(nonBlank[i - 1].match![1])) return text;
+  }
+  return lines
+    .map((line) => line.replace(/^\s*\d+(\s|$)/, ""))
+    .join("\n")
+    .trim();
 }
 
 // Strip TUI chrome from scraped pane text: box-drawing borders, the leading "> " input echo,
