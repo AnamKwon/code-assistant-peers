@@ -41,6 +41,9 @@ export {
 
 const REVIEW_DIFF_BUDGET = parseInt(process.env.CODE_ASSISTANT_PEERS_DIFF_BUDGET ?? "12000", 10);
 const REVIEW_OUTPUT_BUDGET = parseInt(process.env.CODE_ASSISTANT_PEERS_REVIEW_OUTPUT_BUDGET ?? "6000", 10);
+// How many prior review rounds are inlined into each review prompt (open findings are always
+// included in full regardless of this cap).
+const REVIEW_MEMORY_ROUNDS = Math.max(1, parseInt(process.env.CODE_ASSISTANT_PEERS_MEMORY_ROUNDS ?? "3", 10) || 3);
 
 export interface ReviewRoundSummary {
   reviewer: AssistantHost;
@@ -258,7 +261,15 @@ async function buildPreviousReviewMemory(taskId: string): Promise<string> {
   }
 
   if (rounds.length > 0) {
-    parts.push(`Prior rounds:\n${rounds.map((round) => {
+    // Only the most recent rounds are inlined: including every prior round grew the prompt by
+    // ~1.2K chars per round, so long tasks paid an ever-growing input on every review. Open
+    // findings (above) are always included in full, so unresolved issues survive the cut.
+    const recentRounds = rounds.slice(-REVIEW_MEMORY_ROUNDS);
+    const omitted = rounds.length - recentRounds.length;
+    const omittedNote = omitted > 0
+      ? `(${omitted} earlier round${omitted === 1 ? "" : "s"} omitted; open findings above still cover unresolved issues)\n`
+      : "";
+    parts.push(`Prior rounds:\n${omittedNote}${recentRounds.map((round) => {
       const output = compactText(round.stdout || round.stderr || "(no output)", 1200);
       return `Round ${round.round} by ${round.reviewer} at ${round.completed_at}:\n${output}`;
     }).join("\n\n")}`);

@@ -88,6 +88,10 @@ const REVIEW_MODEL_INPUT_PROPERTIES = {
     additionalProperties: { type: "string" as const },
     description: "Optional per-reviewer model mapping selected by the host coding agent, such as {\"claude\":\"opus\",\"codex\":\"gpt-5.5\"}. This overrides review_model for matching reviewers. A per-reviewer value of \"auto\" delegates only that reviewer to MCP automatic routing.",
   },
+  force_review: {
+    type: "boolean" as const,
+    description: "Set true to re-run reviewers even when the repository state and review options match the latest completed review. Default false: an unchanged state reuses the recorded review instead of spending reviewer tokens again.",
+  },
 };
 
 const HOST_MODEL_SELECTION_GUIDANCE = [
@@ -770,6 +774,12 @@ function buildReviewRequestSignatureFromState(
   options: ReviewRequestOptions,
   reviewState: { statusEntries: PeerTask["baseline_status"]; diff: string },
 ): string {
+  // NOTE: change_summary / files_changed are deliberately EXCLUDED. They are host-written free
+  // text that hosts reword on every call, so including them made the signature differ while the
+  // actual repository state (git_status + git_diff below) was identical — defeating the
+  // same-state dedup and superseding in-flight reviews for no reason. They still flow into the
+  // review prompt; they just don't define "did anything reviewable change". Use force_review to
+  // re-run a review for an unchanged state.
   const payload = {
     cwd: task.cwd,
     host: task.host,
@@ -779,8 +789,6 @@ function buildReviewRequestSignatureFromState(
     mode: options.mode ?? "normal",
     scope: options.scope ?? "auto",
     base: options.base ?? null,
-    change_summary: options.change_summary ?? null,
-    files_changed: options.files_changed ?? [],
     workflow: options.workflow ?? "review_only",
     focus: normalizeReviewFocus(options.focus ?? process.env.CODE_ASSISTANT_PEERS_REVIEW_FOCUS),
     semantic_context: options.semantic_context ?? null,
@@ -962,10 +970,10 @@ async function startOrReuseAsyncPeerReview(task: PeerTask, options: ReviewReques
     const hasSensitivePossibleChange = startContext.snapshotSeed.reviewContext.diff.includes("sensitive path");
     const hasNoNonGitBaseline = current.git_root === null && !current.baseline_workspace_snapshot;
 
-    if (currentSignature === requestSignature && isTerminalReviewStatus(current.status) && !hasSensitivePossibleChange && !hasNoNonGitBaseline) {
+    if (currentSignature === requestSignature && isTerminalReviewStatus(current.status) && !hasSensitivePossibleChange && !hasNoNonGitBaseline && options.force_review !== true) {
       return textResult([
         `Peer review already completed for task ${current.id}.`,
-        "The repository state and review options match the latest recorded review.",
+        "The repository state and review options match the latest recorded review, so no reviewer was re-run (no extra tokens spent). Pass force_review=true to re-run anyway.",
         "Call wait_for_peer_review with this task_id before your final response.",
         await buildReviewStatusJson(current),
       ].join("\n\n"));
@@ -1691,6 +1699,7 @@ function parseReviewOptions(args: unknown): ReviewRequestOptions {
       : String(obj.semantic_context),
     review_model: normalizeReviewModel(obj.review_model),
     review_models: normalizeReviewModels(obj.review_models),
+    force_review: obj.force_review === true,
   };
 }
 

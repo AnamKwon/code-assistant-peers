@@ -693,7 +693,12 @@ Main cost drivers:
 - `CODE_ASSISTANT_PEERS_DIFF_BUDGET` controls how much raw diff is included. The default is `12000` characters.
 - `serena-auto` may add semantic context. `CODE_ASSISTANT_PEERS_SERENA_CONTEXT_BUDGET` defaults to `8000` characters.
 - Reviewers are allowed to inspect the repository directly when the included diff is insufficient, so Claude print mode or Codex exec may read additional files.
-- Previous review memory is included in later rounds so reviewers can verify earlier findings.
+- Previous review memory is included in later rounds so reviewers can verify earlier findings. Only the most recent `CODE_ASSISTANT_PEERS_MEMORY_ROUNDS` rounds (default `3`) are inlined; open findings are always included in full.
+
+Built-in savings:
+
+- **Same-state dedup**: when the repository state and review options match the latest completed review, the gate returns the recorded review instead of re-running reviewers (no tokens spent). Host-written `change_summary`/`files_changed` rewording does not defeat this. Pass `force_review: true` to re-run anyway.
+- **Memory cap**: long tasks no longer grow the prompt with every prior round (see above).
 
 Billing pool note: starting 2026-06-15, spawned `claude -p` reviews draw from the separate Agent
 SDK monthly credit instead of the Claude subscription. The `claude-live` adapter keeps Claude
