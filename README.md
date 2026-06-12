@@ -298,6 +298,12 @@ per-repo session whose conversation memory can be kept across reviews
 collaborative comparison) can also run on the host's live session with
 `CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS=1`. See [broker/REVIEWER.md](broker/REVIEWER.md).
 
+Host-selected `review_model` / `review_models` are applied to spawned headless reviewers. Live
+tmux reviewers currently use the model already active inside the TUI; per-request model switching
+for live sessions is a known follow-up. The intended design is to keep a single live session per
+reviewer/repo, pass the resolved model through the broker job, and send `/model <id>` only when the
+requested model differs from the session's current model.
+
 For other CLIs, set `CODE_ASSISTANT_PEERS_ASSISTANTS` to a JSON object. Each adapter needs:
 
 - `command`: argv array used to launch the assistant.

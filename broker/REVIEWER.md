@@ -176,6 +176,30 @@ model is logged-and-ignored on the broker path and only takes effect if that rev
 spawning `claude -p`. To change the live reviewer's model, switch it in the tmux session
 (`/model`) or relaunch the worker with `CODE_ASSISTANT_PEERS_REVIEWER_CLAUDE_ARGS='... --model opus'`.
 
+Confirmed behavior:
+- Headless reviewers receive the selected model in the spawned command, e.g.
+  `claude -p ... --model opus` or `gemini ... --model pro`.
+- Live reviewers currently keep one tmux TUI session per reviewer kind + repo. The broker job
+  payload does not include a model, and the worker does not send `/model`, so per-request model
+  selection is not applied while the broker path succeeds.
+- With the default `CODE_ASSISTANT_PEERS_REVIEWER_CLEAR=always`, the process/session is reused but
+  the conversation is reset before each review. Use `CODE_ASSISTANT_PEERS_REVIEWER_CLEAR=never`
+  when the goal is to preserve reviewer memory across related reviews, accepting cross-task context
+  bleed within the same repo and eventual auto-compaction.
+
+Preferred future design:
+1. Keep **one live tmux session per reviewer kind + repo** instead of starting a separate session
+   for every model.
+2. Add the resolved host-selected model to the broker job payload.
+3. Have the worker track the current model for each live session and send `/model <id>` only when
+   the next review requests a different model.
+4. Record the selection in the persisted round command, for example
+   `["<broker>", "claude-live", "--model", "opus"]`, so audits can distinguish "reviewed through
+   broker" from "reviewed through broker with requested model switch".
+5. Use CLI resume/session-id support only as a fallback design. `resume --last` is ambiguous when
+   unrelated sessions exist; a safe resume flow would need exact session ids stored by reviewer,
+   repo, and requested model state.
+
 ## Verification checklist (the remaining empirical step)
 
 Run with the worker up and `PEER_ASSISTANTS=claude-live`:
