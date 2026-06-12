@@ -708,20 +708,34 @@ reviews on the subscription pool by routing them to a backgrounded interactive s
 Low-token recommended setup:
 
 ```bash
-# Single external peer, compact gate output
-bun cli.ts setup codex --peers=claude --mode=gate
+# Single external peer, compact gate output. gate mode also disables host self-review.
+bun cli.ts setup codex --peers=claude-live --mode=gate
 
 # Or use Gemini explicitly as the only peer
 bun cli.ts setup codex --peers=gemini --mode=gate
 ```
 
-For tighter prompt budgets:
+Full low-cost profile (add these to the MCP server env):
 
 ```bash
-CODE_ASSISTANT_PEERS_DIFF_BUDGET=4000
-CODE_ASSISTANT_PEERS_SERENA_CONTEXT_BUDGET=2000
-CODE_ASSISTANT_PEERS_CONTEXT_PROVIDER=off
+CODE_ASSISTANT_PEERS_REVIEW_MODE=gate        # compact ALLOW/BLOCK output (setup --mode=gate writes this)
+CODE_ASSISTANT_PEERS_REVIEW_MODEL=auto       # route small/low-risk diffs to the cheap model tier by default
+CODE_ASSISTANT_PEERS_SELF_REVIEW=none        # skip the extra host self-review pass
+CODE_ASSISTANT_PEERS_DIFF_BUDGET=4000        # cap included diff (only truncates large diffs)
+CODE_ASSISTANT_PEERS_CONTEXT_PROVIDER=off    # drop semantic context entirely (serena-auto already
+                                             # skips small changes on its own)
+CODE_ASSISTANT_PEERS_MEMORY_ROUNDS=2         # inline fewer prior rounds (open findings always included)
 ```
+
+Notes:
+
+- `CODE_ASSISTANT_PEERS_REVIEW_MODEL` is the default when the host does not pass `review_model`;
+  an explicit host value still wins. `auto` picks from the per-reviewer model catalog by diff
+  size/risk, so routine diffs run on `haiku`/`flash`/`-mini`-class models.
+- `claude-live` keeps Claude reviews on the subscription pool instead of API-rate credits — for
+  many setups that is the single largest cost lever. See [broker/REVIEWER.md](broker/REVIEWER.md).
+- The same-state dedup (above) means re-running the gate without new edits costs nothing; batch
+  your edits and run the gate once per work unit rather than per file save.
 
 Use `normal`, `adversarial`, `collaborative`, multi-peer review, and Serena-rich context when you want deeper review coverage and are willing to spend more tokens. Use `gate` mode and a single peer for routine final-response checks.
 

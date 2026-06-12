@@ -1697,7 +1697,10 @@ function parseReviewOptions(args: unknown): ReviewRequestOptions {
     semantic_context: obj.semantic_context === undefined || obj.semantic_context === null
       ? null
       : String(obj.semantic_context),
-    review_model: normalizeReviewModel(obj.review_model),
+    // CODE_ASSISTANT_PEERS_REVIEW_MODEL is the operator-set default when the host omits
+    // review_model — "auto" is the recommended value (routes small/low-risk diffs to the cheap
+    // tier without host cooperation). An explicit host value always wins.
+    review_model: normalizeReviewModel(obj.review_model ?? process.env.CODE_ASSISTANT_PEERS_REVIEW_MODEL),
     review_models: normalizeReviewModels(obj.review_models),
     force_review: obj.force_review === true,
   };
@@ -1770,6 +1773,7 @@ async function buildSetupStatus() {
     peers,
     workflow: DEFAULT_WORKFLOW,
     default_review_mode: DEFAULT_REVIEW_MODE ?? "normal",
+    default_review_model: process.env.CODE_ASSISTANT_PEERS_REVIEW_MODEL?.trim() || null,
     assistants,
     review_gate: {
       available_tool: "must_call_after_code_changes",
