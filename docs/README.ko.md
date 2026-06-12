@@ -260,7 +260,13 @@ peer review는 설정에 따라 토큰을 많이 사용할 수 있습니다. MCP
 - `CODE_ASSISTANT_PEERS_DIFF_BUDGET`은 raw diff 포함량을 제어합니다. 기본값은 `12000`자입니다.
 - `serena-auto`는 semantic context를 추가할 수 있습니다. `CODE_ASSISTANT_PEERS_SERENA_CONTEXT_BUDGET` 기본값은 `8000`자입니다.
 - reviewer는 diff만으로 부족하면 repository를 직접 inspect할 수 있으므로 Claude print mode나 Codex exec가 추가 파일을 읽을 수 있습니다.
-- 이전 review round memory가 후속 round prompt에 포함되어, 반복 리뷰일수록 prompt가 커질 수 있습니다.
+- 이전 review round memory가 후속 round prompt에 포함됩니다. 최근 `CODE_ASSISTANT_PEERS_MEMORY_ROUNDS`개(기본 `3`)만 인라인되며, 미해결 findings는 항상 전부 포함됩니다.
+
+기본 절약 장치:
+
+- **같은-상태 dedup**: repo 상태와 리뷰 옵션이 직전 완료 리뷰와 같으면 reviewer를 다시 돌리지 않고 저장된 리뷰를 반환합니다(토큰 0). host가 change_summary 문구를 바꿔 보내도 dedup이 깨지지 않습니다. 강제 재실행은 `force_review: true`.
+- **메모리 캡**: 긴 task도 라운드마다 prompt가 무한히 커지지 않습니다(위 참조).
+- **모델 기본값**: `CODE_ASSISTANT_PEERS_REVIEW_MODEL=auto`를 설정하면 host가 모델을 안 넘겨도 작은 diff가 저가 모델로 자동 라우팅됩니다(명시값이 항상 우선).
 
 과금 풀 참고: 2026-06-15부터 `claude -p`로 실행되는 리뷰는 Claude 구독이 아닌 별도의 Agent SDK
 월간 크레딧에서 차감됩니다. `claude-live` adapter는 리뷰를 백그라운드 인터랙티브 세션으로

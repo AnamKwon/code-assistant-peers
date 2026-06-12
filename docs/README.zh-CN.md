@@ -26,6 +26,7 @@
 - `normal`, `adversarial`, `gate`, `collaborative` 审查模式
 - `peer_fix` workflow：reviewer 只提出修复建议，不直接编辑文件
 - SQLite 持久化 task memory、review rounds、findings、async status
+- 同状态 dedup：仓库状态与选项和上次完成的审查一致时直接返回已记录的审查（零 token；`force_review` 可强制重跑）
 - 用于避免 MCP host timeout 的 async-first review flow
 - 用于 MCP 注册和本地诊断的 `setup`, `doctor`
 - `CLAUDE.md` 和 `AGENTS.md` project rule installer
@@ -261,6 +262,9 @@ review prompt 与 Codex 风格的 review heuristic 对齐：
 | `HOST_ASSISTANT` | required | 当前 host assistant id |
 | `PEER_ASSISTANT` | inferred | reviewer assistant id |
 | `PEER_ASSISTANTS` | unset | multi-peer reviewer id 列表 |
+| `CODE_ASSISTANT_PEERS_REVIEW_MODEL` | unset | host 未传 review_model 时的默认值（推荐 `auto`：小 diff 自动路由到低成本模型） |
+| `CODE_ASSISTANT_PEERS_MEMORY_ROUNDS` | `3` | 内联到 prompt 的最近审查轮数（未解决 findings 始终全部包含） |
+| `CODE_ASSISTANT_PEERS_REVIEWER_CLEAR` | keep | 实时会话默认保留对话记忆；`always` 则每次审查前清空 |
 | `CODE_ASSISTANT_PEERS_ASSISTANTS` | built-ins only | custom CLI adapter JSON |
 | `CODE_ASSISTANT_PEERS_WORKFLOW` | `review_only` | `review_only` 或 `peer_fix` |
 | `CODE_ASSISTANT_PEERS_REVIEW_MODE` | `normal` | `normal`, `adversarial`, `gate`, `collaborative` |
