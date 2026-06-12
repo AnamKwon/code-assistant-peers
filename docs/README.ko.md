@@ -314,6 +314,10 @@ CODE_ASSISTANT_PEERS_CONTEXT_PROVIDER=off
 | `CODE_ASSISTANT_PEERS_ASSISTANTS` | built-ins only | custom CLI adapter JSON |
 | `CODE_ASSISTANT_PEERS_WORKFLOW` | `review_only` | `review_only` 또는 `peer_fix` |
 | `CODE_ASSISTANT_PEERS_REVIEW_MODE` | `normal` | `normal`, `adversarial`, `gate`, `collaborative` |
+| `CODE_ASSISTANT_PEERS_REVIEW_MODEL` | unset | host가 review_model을 안 넘길 때 기본값. `auto`면 diff 크기/위험도로 라우팅(명시값 우선) |
+| `CODE_ASSISTANT_PEERS_SELF_REVIEW` | `codex` | 자가리뷰 대상 host: `codex`(기본)/`all`·`*`/`none`·`off`/콤마 목록 |
+| `CODE_ASSISTANT_PEERS_MEMORY_ROUNDS` | `3` | review prompt에 인라인하는 직전 라운드 수(미해결 findings는 항상 전부 포함) |
+| `CODE_ASSISTANT_PEERS_REVIEWER_CLEAR` | 기억 유지 | 라이브 세션 대화 기억 기본 유지, `always`면 리뷰마다 초기화 |
 | `CODE_ASSISTANT_PEERS_REVIEW_FOCUS` | unset | 기본 review focus |
 | `CODE_ASSISTANT_PEERS_HOME` | `~/.mcp-code-assistant-peers` | SQLite 저장 위치 |
 | `CODE_ASSISTANT_PEERS_DIFF_BUDGET` | `12000` | diff 포함 문자 예산 |

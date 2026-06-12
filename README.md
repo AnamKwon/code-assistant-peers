@@ -922,6 +922,11 @@ CODE_ASSISTANT_PEERS_HOME=/path/to/store
 | `CODE_ASSISTANT_PEERS_REVIEW_OUTPUT_BUDGET` | `6000` | Character budget for tool responses. |
 | `CODE_ASSISTANT_PEERS_REVIEW_TIMEOUT_MS` | adapter default, otherwise `600000` | Hard timeout for each reviewer CLI process. Built-in Gemini defaults to `180000`. |
 | `CODE_ASSISTANT_PEERS_ARGV_PROMPT_BUDGET` | `60000` | Maximum prompt size for custom adapters using `prompt_transport: "argv"`. |
+| `CODE_ASSISTANT_PEERS_REVIEW_MODEL` | unset | Default reviewer model when the host omits `review_model`; `auto` routes by diff size/risk. An explicit host value wins. |
+| `CODE_ASSISTANT_PEERS_SELF_REVIEW` | `codex` | Which hosts run a self-review: `codex` (default), `all`/`*`, `none`/`off`, or a comma list. |
+| `CODE_ASSISTANT_PEERS_MEMORY_ROUNDS` | `3` | Prior review rounds inlined into each review prompt (open findings always included in full). |
+| `CODE_ASSISTANT_PEERS_REVIEWER_CLEAR` | keep memory | Live-session conversation memory across reviews; `always` resets per review. See [broker/REVIEWER.md](broker/REVIEWER.md). |
+| `CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS` | unset | `1` routes host-side passes (self-review/aggregate/collaborative) through the host's live session. |
 | `CODE_ASSISTANT_PEERS_INCLUDE_SUCCESS_STDERR` | unset | Set `1` to include successful reviewer stderr in MCP responses. |
 
 ## CLI

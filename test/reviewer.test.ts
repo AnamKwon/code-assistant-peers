@@ -294,6 +294,8 @@ describe("reviewer worker loop", () => {
       // finds OURS by marker even though THEIRS is newer (never picks most-recent blindly)
       expect(await findCodexSessionId(dir, "PEER-REVIEW-BEGIN-job-42")).toBe("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
       expect(await findCodexSessionId(dir, "PEER-REVIEW-BEGIN-job-99")).toBeNull();
+      // sinceMs floor excludes rollouts older than the session launch (future floor -> no match)
+      expect(await findCodexSessionId(dir, "PEER-REVIEW-BEGIN-job-42", Date.now() + 600_000)).toBeNull();
     } finally {
       await rmP(dir, { recursive: true, force: true });
     }
