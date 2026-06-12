@@ -294,7 +294,9 @@ checklist.
 broker), each falling back to its headless CLI if the broker/session is unavailable. Unlike
 Claude there is no headless-vs-interactive billing split for these — the benefit is a persistent
 per-repo session whose conversation memory can be kept across reviews
-(`CODE_ASSISTANT_PEERS_REVIEWER_CLEAR=never`). Host-side passes (self-review, the aggregate pass,
+(kept by default; `CODE_ASSISTANT_PEERS_REVIEWER_CLEAR=always` clears per review). `review_model`
+also applies to live reviewers: a model change restarts the session resuming the same
+conversation. Host-side passes (self-review, the aggregate pass,
 collaborative comparison) can also run on the host's live session with
 `CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS=1`. See [broker/REVIEWER.md](broker/REVIEWER.md).
 

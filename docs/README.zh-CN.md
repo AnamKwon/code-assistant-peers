@@ -128,7 +128,7 @@ broker/会话不可用时自动 fallback 到启动 `claude -p`。在原本使用
 [broker/REVIEWER.md](../broker/REVIEWER.md)。
 
 `gemini-live`、`codex-live` 以相同方式路由（交互式 Gemini/Codex 会话，不可用时回退到无头 CLI）。与 Claude
-不同，它们没有计费池差异，好处是**持久会话 + 跨审查记忆**（`CODE_ASSISTANT_PEERS_REVIEWER_CLEAR=never`）。
+不同，它们没有计费池差异，好处是**持久会话 + 跨审查记忆**（默认保留；`CODE_ASSISTANT_PEERS_REVIEWER_CLEAR=always` 则每次审查前清空）。切换模型时会在 resume 同一会话的前提下重启，因此 `review_model` 也适用于实时会话。
 self-review 等 host 侧流程也可通过 `CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS=1` 在 host 的实时会话中运行；
 由 `CODE_ASSISTANT_PEERS_SELF_REVIEW`（默认 `codex` / `all` / `none` / `claude,codex` 等）决定哪些 host 自审。
 

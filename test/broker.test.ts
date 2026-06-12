@@ -26,7 +26,8 @@ function bootstrapDeps(overrides: Partial<BackendBootstrapDeps> = {}): BackendBo
 // Mock broker: POST /jobs -> id; GET /jobs/:id -> done with a canned review.
 function startMockBroker(reviewText: string) {
   let jobId = "";
-  return Bun.serve({
+  const submitted: Array<Record<string, unknown>> = [];
+  const server = Bun.serve({
     port: 0,
     hostname: "127.0.0.1",
     fetch(req) {
@@ -36,7 +37,10 @@ function startMockBroker(reviewText: string) {
       }
       if (req.method === "POST" && pathname === "/jobs") {
         jobId = "mock-1";
-        return Response.json({ id: jobId, status: "pending" });
+        return req.json().then((body) => {
+          submitted.push(body as Record<string, unknown>);
+          return Response.json({ id: jobId, status: "pending" });
+        });
       }
       if (req.method === "GET" && pathname === `/jobs/${jobId}`) {
         return Response.json({ status: "done", result: reviewText });
@@ -44,6 +48,7 @@ function startMockBroker(reviewText: string) {
       return Response.json({ error: "not found" }, { status: 404 });
     },
   });
+  return Object.assign(server, { submitted });
 }
 
 describe("channel review transport (broker)", () => {
@@ -57,7 +62,7 @@ describe("channel review transport (broker)", () => {
     const server = startMockBroker("MOCK REVIEW: No findings.");
     process.env.CODE_ASSISTANT_PEERS_BROKER_URL = `http://127.0.0.1:${server.port}`;
     try {
-      const reply = await reviewViaBroker("claude-live", "review this", 5000, "", 25);
+      const reply = await reviewViaBroker("claude-live", "review this", 5000, "", null, 25);
       expect(reply.ok).toBe(true);
       expect(reply.text).toContain("MOCK REVIEW");
     } finally {
@@ -67,7 +72,7 @@ describe("channel review transport (broker)", () => {
 
   test("reviewViaBroker fails gracefully when the broker is unreachable", async () => {
     process.env.CODE_ASSISTANT_PEERS_BROKER_URL = "http://127.0.0.1:1";
-    const reply = await reviewViaBroker("claude-live", "review this", 400, "", 25);
+    const reply = await reviewViaBroker("claude-live", "review this", 400, "", null, 25);
     expect(reply.ok).toBe(false);
     expect(reply.error).toBeTruthy();
   });
@@ -102,6 +107,18 @@ describe("channel review transport (broker)", () => {
       expect(result.exitCode).toBe(0);
       expect(result.stdout).toContain("MOCK REVIEW via broker");
       expect(result.command).toEqual(["<broker>", "claude-live"]);
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  test("runReviewCommand forwards the requested model to the broker job", async () => {
+    const server = startMockBroker("MOCK MODELED REVIEW.");
+    process.env.CODE_ASSISTANT_PEERS_BROKER_URL = `http://127.0.0.1:${server.port}`;
+    try {
+      const result = await runReviewCommand("claude-live", process.cwd(), "review this", "opus");
+      expect(result.exitCode).toBe(0);
+      expect(server.submitted[0]?.model).toBe("opus"); // model rides the job to the worker
     } finally {
       server.stop(true);
     }

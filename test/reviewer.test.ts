@@ -7,8 +7,12 @@ import {
   claimNextJob,
   doneMarkerFor,
   extractReviewFromCapture,
+  codexSessionIdFromRolloutPath,
+  findCodexSessionId,
   liveCliKindFor,
+  parseGeminiSessionIndex,
   runReviewerWorker,
+  sessionEnvPrefix,
   sessionNameFor,
   stripRenderedLineNumbers,
 } from "../broker/reviewer.ts";
@@ -18,6 +22,7 @@ interface MockJob {
   reviewer: string;
   prompt: string;
   cwd?: string;
+  model?: string | null;
 }
 
 // In-memory broker exposing exactly the endpoints the reviewer worker uses:
@@ -34,7 +39,7 @@ function startMockBroker(jobs: MockJob[]) {
       const { pathname } = new URL(req.url);
       if (req.method === "GET" && pathname === "/next") {
         const job = queue.shift();
-        return Response.json(job ? { id: job.id, reviewer: job.reviewer, prompt: job.prompt, cwd: job.cwd ?? "" } : { id: null });
+        return Response.json(job ? { id: job.id, reviewer: job.reviewer, prompt: job.prompt, cwd: job.cwd ?? "", model: job.model ?? null } : { id: null });
       }
       const resultMatch = pathname.match(/^\/jobs\/([^/]+)\/result$/);
       if (req.method === "POST" && resultMatch) {
@@ -151,6 +156,31 @@ describe("reviewer worker loop", () => {
     }
   });
 
+  test("the job's requested model is passed through to the session deliver", async () => {
+    const broker = startMockBroker([
+      { id: "m1", reviewer: "claude-live", prompt: "p", cwd: "/repo/a", model: "opus" },
+      { id: "m2", reviewer: "claude-live", prompt: "p", cwd: "/repo/a" }, // no model -> null
+    ]);
+    const seen: Array<{ job: string; model: string | null | undefined }> = [];
+    const session: ReviewerSession = {
+      deliver: async (_p, jobId, _s, model) => {
+        seen.push({ job: jobId, model });
+        return "ok";
+      },
+    };
+    const controller = new AbortController();
+    try {
+      const run = runReviewerWorker({ brokerUrl: broker.url, sessionFor: () => session, signal: controller.signal, pollIntervalMs: 5 });
+      await Bun.sleep(120);
+      controller.abort();
+      await run;
+      expect(seen).toEqual([{ job: "m1", model: "opus" }, { job: "m2", model: null }]);
+    } finally {
+      controller.abort();
+      broker.server.stop(true);
+    }
+  });
+
   test("distinct sessions run in PARALLEL; same-session jobs stay serialized", async () => {
     const broker = startMockBroker([
       { id: "c1", reviewer: "claude-live", prompt: "p", cwd: "/repo/a" },
@@ -209,24 +239,94 @@ describe("reviewer worker loop", () => {
     }
   });
 
-  test("LIVE_CLI_KINDS maps each built-in live adapter to its CLI launch + reset + prompt dir", () => {
+  test("LIVE_CLI_KINDS maps each built-in live adapter to launch/resume commands + strategies", () => {
     expect(Object.keys(LIVE_CLI_KINDS).sort()).toEqual(["claude-live", "codex-live", "gemini-live"]);
 
     const claude = liveCliKindFor("claude-live")!;
-    expect(claude.launchCommand("/repo", claude.promptDir("/repo"))[0]).toBe("claude");
-    expect(claude.launchCommand("/repo", claude.promptDir("/repo"))).toContain("--add-dir");
+    const claudeLaunch = claude.launchCommand("/repo", claude.promptDir("/repo"), "uuid-1", "opus");
+    expect(claudeLaunch[0]).toBe("claude");
+    expect(claudeLaunch).toContain("--add-dir");
+    expect(claudeLaunch.join(" ")).toContain("--session-id uuid-1"); // assigned id baked into launch
+    expect(claudeLaunch.join(" ")).toContain("--model opus"); // first-launch model baked in
+    const claudeResume = claude.resumeCommand(claude.promptDir("/repo"), "uuid-1", "sonnet");
+    expect(claudeResume.join(" ")).toContain("--resume uuid-1");
+    expect(claudeResume.join(" ")).toContain("--model sonnet");
+    expect(claude.idStrategy).toBe("assign");
 
     const gemini = liveCliKindFor("gemini-live")!;
     expect(gemini.promptDir("/repo")).toBe("/repo/.peer-review"); // inside the trusted cwd
-    const gemCmd = gemini.launchCommand("/repo", gemini.promptDir("/repo"));
+    const gemCmd = gemini.launchCommand("/repo", gemini.promptDir("/repo"), "uuid-2", null);
     expect(gemCmd[0]).toBe("gemini");
     expect(gemCmd).not.toContain("--include-directories"); // avoids the second trust prompt
+    expect(gemCmd.join(" ")).toContain("--session-id uuid-2");
+    expect(gemini.resumeCommand("/p", "4", "flash").join(" ")).toContain("--resume 4"); // list INDEX, not uuid
+    expect(gemini.resumeBy).toBe("gemini-index");
 
     const codex = liveCliKindFor("codex-live")!;
-    expect(codex.launchCommand("/repo", codex.promptDir("/repo"))[0]).toBe("codex");
+    const cxLaunch = codex.launchCommand("/repo", codex.promptDir("/repo"), null, "gpt-5.4-mini");
+    expect(cxLaunch[0]).toBe("codex");
+    expect(cxLaunch).not.toContain("--session-id"); // codex cannot assign an id at launch
+    expect(cxLaunch.join(" ")).toContain("-m gpt-5.4-mini");
+    const cxResume = codex.resumeCommand("/p", "rollout-uuid", "gpt-5.4");
+    expect(cxResume.slice(0, 3)).toEqual(["codex", "resume", "rollout-uuid"]);
+    expect(cxResume.join(" ")).toContain("model=");
+    expect(codex.idStrategy).toBe("capture");
     expect(codex.clearCommand).toBe("/new");
 
     expect(liveCliKindFor("unknown-live")).toBeNull();
+  });
+
+  test("codex session id helpers: filename parsing + marker-based capture", async () => {
+    expect(codexSessionIdFromRolloutPath("/x/2026/06/12/rollout-2026-06-12T09-41-24-019eb946-ca67-7221-8e60-9fd5d450f572.jsonl"))
+      .toBe("019eb946-ca67-7221-8e60-9fd5d450f572");
+    expect(codexSessionIdFromRolloutPath("/x/not-a-rollout.txt")).toBeNull();
+
+    const { mkdtemp, mkdir: mkdirP, writeFile: writeF, rm: rmP } = await import("node:fs/promises");
+    const { tmpdir: tmp } = await import("node:os");
+    const { join: j } = await import("node:path");
+    const dir = await mkdtemp(j(tmp(), "codex-sessions-"));
+    try {
+      await mkdirP(j(dir, "2026/06/12"), { recursive: true });
+      const ours = j(dir, "2026/06/12", "rollout-2026-06-12T10-00-00-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl");
+      const theirs = j(dir, "2026/06/12", "rollout-2026-06-12T11-00-00-11111111-2222-3333-4444-555555555555.jsonl");
+      await writeF(ours, JSON.stringify({ text: "instruction with PEER-REVIEW-BEGIN-job-42 marker" }) + "\n");
+      await writeF(theirs, JSON.stringify({ text: "the user own unrelated session" }) + "\n");
+      // finds OURS by marker even though THEIRS is newer (never picks most-recent blindly)
+      expect(await findCodexSessionId(dir, "PEER-REVIEW-BEGIN-job-42")).toBe("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+      expect(await findCodexSessionId(dir, "PEER-REVIEW-BEGIN-job-99")).toBeNull();
+    } finally {
+      await rmP(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("sessionEnvPrefix isolates the session env to the allowlist", () => {
+    const prefix = sessionEnvPrefix({
+      PATH: "/usr/bin",
+      HOME: "/Users/me",
+      TERM: "tmux-256color",
+      CLAUDECODE: "1", // nested-session leakage — must NOT pass through
+      CLAUDE_CODE_SESSION_ID: "parent-session",
+      ANTHROPIC_API_KEY: "sk-secret", // must NOT pass through (subscription auth only)
+      CLAUDE_CONFIG_DIR: "/Users/me/.claude-alt", // allowlisted
+    } as NodeJS.ProcessEnv);
+    expect(prefix.slice(0, 2)).toEqual(["env", "-i"]);
+    expect(prefix).toContain("PATH=/usr/bin");
+    expect(prefix).toContain("CLAUDE_CONFIG_DIR=/Users/me/.claude-alt");
+    expect(prefix).toContain("TERM=tmux-256color");
+    expect(prefix.join(" ")).not.toContain("CLAUDECODE");
+    expect(prefix.join(" ")).not.toContain("CLAUDE_CODE_SESSION_ID");
+    expect(prefix.join(" ")).not.toContain("ANTHROPIC_API_KEY");
+  });
+
+  test("gemini session index parsing matches our uuid, never position", () => {
+    const listing = [
+      "Available sessions for this project (3):",
+      "  1. <session_context> something recent... (1 hour ago) [841a449c-14aa-4b1e-8360-2504038181d1]",
+      "  2. <session_context> the user own session... (2 hours ago) [51272c1b-25e5-42a7-b6ab-8e77a6749710]",
+      "  3. <session_context> ours... (3 hours ago) [03FA3A39-CD84-43c3-9188-7EAE35004BA9]",
+    ].join("\n");
+    expect(parseGeminiSessionIndex(listing, "03fa3a39-cd84-43c3-9188-7eae35004ba9")).toBe("3"); // case-insensitive
+    expect(parseGeminiSessionIndex(listing, "ffffffff-ffff-ffff-ffff-ffffffffffff")).toBeNull();
   });
 
   test("claimNextJob returns null when the broker is unreachable", async () => {
