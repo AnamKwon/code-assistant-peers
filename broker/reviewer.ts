@@ -26,6 +26,65 @@ import { join } from "node:path";
 const DEFAULT_BROKER_URL = "http://127.0.0.1:7899";
 const DEFAULT_POLL_INTERVAL_MS = 1000;
 const DEFAULT_DELIVER_TIMEOUT_MS = 600_000;
+// How long a reviewer (kind × repo) is skipped after it reports a usage/rate limit, when the
+// limit message gives no explicit reset time. Override with CODE_ASSISTANT_PEERS_RATE_LIMIT_COOLDOWN_MS.
+const DEFAULT_RATE_LIMIT_COOLDOWN_MS = 15 * 60_000;
+
+// Thrown when a reviewer's pane shows it has hit a usage/rate limit, so the worker can stop
+// waiting for a marker that will never come and cool the reviewer down instead of retrying.
+export class RateLimitError extends Error {
+  constructor(message: string, readonly resetAtMs: number | null) {
+    super(message);
+    this.name = "RateLimitError";
+  }
+}
+
+// Best-effort detection of a usage/rate-limit notice in a captured pane. Patterns are broad and
+// CLI-agnostic (claude "usage limit"/"plan limit", codex "rate limit", gemini "quota exceeded"/
+// "resource exhausted"/429); a miss simply degrades to the normal deliver timeout, so a false
+// negative is safe. Extra patterns via CODE_ASSISTANT_PEERS_RATE_LIMIT_PATTERNS (comma-separated,
+// case-insensitive substrings). Returns the matched line (for the error message) or null.
+const RATE_LIMIT_PATTERNS = [
+  /\busage limit(?:s)? (?:reached|exceeded)\b/i,
+  /\b(?:rate|usage) limit(?:ed)?\b.*\b(?:reached|exceeded|hit)\b/i,
+  /\bplan limit(?:s)? (?:reached|exceeded)\b/i,
+  // A usage gauge that pairs "limit" with a "resets …" clause on one line is a quota notice, not
+  // review prose (which rarely says both) — covers codex's "5h limit … resets 19:08" style.
+  /\blimit\b[^\n]*\bresets?\b/i,
+  /\bquota exceeded\b/i,
+  /\bresource exhausted\b/i,
+  /\b(?:reached|hit) your .*\blimit\b/i,
+  /\byou(?:'ve| have) (?:reached|hit|exceeded)\b.*\blimit\b/i,
+  /\bout of (?:usage )?credits\b/i,
+  /\b429\b.*\b(?:limit|quota|exhaust)/i,
+  /\btoo many requests\b/i,
+];
+
+export function detectRateLimit(capture: string, extraPatterns: string[] = []): string | null {
+  const lines = capture.split("\n");
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    if (RATE_LIMIT_PATTERNS.some((re) => re.test(line))) return line.trim();
+    const lower = line.toLowerCase();
+    if (extraPatterns.some((p) => p && lower.includes(p.toLowerCase()))) return line.trim();
+  }
+  return null;
+}
+
+// Parse an explicit reset time from a limit notice ("resets 19:08", "resets at 21:05",
+// "resets 16:05 on 19 Jun"). Returns epoch ms for the next occurrence of that HH:MM, or null.
+export function parseResetAtMs(text: string, nowMs: number): number | null {
+  const match = /\bresets?\b[^0-9]{0,8}(\d{1,2}):(\d{2})/i.exec(text);
+  if (!match) return null;
+  const h = Number(match[1]);
+  const m = Number(match[2]);
+  if (h > 23 || m > 59) return null;
+  const now = new Date(nowMs);
+  const reset = new Date(nowMs);
+  reset.setHours(h, m, 0, 0);
+  if (reset.getTime() <= now.getTime()) reset.setTime(reset.getTime() + 24 * 60 * 60_000); // next day
+  return reset.getTime();
+}
 
 export interface ReviewJob {
   id: string;
@@ -54,6 +113,8 @@ export interface ReviewerWorkerOptions {
   pollIntervalMs?: number;
   once?: boolean;
   log?: (message: string) => void;
+  // Cooldown after a reviewer reports a usage/rate limit with no explicit reset time.
+  rateLimitCooldownMs?: number;
 }
 
 // Claim the next pending job from the broker. Returns null when there is nothing to do or the
@@ -113,14 +174,36 @@ export async function runReviewerWorker(options: ReviewerWorkerOptions): Promise
     return session;
   };
 
+  // Reviewers (kind × repo) that hit a usage/rate limit are cooled down until this epoch-ms, so
+  // we stop booting/poking a reviewer that can't answer instead of retrying every job.
+  const cooldownMs = options.rateLimitCooldownMs ?? DEFAULT_RATE_LIMIT_COOLDOWN_MS;
+  const blockedUntil = new Map<string, number>();
+  const now = () => Date.now();
+
   // processJob never rejects — failures are reported to the broker as job errors.
   const processJob = async (job: ReviewJob): Promise<void> => {
+    const key = `${job.reviewer}|${job.cwd}`;
+    const blocked = blockedUntil.get(key);
+    if (blocked && now() < blocked) {
+      const mins = Math.ceil((blocked - now()) / 60_000);
+      const msg = `reviewer ${job.reviewer} is rate-limited (cooling down ~${mins} min); skipped without retry — use another peer or wait`;
+      await postError(brokerUrl, job.id, msg).catch(() => {});
+      log(`job ${job.id} skipped: ${msg}`);
+      return;
+    }
     log(`claimed job ${job.id} (${job.reviewer}, cwd=${job.cwd || "(default)"})`);
     try {
       const review = await resolveSession(job.reviewer, job.cwd).deliver(job.prompt, job.id, signal, job.model);
       await postResult(brokerUrl, job.id, review);
       log(`job ${job.id} reviewed (${review.length} chars)`);
     } catch (error) {
+      if (error instanceof RateLimitError) {
+        const until = error.resetAtMs && error.resetAtMs > now() ? error.resetAtMs : now() + cooldownMs;
+        blockedUntil.set(key, until);
+        log(`job ${job.id} failed (rate limit); cooling down ${job.reviewer} until ${new Date(until).toISOString()}`);
+        await postError(brokerUrl, job.id, error.message).catch(() => {});
+        return;
+      }
       const message = error instanceof Error ? error.message : String(error);
       await postError(brokerUrl, job.id, `reviewer worker failed: ${message}`).catch(() => {});
       log(`job ${job.id} failed: ${message}`);
@@ -269,6 +352,8 @@ export interface TmuxSessionConfig {
   startupTimeoutMs: number;
   deliverTimeoutMs: number;
   pollIntervalMs: number;
+  // Extra case-insensitive substrings that mark a usage/rate-limit notice in the pane.
+  rateLimitPatterns: string[];
 }
 
 // Read-only launch: plan mode + edit tools disallowed so a reviewed diff containing injected
@@ -379,6 +464,13 @@ export class TmuxCliSession implements ReviewerSession {
         const capture = await this.capture();
         const review = extractReviewFromCapture(capture, jobId);
         if (review !== null) return review;
+        // Stop early if the reviewer reports a usage/rate limit — the marker will never arrive,
+        // so fail fast (and let the worker cool this reviewer down) instead of polling for the
+        // full deliver timeout.
+        const limited = detectRateLimit(capture, this.config.rateLimitPatterns);
+        if (limited) {
+          throw new RateLimitError(`reviewer hit its usage/rate limit: ${limited}`, parseResetAtMs(limited, Date.now()));
+        }
       }
       throw new Error(`timed out after ${deliverTimeoutMs}ms waiting for the review marker in the live session`);
     } finally {
@@ -616,6 +708,7 @@ async function main(): Promise<void> {
       startupTimeoutMs: envInt("CODE_ASSISTANT_PEERS_REVIEWER_STARTUP_MS", 30_000),
       deliverTimeoutMs: envInt("CODE_ASSISTANT_PEERS_REVIEW_TIMEOUT_MS", DEFAULT_DELIVER_TIMEOUT_MS),
       pollIntervalMs: envInt("CODE_ASSISTANT_PEERS_REVIEWER_POLL_MS", DEFAULT_POLL_INTERVAL_MS),
+      rateLimitPatterns: (process.env.CODE_ASSISTANT_PEERS_RATE_LIMIT_PATTERNS ?? "").split(",").map((p) => p.trim()).filter(Boolean),
     });
   };
 
@@ -625,6 +718,7 @@ async function main(): Promise<void> {
     sessionFor,
     signal: controller.signal,
     once,
+    rateLimitCooldownMs: envInt("CODE_ASSISTANT_PEERS_RATE_LIMIT_COOLDOWN_MS", DEFAULT_RATE_LIMIT_COOLDOWN_MS),
     log: (message) => console.error(`[reviewer] ${message}`),
   });
   releaseLock?.();

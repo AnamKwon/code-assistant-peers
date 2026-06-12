@@ -136,6 +136,8 @@ CODE_ASSISTANT_PEERS_REVIEWER_CWD="$PWD" bun broker/reviewer.ts
 | `CODE_ASSISTANT_PEERS_REVIEWER_PROMPT_DIR` | per-kind | override where the per-job prompt file is written (claude/codex: a tmp dir; gemini: `<cwd>/.peer-review`) |
 | `CODE_ASSISTANT_PEERS_REVIEWER_CLEAR` | keep memory | DEFAULT keeps the session's conversation memory across reviews (note the session is per-REPO, so other tasks' history accumulates too, and a long-lived context will eventually auto-compact). `always` clears before every review for isolated rounds; `never` is a legacy alias for the default |
 | `CODE_ASSISTANT_PEERS_REVIEWER_STARTUP_MS` | `30000` | how long to wait for the TUI to boot |
+| `CODE_ASSISTANT_PEERS_RATE_LIMIT_PATTERNS` | unset | extra comma-separated, case-insensitive substrings that mark a usage/rate-limit notice |
+| `CODE_ASSISTANT_PEERS_RATE_LIMIT_COOLDOWN_MS` | `900000` | how long a rate-limited reviewer is skipped when the notice gives no explicit reset time |
 | `CODE_ASSISTANT_PEERS_REVIEW_TIMEOUT_MS` | `600000` | per-review deliver timeout |
 | `CODE_ASSISTANT_PEERS_REVIEWER_POLL_MS` | `1000` | pane poll interval |
 
@@ -188,6 +190,23 @@ user-launched session, or codex before its first review), the switch restarts FR
 
 Submission is echo-verified: a TUI that is still settling after a resume can swallow keystrokes,
 so the worker re-sends the instruction (up to 3 times) until its BEGIN marker appears in the pane.
+
+## Usage / rate-limit handling
+
+If a reviewer CLI runs out of its plan/usage limit, its TUI never emits the review markers — so
+the worker would otherwise poll for the full deliver timeout (default 10 min) and then fall back
+to spawning the same headless CLI (also limited). Instead:
+
+- **Fast detection**: each poll scans the pane for a usage/rate-limit notice (claude "usage/plan
+  limit reached", codex "… limit … resets …", gemini "quota exceeded"/"resource exhausted"/429,
+  etc.). On a match the review fails immediately with a clear `usage/rate limit` error instead of
+  timing out. Add CLI-specific phrases via `CODE_ASSISTANT_PEERS_RATE_LIMIT_PATTERNS`
+  (comma-separated, case-insensitive). A miss safely degrades to the normal timeout.
+- **Cooldown (no retry storm)**: the worker then blocks that reviewer (kind × repo) until the
+  message's "resets HH:MM" time, or `CODE_ASSISTANT_PEERS_RATE_LIMIT_COOLDOWN_MS` (default 15 min)
+  if none is given. Jobs for a cooled-down reviewer are skipped immediately with a
+  `reviewer X is rate-limited` error — **no session boot, no waiting**. Other reviewers are
+  unaffected, so a multi-peer review keeps running on the models that still have budget.
 
 ## Session environment isolation
 

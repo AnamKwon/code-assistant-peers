@@ -3,14 +3,17 @@ import {
   LIVE_CLI_KINDS,
   type ReviewerSession,
   acquireWorkerLock,
+  RateLimitError,
   beginMarkerFor,
   claimNextJob,
+  detectRateLimit,
   doneMarkerFor,
   extractReviewFromCapture,
   codexSessionIdFromRolloutPath,
   findCodexSessionId,
   liveCliKindFor,
   parseGeminiSessionIndex,
+  parseResetAtMs,
   runReviewerWorker,
   sessionEnvPrefix,
   sessionNameFor,
@@ -210,6 +213,38 @@ describe("reviewer worker loop", () => {
       expect(broker.results.get("c1")?.result).toContain("done");
       expect(broker.results.get("g1")?.result).toContain("done");
       expect(broker.results.get("c2")?.result).toContain("done");
+    } finally {
+      controller.abort();
+      broker.server.stop(true);
+    }
+  });
+
+  test("a rate-limited reviewer is cooled down: later jobs are skipped without retry", async () => {
+    const broker = startMockBroker([
+      { id: "r1", reviewer: "claude-live", prompt: "p", cwd: "/repo/a" }, // hits the limit
+      { id: "r2", reviewer: "claude-live", prompt: "p", cwd: "/repo/a" }, // same reviewer -> skipped
+      { id: "ok", reviewer: "gemini-live", prompt: "p", cwd: "/repo/a" }, // different reviewer -> runs
+    ]);
+    let claudeDelivers = 0;
+    const sessionFor = (reviewer: string): ReviewerSession => ({
+      deliver: async () => {
+        if (reviewer === "claude-live") {
+          claudeDelivers++;
+          throw new RateLimitError("reviewer hit its usage/rate limit: usage limit reached", null);
+        }
+        return "patch is correct";
+      },
+    });
+    const controller = new AbortController();
+    try {
+      const run = runReviewerWorker({ brokerUrl: broker.url, sessionFor, signal: controller.signal, pollIntervalMs: 5, rateLimitCooldownMs: 60_000 });
+      await Bun.sleep(160);
+      controller.abort();
+      await run;
+      expect(claudeDelivers).toBe(1); // r1 tried once; r2 skipped WITHOUT calling deliver again
+      expect(broker.results.get("r1")?.error).toContain("usage/rate limit");
+      expect(broker.results.get("r2")?.error).toContain("rate-limited");
+      expect(broker.results.get("ok")?.result).toContain("patch is correct"); // other reviewer unaffected
     } finally {
       controller.abort();
       broker.server.stop(true);
@@ -417,6 +452,29 @@ describe("review extraction from a captured pane", () => {
 
   // Regression: the Gemini TUI renders responses with leading line numbers, which leaked into
   // the extracted review ("2 I am Gemini..."). Strip only under the conservative signature.
+  test("detectRateLimit matches usage/rate-limit notices across CLIs but not normal review text", () => {
+    expect(detectRateLimit("...\n  5h limit reached, resets 19:08\n...")).toContain("resets 19:08");
+    expect(detectRateLimit("Error: quota exceeded for this project")).toContain("quota exceeded");
+    expect(detectRateLimit("429 Too Many Requests")).toBeTruthy();
+    expect(detectRateLimit("You have reached your weekly usage limit")).toBeTruthy();
+    // normal review content must NOT trip it
+    expect(detectRateLimit("No findings. The diff stays within the rate limiter's bounds.")).toBeNull();
+    expect(detectRateLimit("patch is correct")).toBeNull();
+    // custom extra pattern
+    expect(detectRateLimit("PLAN_CAP_HIT code 7", ["plan_cap_hit"])).toBeTruthy();
+  });
+
+  test("parseResetAtMs reads an explicit reset time as the next occurrence", () => {
+    const noon = new Date("2026-06-12T12:00:00").getTime();
+    const at1305 = parseResetAtMs("resets 13:05", noon)!;
+    expect(new Date(at1305).getHours()).toBe(13);
+    expect(new Date(at1305).getMinutes()).toBe(5);
+    // a time already past today rolls to tomorrow
+    const at1100 = parseResetAtMs("resets at 11:00", noon)!;
+    expect(at1100).toBeGreaterThan(noon);
+    expect(parseResetAtMs("no reset here", noon)).toBeNull();
+  });
+
   test("strips Gemini's rendered line numbers but never genuine content", () => {
     expect(stripRenderedLineNumbers(" 2 I am Gemini, trained by Google.\n 3 The channel works.")).toBe(
       "I am Gemini, trained by Google.\nThe channel works.",
