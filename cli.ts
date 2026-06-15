@@ -575,12 +575,16 @@ function validateSetupPeers(targets: readonly ("claude" | "codex")[], peers: str
   if (!peers) return;
   const peerSet = new Set(peers.split(","));
   for (const target of targets) {
-    const remainingPeers = [...peerSet].filter((peer) => peer !== target);
+    const remainingPeers = [...peerSet].filter((peer) => setupBaseAssistantId(peer) !== target);
     if (remainingPeers.length === 0) {
       console.error(`--peers=${peers} leaves no peer reviewer for HOST_ASSISTANT=${target}. Include at least one assistant different from ${target}.`);
       process.exit(1);
     }
   }
+}
+
+function setupBaseAssistantId(id: string): string {
+  return id.endsWith("-live") ? id.slice(0, -"-live".length) : id;
 }
 
 function validateSetupTargetsAvailable(
