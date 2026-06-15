@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { runReviewerWorker, type ReviewerSession } from "./broker/reviewer.ts";
+import { runReviewerWorker, type ReviewerSession } from "../broker/reviewer.ts";
 
 function startMockBroker(jobs: any[]) {
   const queue = [...jobs];
