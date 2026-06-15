@@ -18,13 +18,15 @@
 //       bun broker/reviewer.ts --once     # process at most one job then exit (verification)
 //       bun broker/reviewer.ts --echo     # fake session that echoes the prompt (no claude; dev)
 
-import { closeSync, openSync, readFileSync, unlinkSync, writeSync } from "node:fs";
-import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, unlinkSync, writeSync } from "node:fs";
+import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { codexReviewerInstructionsFor, liveReviewerSystemPromptFor, toTomlBasicString } from "../shared/review-prompts.ts";
 
 const DEFAULT_BROKER_URL = "http://127.0.0.1:7899";
-const DEFAULT_POLL_INTERVAL_MS = 1000;
+const DEFAULT_POLL_INTERVAL_MS = 250; // reduced from 1000ms — all polling layers share this
 const DEFAULT_DELIVER_TIMEOUT_MS = 600_000;
 // How long a reviewer (kind × repo) is skipped after it reports a usage/rate limit, when the
 // limit message gives no explicit reset time. Override with CODE_ASSISTANT_PEERS_RATE_LIMIT_COOLDOWN_MS.
@@ -115,6 +117,10 @@ export interface ReviewerWorkerOptions {
   log?: (message: string) => void;
   // Cooldown after a reviewer reports a usage/rate limit with no explicit reset time.
   rateLimitCooldownMs?: number;
+  // Maximum number of (reviewer, cwd) sessions running concurrently. Default 8. Lower values
+  // reduce the number of jobs that would be permanently lost if the worker crashes; higher values
+  // allow more parallelism. Must be >= 1.
+  maxConcurrentSessions?: number;
 }
 
 // Claim the next pending job from the broker. Returns null when there is nothing to do or the
@@ -148,15 +154,19 @@ async function postError(brokerUrl: string, jobId: string, error: string): Promi
   });
 }
 
+// Reclaim jobs left in "claimed" state by a previous worker instance (crash/restart).
+// Called at worker startup so stale claimed jobs become visible to GET /next again.
+async function reclaimStaleClaims(brokerUrl: string): Promise<void> {
+  const res = await fetch(`${brokerUrl}/reclaim`, { method: "POST" }).catch(() => null);
+  if (res?.ok) {
+    const body = (await res.json().catch(() => ({}))) as { reclaimed?: number };
+    if (body.reclaimed) console.error(`[reviewer] reclaimed ${body.reclaimed} stale claimed job(s) from prior worker`);
+  }
+}
+
 // The worker loop: claim → deliver to the live session → report result/error. Bounded only by
 // the abort signal. A failed delivery is reported as a job error (not a crash) so one bad review
 // never takes the worker down.
-//
-// Concurrency model: jobs for DIFFERENT sessions (reviewer kind × repo) run in PARALLEL — a
-// multi-peer review that fans out to claude-live + gemini-live + codex-live boots and runs all
-// three TUIs concurrently instead of paying their wall-clock times in sequence. Jobs for the
-// SAME session are serialized via a per-session promise chain, because one TUI cannot interleave
-// two reviews (send-keys/capture would corrupt both).
 export async function runReviewerWorker(options: ReviewerWorkerOptions): Promise<void> {
   const { brokerUrl, sessionFor, signal } = options;
   const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
@@ -180,93 +190,171 @@ export async function runReviewerWorker(options: ReviewerWorkerOptions): Promise
   const blockedUntil = new Map<string, number>();
   const now = () => Date.now();
 
-  // processJob never rejects — failures are reported to the broker as job errors.
-  const processJob = async (job: ReviewJob): Promise<void> => {
-    const key = `${job.reviewer}|${job.cwd}`;
-    const blocked = blockedUntil.get(key);
-    if (blocked && now() < blocked) {
-      const mins = Math.ceil((blocked - now()) / 60_000);
-      const msg = `reviewer ${job.reviewer} is rate-limited (cooling down ~${mins} min); skipped without retry — use another peer or wait`;
-      await postError(brokerUrl, job.id, msg).catch(() => {});
-      log(`job ${job.id} skipped: ${msg}`);
-      return;
-    }
-    log(`claimed job ${job.id} (${job.reviewer}, cwd=${job.cwd || "(default)"})`);
-    try {
-      const review = await resolveSession(job.reviewer, job.cwd).deliver(job.prompt, job.id, signal, job.model);
-      await postResult(brokerUrl, job.id, review);
-      log(`job ${job.id} reviewed (${review.length} chars)`);
-    } catch (error) {
-      if (error instanceof RateLimitError) {
-        const until = error.resetAtMs && error.resetAtMs > now() ? error.resetAtMs : now() + cooldownMs;
-        blockedUntil.set(key, until);
-        log(`job ${job.id} failed (rate limit); cooling down ${job.reviewer} until ${new Date(until).toISOString()}`);
-        await postError(brokerUrl, job.id, error.message).catch(() => {});
-        return;
-      }
-      const message = error instanceof Error ? error.message : String(error);
-      await postError(brokerUrl, job.id, `reviewer worker failed: ${message}`).catch(() => {});
-      log(`job ${job.id} failed: ${message}`);
-    }
-  };
+  // Reclaim jobs left in "claimed" by a crashed/replaced prior worker so they become visible
+  // to GET /next again. Best-effort — ignore if broker is unreachable.
+  await reclaimStaleClaims(brokerUrl);
 
-  // Tail of the in-order work chain per session key. Chaining serializes same-session jobs while
-  // distinct sessions proceed independently (= in parallel).
-  const chains = new Map<string, Promise<void>>();
+  // Per-(reviewer, cwd) promise chain: jobs for the SAME session run sequentially
+  // (they share one tmux TUI), while jobs for DIFFERENT sessions run concurrently.
+  // Each new job is appended to the tail of its session's chain and starts as soon
+  // as the prior job for that session finishes — without blocking other sessions.
+  const chainByKey = new Map<string, Promise<void>>();
+  // runningCount: number of jobs CURRENTLY EXECUTING — jobs at the head of their chain.
+  // Same-key queued jobs (waiting behind the head) are NOT counted; they queue internally
+  // without consuming a running slot or blocking other pairs from being claimed.
+  let runningCount = 0;
+  // Max active sessions (heads of chains actually executing). Enforce >= 1 so the loop can
+  // always make progress; a value of 0 would deadlock the gate immediately.
+  const MAX_CONCURRENT_RUNNING = Math.max(1, options.maxConcurrentSessions ?? 8);
+
+  const enqueueJob = (job: ReviewJob): void => {
+    const key = `${job.reviewer}|${job.cwd || ""}`;
+    // A job for a key with no existing chain starts immediately (head-of-chain = running now).
+    // Count it synchronously so the gate in the main loop sees the correct running count
+    // before the next await. A queued job (key already has an active chain) defers its
+    // increment until it actually starts executing — its chain predecessor is the running job.
+    const isNewKey = !chainByKey.has(key);
+    if (isNewKey) runningCount++;
+
+    const previous = chainByKey.get(key) ?? Promise.resolve();
+    const jobPromise: Promise<void> = previous.then(async () => {
+      if (!isNewKey) runningCount++; // same-key queued job: increment when predecessor finishes
+      try {
+        // Rate-limit cooldown check: if this reviewer+cwd is blocked, fail fast instead of
+        // starting a session that will immediately reject jobs anyway.
+        const blocked = blockedUntil.get(key);
+        if (blocked && now() < blocked) {
+          const mins = Math.ceil((blocked - now()) / 60_000);
+          const msg = `reviewer ${job.reviewer} is rate-limited (cooling down ~${mins} min); skipped without retry — use another peer or wait`;
+          await postError(brokerUrl, job.id, msg).catch(() => {});
+          log(`job ${job.id} skipped: ${msg}`);
+          return;
+        }
+        const review = await resolveSession(job.reviewer, job.cwd).deliver(job.prompt, job.id, signal, job.model);
+        await postResult(brokerUrl, job.id, review);
+        log(`job ${job.id} reviewed (${review.length} chars)`);
+      } catch (error) {
+        if (error instanceof RateLimitError) {
+          const until = error.resetAtMs && error.resetAtMs > now() ? error.resetAtMs : now() + cooldownMs;
+          blockedUntil.set(key, until);
+          log(`job ${job.id} failed (rate limit); cooling down ${job.reviewer} until ${new Date(until).toISOString()}`);
+          await postError(brokerUrl, job.id, error.message).catch(() => {});
+          return;
+        }
+        const message = error instanceof Error ? error.message : String(error);
+        await postError(brokerUrl, job.id, `reviewer worker failed: ${message}`).catch(() => {});
+        log(`job ${job.id} failed: ${message}`);
+      } finally {
+        runningCount--;
+      }
+    }).finally(() => {
+      if (chainByKey.get(key) === jobPromise) chainByKey.delete(key);
+    });
+
+    chainByKey.set(key, jobPromise);
+  };
 
   try {
     while (!signal.aborted) {
-      const job = await claimNextJob(brokerUrl, signal);
-      if (!job) {
-        if (options.once) return;
+      // Back-pressure: gate on currently RUNNING jobs, not total claimed.
+      // A same-key backlog queues internally without counting against this limit,
+      // so unrelated pairs can always start running in their own sessions.
+      if (runningCount >= MAX_CONCURRENT_RUNNING) {
         await sleep(pollIntervalMs, signal);
         continue;
       }
 
-      if (options.once) {
-        await processJob(job);
-        return;
+      const job = await claimNextJob(brokerUrl, signal);
+      if (!job) {
+        if (options.once) {
+          // Drain: wait for all in-flight chains before returning.
+          await Promise.all([...chainByKey.values()]);
+          return;
+        }
+        await sleep(pollIntervalMs, signal);
+        continue;
       }
 
-      const key = `${job.reviewer}|${job.cwd}`;
-      const next = (chains.get(key) ?? Promise.resolve()).then(() => processJob(job));
-      chains.set(key, next);
-      // Drop the entry once it settles IF it is still the tail, so the Map stays proportional to
-      // in-flight sessions rather than every distinct repo the worker ever touched.
-      void next.finally(() => {
-        if (chains.get(key) === next) chains.delete(key);
-      });
-      // Loop straight back to claim the next job — concurrent sessions start immediately.
+      log(`claimed job ${job.id} (${job.reviewer}, cwd=${job.cwd || "(default)"})`);
+      enqueueJob(job);
+      // Do NOT await — immediately loop back to claim the next job.
     }
   } finally {
-    // Let in-flight reviews finish reporting before tearing the sessions down.
-    await Promise.allSettled([...chains.values()]);
+    // On shutdown, wait for in-flight jobs to complete so results are posted before exit.
+    await Promise.all([...chainByKey.values()]).catch(() => {});
     for (const session of sessions.values()) await session.close?.();
   }
 }
 
 // ---------------------------------------------------------------------------
 // Output extraction (pure, unit-tested)
-//
-// We instruct the live session to WRAP its review between two unique-per-job markers: a BEGIN
-// marker printed immediately before the review body and a DONE marker on the final line. Each
-// marker also appears once where our instruction is echoed into the input, so the review is
-// complete only when each marker appears at least twice (echo + emitted). We take the text
-// between the LAST BEGIN and the LAST DONE occurrence — this structurally excludes the echoed
-// instruction, any preamble narration, and tool-status chrome printed before the body (which the
-// old single-end-marker scheme could only filter heuristically). Per-job-unique markers mean
-// stale markers from prior jobs in the scrollback never match.
 // ---------------------------------------------------------------------------
 
-// Plain hyphenated tokens only — NO angle brackets, backticks, or markdown-special chars. The
-// Claude TUI/markdown renderer mangles bracketed markers (e.g. `<<<x>>>` renders as `<<x>>`),
-// which broke marker matching. Letters/digits/hyphens/underscores survive rendering intact.
+// Plain hyphenated tokens only — NO angle brackets, backticks, or markdown-special chars.
 export function beginMarkerFor(jobId: string): string {
   return `PEER-REVIEW-BEGIN-${jobId}`;
 }
 
 export function doneMarkerFor(jobId: string): string {
   return `PEER-REVIEW-DONE-${jobId}-END`;
+}
+
+// outputFile: when provided, Claude is instructed to write the review to this file (primary
+// transport). When absent, falls back to the terminal-print protocol (capture-pane extraction).
+export function wrapLiveReviewPrompt(
+  prompt: string,
+  begin: string,
+  done: string,
+  outputFile?: string,
+  writeMethod: "write_file_tool" | "shell" = "write_file_tool",
+): string {
+  if (outputFile) {
+    const writeRule = writeMethod === "shell"
+      ? "- Use a bash shell command (e.g. cat/tee/printf) to write the file. Do NOT use MCP tools."
+      : "- Use the native write_file tool to create the file. Do NOT use shell run_shell_command or MCP tools.";
+    return [
+      "LIVE REVIEW FILE OUTPUT REQUIREMENTS",
+      "",
+      `Write your complete review to this file: ${outputFile}`,
+      "",
+      "The file content must begin with the BEGIN marker line and end with the DONE marker line.",
+      "The BEGIN marker is formed by concatenating these parts with no separator:",
+      ...markerParts(begin).map((part) => `- ${part}`),
+      "The DONE marker is formed by concatenating these parts with no separator:",
+      ...markerParts(done).map((part) => `- ${part}`),
+      "",
+      "Rules:",
+      writeRule,
+      "- Write the BEGIN and DONE marker lines as plain text with no indentation, markdown fencing, or quoting.",
+      "- Do not omit the marker lines even if the review instructions below specify another output format.",
+      "- ALSO print the BEGIN marker, the full review, and the DONE marker to the terminal (in addition",
+      "  to writing the file). This ensures the worker can extract the review if the file write fails.",
+      "",
+      "REVIEW INSTRUCTIONS",
+      "",
+      prompt,
+    ].join("\n");
+  }
+  return [
+    "LIVE REVIEW TRANSPORT REQUIREMENTS",
+    "",
+    "Before writing any review content, print the BEGIN marker line formed by concatenating these parts with no separator:",
+    ...markerParts(begin).map((part) => `- ${part}`),
+    "After the full review, print the DONE marker line formed by concatenating these parts with no separator:",
+    ...markerParts(done).map((part) => `- ${part}`),
+    "Do not omit these marker lines, even if the review instructions below specify another output format.",
+    "Do not quote, indent, wrap, or put markdown around the marker lines.",
+    "",
+    "REVIEW INSTRUCTIONS",
+    "",
+    prompt,
+  ].join("\n");
+}
+
+function markerParts(marker: string): string[] {
+  const match = marker.match(/^(PEER-REVIEW-(?:BEGIN|DONE)-)(.+?)(-END)?$/);
+  if (!match) return [marker];
+  return [match[1], match[2], match[3] ?? ""].filter(Boolean);
 }
 
 // Returns the review text if the capture shows a completed review (both markers EMITTED by the
@@ -279,20 +367,15 @@ export function extractReviewFromCapture(capture: string, jobId: string): string
   if (firstBegin === -1 || firstDone === -1) return null;
   const lastBegin = capture.lastIndexOf(begin);
   const lastDone = capture.lastIndexOf(done);
-  // Each marker appears once in the echoed instruction; require a second (emitted) occurrence of
-  // both, in order, so the echo alone (which contains BEGIN then DONE) never matches.
   if (lastBegin === firstBegin || lastDone === firstDone) return null;
-  if (lastDone <= lastBegin) return null; // mid-repaint / out-of-order — keep polling
+  if (lastDone <= lastBegin) return null;
 
   const between = capture.slice(lastBegin + begin.length, lastDone);
   return stripRenderedLineNumbers(cleanCapturedReview(between));
 }
 
-// The Gemini TUI renders responses with leading line numbers (" 2 I am Gemini...", " 3 ..."),
-// which leak into the captured body. Strip them only under a conservative signature so genuine
-// content is never mangled: at least two non-empty lines AND every non-empty line starts with a
-// bare integer (followed by whitespace) AND those integers are strictly increasing. Markdown
-// lists ("1. foo") don't match (dot, not whitespace, follows the digits).
+// The Gemini TUI renders responses with leading line numbers. Strip them only under a conservative
+// signature so genuine content is never mangled.
 export function stripRenderedLineNumbers(text: string): string {
   const lines = text.split("\n");
   const numbered = lines
@@ -309,55 +392,91 @@ export function stripRenderedLineNumbers(text: string): string {
     .trim();
 }
 
-// Strip TUI chrome from scraped pane text: box-drawing borders, the leading "> " input echo,
-// and blank padding. Best-effort — the pane is a rendered screen, not a clean stream.
+// Strip TUI chrome from scraped pane text.
 function cleanCapturedReview(text: string): string {
   const lines = text
     .split("\n")
     .map((line) =>
       line
-        // Drop tmux/Claude TUI box-drawing border characters and trailing whitespace.
         .replace(/[│┃|]\s?/g, "")
         .replace(/[─━╭╮╰╯┌┐└┘]/g, "")
-        // Strip the leading response bullet glyph Claude prints before assistant text.
         .replace(/^\s*[⏺●○•]\s?/, "")
         .replace(/\s+$/g, ""),
     )
-    // Drop Claude tool-call status chrome (never review content), e.g. "Read 1 file (ctrl+o to
-    // expand)" or other "(ctrl+o to expand)" affordances captured from the rendered pane.
     .filter((line) => !/\(ctrl\+o to expand\)/.test(line) && !/^\s*Read \d+ file\b/.test(line));
-  // Trim leading/trailing blank lines.
   while (lines.length && lines[0].trim() === "") lines.shift();
   while (lines.length && lines[lines.length - 1].trim() === "") lines.pop();
   return lines.join("\n").trim();
 }
 
+// Reads the output file written by Claude's Write tool.
+export async function extractReviewFromFile(outputFile: string, jobId: string): Promise<string | null> {
+  let content: string;
+  try {
+    content = await readFile(outputFile, "utf8");
+  } catch {
+    return null;
+  }
+  const begin = beginMarkerFor(jobId);
+  const done = doneMarkerFor(jobId);
+  const beginIdx = content.indexOf(begin);
+  const doneIdx = content.indexOf(done);
+  if (beginIdx === -1 || doneIdx === -1 || doneIdx <= beginIdx) return null;
+  const body = content.slice(beginIdx + begin.length, doneIdx);
+  return body.replace(/^\n+/, "").replace(/\n+$/, "").trim();
+}
+
+// Deletes output files older than maxAgeMs from promptDir.
+export async function sweepOrphanedOutputFiles(promptDir: string, maxAgeMs = 2 * 60 * 60 * 1000): Promise<void> {
+  try {
+    const files = await readdir(promptDir);
+    const now = Date.now();
+    await Promise.all(
+      files
+        .filter((f) => f.endsWith("-output.md"))
+        .map(async (f) => {
+          const filePath = join(promptDir, f);
+          const s = await stat(filePath).catch(() => null);
+          if (s && now - s.mtimeMs > maxAgeMs) await rm(filePath, { force: true }).catch(() => {});
+        }),
+    );
+  } catch {
+    // promptDir may not exist yet; that is fine.
+  }
+}
+
 // ---------------------------------------------------------------------------
-// tmux-driven interactive CLI session (the real backend) — generic over the reviewer CLI
-// (claude / gemini / codex), parameterized by launch command and conversation-reset command.
+// tmux-driven interactive CLI session
 // ---------------------------------------------------------------------------
 
 export interface TmuxSessionConfig {
   sessionName: string;
   cwd: string;
-  // Dir the per-job prompt files are written to. Must be readable by the session.
+  launchCommand: string[];
+  launchCommandForModel?: (model: string | null, sessionId: string | null) => string[];
+  resumeCommandForModel?: (sessionId: string, model: string | null) => string[];
+  initialSessionId?: string | null;
+  initialModel?: string | null;
+  hasPersistedSessionId: boolean;
+  stateKey: string;
+  discoverSessionId?: (cwd: string) => Promise<string | null>;
   promptDir: string;
-  // CLI kind: command building (launch/resume), session-id strategy, conversation reset command.
-  kind: LiveCliKind;
-  // Send the kind's clear command before each review. Default FALSE (keep conversation memory
-  // across reviews); set CODE_ASSISTANT_PEERS_REVIEWER_CLEAR=always for isolated reviews. Keeping
-  // memory means the per-REPO session also accumulates other tasks' history and will eventually
-  // auto-compact.
+  clearCommand: string | null;
   clearBetweenReviews: boolean;
   startupTimeoutMs: number;
   deliverTimeoutMs: number;
   pollIntervalMs: number;
+  useOutputFile: boolean;
+  policyFile?: { path: string; content: string };
+  freshSessionId?: () => string;
+  outputFileWriteMethod: "write_file_tool" | "shell";
   // Extra case-insensitive substrings that mark a usage/rate-limit notice in the pane.
-  rateLimitPatterns: string[];
+  rateLimitPatterns?: string[];
+  devLog?: DevLogger;
 }
 
-// Read-only launch: plan mode + edit tools disallowed so a reviewed diff containing injected
-// instructions still cannot modify files (same safety model as the `claude -p` reviewer).
+type DevLogger = (event: string, data?: Record<string, unknown>) => void;
+
 export const DEFAULT_REVIEWER_CLAUDE_ARGS = [
   "--permission-mode",
   "plan",
@@ -367,114 +486,221 @@ export const DEFAULT_REVIEWER_CLAUDE_ARGS = [
   "Edit,Write,MultiEdit,NotebookEdit",
 ];
 
+export function buildDefaultReviewerClaudeArgs(promptDir: string, workflow: "review_only" | "peer_fix"): string[] {
+  return [
+    "--permission-mode",
+    "plan",
+    "--append-system-prompt",
+    liveReviewerSystemPromptFor(workflow),
+    "--allowedTools",
+    [
+      "Read",
+      "Grep",
+      "Glob",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git show:*)",
+      "Bash(git log:*)",
+      "Bash(git ls-files:*)",
+      `Write(${promptDir}:*)`,
+    ].join(","),
+    "--disallowedTools",
+    "Edit,MultiEdit,NotebookEdit",
+  ];
+}
+
+export function resolveReviewerWorkflow(env: NodeJS.ProcessEnv = process.env): "review_only" | "peer_fix" {
+  const val = env.CODE_ASSISTANT_PEERS_REVIEWER_WORKFLOW ?? env.CODE_ASSISTANT_PEERS_WORKFLOW;
+  return val === "peer_fix" ? "peer_fix" : "review_only";
+}
+
+export const REVIEWER_CODEX_HOME = join(tmpdir(), "peer-reviewer-codex-home");
+
+function setupReviewerCodexHome(workspaceCwd: string): void {
+  mkdirSync(REVIEWER_CODEX_HOME, { recursive: true });
+
+  for (const name of ["auth.json", "installation_id"] as const) {
+    const dst = join(REVIEWER_CODEX_HOME, name);
+    try {
+      if (!require("node:fs").existsSync(dst)) {
+        require("node:fs").copyFileSync(join(homedir(), ".codex", name), dst);
+      }
+    } catch { /* source may not exist */ }
+  }
+
+  const userConfigPath = join(homedir(), ".codex", "config.toml");
+  let userConfig = "";
+  try { userConfig = readFileSync(userConfigPath, "utf8"); } catch { /* ok */ }
+
+  const extractSection = (src: string, header: string): string => {
+    const start = src.indexOf(`[${header}]`);
+    if (start === -1) return "";
+    const end = src.indexOf("\n[", start + 1);
+    return src.slice(start, end === -1 ? undefined : end).trimEnd();
+  };
+  const nuxSection = extractSection(userConfig, "tui.model_availability_nux") ||
+    `[tui.model_availability_nux]\n"gpt-5.5" = 4`;
+  const migrationsSection = extractSection(userConfig, "notice.model_migrations") ||
+    `[notice.model_migrations]\n"gpt-5.4" = "gpt-5.5"`;
+
+  const configPath = join(REVIEWER_CODEX_HOME, "config.toml");
+  let existing = "";
+  try { existing = readFileSync(configPath, "utf8"); } catch { /* first run */ }
+
+  const configLines = [
+    "# reviewer session: no MCP servers, workspace trusted",
+    'model = "gpt-5.5"',
+    'model_reasoning_effort = "medium"',
+    'service_tier = "fast"',
+    "",
+  ];
+
+  const projectMatches = [...existing.matchAll(/\[projects\."([^"]+)"\][^\[]+/g)];
+  const trustedCwds = new Set<string>(projectMatches.map((m) => m[1]));
+  trustedCwds.add(workspaceCwd);
+  for (const cwd of trustedCwds) {
+    configLines.push(`[projects."${cwd}"]`, 'trust_level = "trusted"', "");
+  }
+
+  configLines.push(nuxSection, "", migrationsSection, "", "[mcp_servers]", "");
+
+  require("node:fs").writeFileSync(configPath, configLines.join("\n"), "utf8");
+}
+
+export function buildDefaultReviewerCodexArgs(promptDir: string, workflow: "review_only" | "peer_fix"): string[] {
+  const instructions = toTomlBasicString(codexReviewerInstructionsFor(workflow));
+  return [
+    "-c", `instructions="${instructions}"`,
+    "--sandbox", "workspace-write",
+    "-a", "never",
+  ];
+}
+
+export function buildGeminiReviewerPolicy(promptDir: string): string {
+  const regexEscaped = promptDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const tomlEscaped = regexEscaped.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  const filePathPattern = `^{\\s*\\"file_path\\"\\s*:\\s*\\"${tomlEscaped}/[a-zA-Z0-9._-]*\\"`;
+  return [
+    "# Reviewer session policy: restricts file writes to .peer-review/ and blocks MCP write tools.",
+    "",
+    "# Allow write_file/replace ONLY to the review output directory (flat filenames, no traversal).",
+    "[[rule]]",
+    `toolName = ["write_file", "replace"]`,
+    `argsPattern = "${filePathPattern}"`,
+    `decision = "allow"`,
+    `priority = 500`,
+    "",
+    "# Deny write_file/replace to any other path.",
+    "[[rule]]",
+    `toolName = ["write_file", "replace"]`,
+    `decision = "deny"`,
+    `priority = 100`,
+    `denyMessage = "Reviewer session: file writes are restricted to the .peer-review/ output directory."`,
+    "",
+    "# Deny shell execution.",
+    "[[rule]]",
+    `toolName = "run_shell_command"`,
+    `decision = "deny"`,
+    `priority = 600`,
+    `denyMessage = "Reviewer session: shell execution is disabled for security."`,
+    "",
+    "# Deny serena MCP write/modify tools.",
+    "[[rule]]",
+    `toolName = ["mcp__serena__create_text_file", "mcp__serena__replace_content", "mcp__serena__replace_symbol_body", "mcp__serena__insert_after_symbol", "mcp__serena__insert_before_symbol", "mcp__serena__safe_delete_symbol", "mcp__serena__rename_symbol", "mcp__serena__write_memory", "mcp__serena__edit_memory", "mcp__serena__delete_memory"]`,
+    `decision = "deny"`,
+    `priority = 600`,
+    `denyMessage = "Reviewer session: MCP write tools are disabled."`,
+  ].join("\n");
+}
+
+export const DEFAULT_REVIEWER_GEMINI_ARGS = [
+  "--skip-trust",
+  "--approval-mode", "auto_edit",
+  "--allowed-mcp-server-names", "reviewer-session-no-mcp",
+];
+
 export class TmuxCliSession implements ReviewerSession {
   private ready = false;
-  // Model the live session is currently running (null = unknown / CLI default).
   private currentModel: string | null = null;
-  // Session id used for resume-on-model-switch. Assigned up front where the CLI supports it
-  // (claude/gemini --session-id); captured lazily from rollout files for codex; null when the
-  // session is not resumable (e.g. we reused a user-launched session).
   private sessionId: string | null;
-  // Last delivered job id — its unique BEGIN marker identifies OUR codex transcript on capture.
-  private lastJobId: string | null = null;
-  // When the session was first launched — lower bound for codex rollout-file mtime filtering.
-  private startedAtMs = 0;
-
+  private untrackedExistingSession = false;
   constructor(private readonly config: TmuxSessionConfig) {
-    this.sessionId = config.kind.idStrategy === "assign" ? crypto.randomUUID() : null;
+    this.sessionId = config.initialSessionId ?? null;
+    this.currentModel = config.initialModel ?? null;
   }
 
   async deliver(prompt: string, jobId: string, signal: AbortSignal, model?: string | null): Promise<string> {
-    // Don't boot a session for a job that arrives during shutdown (the worker drains its chains
-    // on abort) — bail before any tmux work.
-    if (signal.aborted) throw new Error("reviewer worker is shutting down");
-    try {
-      return await this.deliverInner(prompt, jobId, signal, model);
-    } catch (error) {
-      // A failed delivery may have left the pane dead/wedged (e.g. a resume that never booted, or
-      // swallowed input). Drop readiness so the NEXT job re-boots via ensureSession instead of
-      // reusing a broken session forever.
-      this.ready = false;
-      throw error;
-    }
-  }
-
-  private async deliverInner(prompt: string, jobId: string, signal: AbortSignal, model?: string | null): Promise<string> {
-    const desired = model?.trim() || null;
-    await this.ensureSession(signal, desired);
-    // Switch the EXISTING session to the requested model (restart + resume keeps the
-    // conversation). No-op when no model was requested or it already matches.
-    if (desired && desired !== this.currentModel) {
-      await this.switchModel(desired, signal);
-    }
+    const requestedModel = normalizedModel(model);
+    this.devLog("deliver_start", { jobId, requestedModel, promptChars: prompt.length });
+    await this.ensureSession(signal, requestedModel);
+    this.devLog("deliver_ready", { jobId, requestedModel, usedModel: this.usedModelForLog(), currentModel: this.currentModel, sessionId: this.sessionId });
     const begin = beginMarkerFor(jobId);
     const done = doneMarkerFor(jobId);
     const { sessionName, promptDir, deliverTimeoutMs, pollIntervalMs } = this.config;
 
-    // Hand the (large) review prompt to the session via a file — typing it through send-keys is
-    // fragile. The instruction itself stays short to avoid input-line wrapping in the pane.
-    // promptDir is granted via `--add-dir` at launch so the read-only session can Read it.
     await mkdir(promptDir, { recursive: true });
     const promptFile = join(promptDir, `${jobId}.md`);
-    await writeFile(promptFile, prompt, "utf8");
-    const instruction =
-      `Read the file ${promptFile} and perform the code review it describes. ` +
-      `Print exactly ${begin} on a line by itself, then the full review as plain text, ` +
-      `then exactly ${done} on the final line.`;
+    const outputFile = join(promptDir, `${jobId}-output.md`);
+    await writeFile(promptFile, wrapLiveReviewPrompt(prompt, begin, done, this.config.useOutputFile ? outputFile : undefined, this.config.outputFileWriteMethod), "utf8");
+    const writeInstruction = this.config.outputFileWriteMethod === "shell"
+      ? `Write your complete review to ${outputFile} using a bash shell command (e.g. cat/tee). `
+      : `Write your complete review to ${outputFile} using the native write_file tool. `;
+    const instruction = this.config.useOutputFile
+      ? `Read the file ${promptFile} and perform the code review it describes. ` +
+        writeInstruction +
+        `Also print exactly ${begin}, then the full review, then exactly ${done} to the terminal.`
+      : `Read the file ${promptFile} and perform the code review it describes. ` +
+        `Print exactly ${begin} on a line by itself, then the full review as plain text, ` +
+        `then exactly ${done} on the final line.`;
 
     try {
-      // Conversation reset is OPT-IN (CODE_ASSISTANT_PEERS_REVIEWER_CLEAR=always): by default the
-      // session keeps its memory across reviews so follow-up rounds benefit from what the
-      // reviewer already read. NOTE the session is per-REPO, not per-task, so the default also
-      // accumulates other tasks' history and a long-lived context will eventually auto-compact —
-      // use "always" for isolated, bounded-context rounds.
-      if (this.config.clearBetweenReviews && this.config.kind.clearCommand) {
-        await tmux(["send-keys", "-t", sessionName, "-l", "--", this.config.kind.clearCommand]);
+      if (this.config.clearBetweenReviews && this.config.clearCommand) {
+        await tmux(["send-keys", "-t", sessionName, "-l", "--", this.config.clearCommand]);
         await sleep(150, signal);
         await tmux(["send-keys", "-t", sessionName, "Enter"]);
-        await sleep(600, signal); // let the reset settle before we wipe scrollback
+        await sleep(600, signal);
       }
-      // Always drop prior tmux scrollback so the capture is bounded to this job. This wipes the
-      // rendered pane history only — NOT the session's conversation memory — so it is safe (and
-      // required for clean extraction) regardless of clearBetweenReviews.
       await tmux(["clear-history", "-t", sessionName]);
-      // Submit with echo verification: a TUI that is still booting (especially right after a
-      // resume relaunch) can swallow keystrokes. The echoed instruction contains the BEGIN
-      // marker, so its absence from the pane means the input was lost — retry a few times.
-      let submitted = false;
-      for (let attempt = 0; attempt < 3 && !submitted; attempt++) {
-        await tmux(["send-keys", "-t", sessionName, "-l", "--", instruction]);
-        await sleep(150, signal); // let the TUI register the paste before submitting
-        await tmux(["send-keys", "-t", sessionName, "Enter"]);
-        const echoDeadline = Date.now() + 5_000;
-        while (Date.now() < echoDeadline && !submitted) {
-          await sleep(500, signal);
-          if ((await this.capture()).includes(begin)) submitted = true;
-        }
-      }
-      if (!submitted) throw new Error("the live session did not accept the review instruction (input swallowed)");
-      this.lastJobId = jobId; // marker is now part of the transcript (used for codex id capture)
+      await tmux(["send-keys", "-t", sessionName, "-l", "--", instruction]);
+      await sleep(150, signal);
+      await tmux(["send-keys", "-t", sessionName, "Enter"]);
 
       const deadline = Date.now() + deliverTimeoutMs;
+      let adaptivePoll = 50;
       while (Date.now() < deadline) {
-        // Bail out promptly on worker shutdown (SIGINT/SIGTERM) instead of polling until the
-        // deliver timeout — the job is reported as an error and the worker loop can exit.
         if (signal.aborted) throw new Error("reviewer worker is shutting down");
-        await sleep(pollIntervalMs, signal);
+
+        if (this.config.useOutputFile) {
+          const fileReview = await extractReviewFromFile(outputFile, jobId);
+          if (fileReview !== null) {
+            await this.refreshSessionId();
+            this.devLog("review_extracted", { jobId, chars: fileReview.length, source: "file", requestedModel, usedModel: this.usedModelForLog(), currentModel: this.currentModel, sessionId: this.sessionId });
+            return fileReview;
+          }
+        }
+
         const capture = await this.capture();
         const review = extractReviewFromCapture(capture, jobId);
-        if (review !== null) return review;
-        // Stop early if the reviewer reports a usage/rate limit — the marker will never arrive,
-        // so fail fast (and let the worker cool this reviewer down) instead of polling for the
-        // full deliver timeout.
-        const limited = detectRateLimit(capture, this.config.rateLimitPatterns);
+        if (review !== null) {
+          await this.refreshSessionId();
+          this.devLog("review_extracted", { jobId, chars: review.length, source: "capture", requestedModel, usedModel: this.usedModelForLog(), currentModel: this.currentModel, sessionId: this.sessionId });
+          return review;
+        }
+
+        // Stop early if the reviewer reports a usage/rate limit
+        const limited = detectRateLimit(capture, this.config.rateLimitPatterns ?? []);
         if (limited) {
           throw new RateLimitError(`reviewer hit its usage/rate limit: ${limited}`, parseResetAtMs(limited, Date.now()));
         }
+
+        await sleep(Math.min(adaptivePoll, Math.max(0, deadline - Date.now())), signal);
+        adaptivePoll = Math.min(adaptivePoll * 2, pollIntervalMs);
       }
+      this.devLog("deliver_timeout", { jobId, timeoutMs: deliverTimeoutMs, requestedModel, usedModel: this.usedModelForLog(), currentModel: this.currentModel, sessionId: this.sessionId });
       throw new Error(`timed out after ${deliverTimeoutMs}ms waiting for the review marker in the live session`);
     } finally {
       await rm(promptFile, { force: true }).catch(() => {});
+      await rm(outputFile, { force: true }).catch(() => {});
     }
   }
 
@@ -482,135 +708,140 @@ export class TmuxCliSession implements ReviewerSession {
     await tmux(["kill-session", "-t", this.config.sessionName]).catch(() => {});
   }
 
-  // Ensure a tmux session running the interactive reviewer TUI exists and is ready for input.
-  // If the session already exists we reuse it (the user may have launched it themselves) — but a
-  // reused session was not launched with our session id, so it is not resumable by us.
-  private async ensureSession(signal: AbortSignal, desiredModel: string | null = null): Promise<void> {
-    if (this.ready) return;
-    const { sessionName, cwd, promptDir, kind, startupTimeoutMs } = this.config;
+  private async ensureSession(signal: AbortSignal, requestedModel: string | null): Promise<void> {
+    const { sessionName, cwd, launchCommand, promptDir, startupTimeoutMs } = this.config;
 
     const exists = (await tmux(["has-session", "-t", sessionName])).code === 0;
-    if (!exists) {
-      // Bake the requested model into the FIRST launch — cheaper than booting on the default
-      // model and immediately restarting to switch.
-      const launched = await this.createTmuxSession(kind.launchCommand(cwd, promptDir, this.sessionId, desiredModel));
-      if (!launched.ok) {
-        throw new Error(`failed to start tmux session '${sessionName}': ${launched.detail}`);
+    const attachedUnknownExistingSession = isUnknownExistingSession(exists, this.ready, this.config.hasPersistedSessionId);
+    this.untrackedExistingSession = liveSessionUntrackedState(this.untrackedExistingSession, attachedUnknownExistingSession);
+    const mustRelaunchForModel = Boolean(exists && requestedModel && requestedModel !== this.currentModel);
+    this.devLog("ensure_session", {
+      sessionName,
+      exists,
+      ready: this.ready,
+      requestedModel,
+      currentModel: this.currentModel,
+      sessionId: this.sessionId,
+      untrackedExistingSession: this.untrackedExistingSession,
+      mustRelaunchForModel,
+    });
+    if (this.ready && !mustRelaunchForModel) return;
+    if (shouldRejectUnknownExistingSession(this.untrackedExistingSession, requestedModel)) {
+      this.devLog("reject_unknown_existing_session", { sessionName, requestedModel });
+      throw new Error(
+        `live session '${sessionName}' already exists but has no persisted session id/model state; ` +
+          `restart that tmux session so the worker can create a tracked session before model switching`,
+      );
+    }
+    if (mustRelaunchForModel) {
+      await this.refreshSessionId();
+      const resumeCommand = this.sessionId && this.config.resumeCommandForModel?.(this.sessionId, requestedModel);
+      if (!resumeCommand) {
+        this.devLog("model_switch_missing_resume_id", { sessionName, requestedModel, sessionId: this.sessionId });
+        throw new Error(`live session '${sessionName}' cannot switch to model '${requestedModel}' because no resumable session id is available`);
       }
-      // `ready`/`currentModel` are only trustworthy once the pane is CONFIRMED live — otherwise a
-      // later job would short-circuit ensureSession and send keys into a half-booted/dead TUI.
-      if (!(await this.waitUntilReady(startupTimeoutMs, signal))) {
-        throw new Error(`tmux session '${sessionName}' did not become ready within ${startupTimeoutMs}ms`);
-      }
-      this.currentModel = desiredModel;
-    } else {
-      // Reused (likely user-launched) session: unknown identity and model, and we can't confirm
-      // boot state, so trust that an existing session is usable but treat it as non-resumable.
-      this.sessionId = null;
-      this.currentModel = null;
-    }
-    this.ready = true;
-  }
-
-  // Switch the live session to `desired` by restarting it with the kind's resume command, which
-  // preserves the conversation. Falls back to a FRESH session (memory reset, logged) when no
-  // resumable ref exists, the resume relaunch fails to start, or the resumed pane never boots
-  // (e.g. an expired/bad ref where `tmux new-session` still exits 0 but the inner CLI dies).
-  private async switchModel(desired: string, signal: AbortSignal): Promise<void> {
-    const { kind, cwd, promptDir, sessionName, startupTimeoutMs } = this.config;
-
-    const ref = await this.resolveResumeRef();
-    if (ref && kind.resumeCommand) {
-      const resumed = await this.createTmuxSession(kind.resumeCommand(promptDir, ref, desired), true);
-      // Success requires BOTH new-session exiting 0 AND the pane actually booting — the latter is
-      // what catches a resume whose inner command died on a bad ref.
-      if (resumed.ok && (await this.waitUntilReady(startupTimeoutMs, signal))) {
-        this.ready = true;
-        this.currentModel = desired;
-        console.error(`[reviewer] ${sessionName}: switched model to ${desired} (resumed session ${ref}, conversation preserved)`);
-        return;
-      }
-      console.error(`[reviewer] ${sessionName}: resume to ${desired} did not come up (${resumed.ok ? "pane never booted" : resumed.detail}); restarting fresh (conversation memory reset).`);
-    } else {
-      console.error(`[reviewer] ${sessionName}: no resumable session ref; model switch restarts fresh (conversation memory reset).`);
-    }
-
-    // Fresh fallback: new identity, requested model baked into the launch.
-    this.sessionId = kind.idStrategy === "assign" ? crypto.randomUUID() : null;
-    this.lastJobId = null;
-    const fresh = await this.createTmuxSession(kind.launchCommand(cwd, promptDir, this.sessionId, desired), true);
-    if (!fresh.ok || !(await this.waitUntilReady(startupTimeoutMs, signal))) {
-      this.ready = false; // leave it un-ready so the next job re-boots instead of reusing a dead pane
-      throw new Error(`failed to restart session '${sessionName}' for model switch to ${desired}`);
-    }
-    this.ready = true;
-    this.currentModel = desired;
-  }
-
-  // The reference the kind's resume command needs: assigned uuid (claude), per-project list
-  // index resolved from our uuid (gemini), or the rollout uuid captured by grepping for our
-  // unique job marker (codex). null = not resumable.
-  private async resolveResumeRef(): Promise<string | null> {
-    const { kind, cwd } = this.config;
-    if (kind.idStrategy === "capture") {
-      if (!this.lastJobId) return null; // nothing delivered yet — fresh restart loses nothing
-      // Only consider rollouts touched since this session launched (minus slack) so a busy
-      // machine-global store can't push our file past the scan window.
-      return await findCodexSessionId(codexSessionsDir(), beginMarkerFor(this.lastJobId), this.startedAtMs - 60_000);
-    }
-    if (!this.sessionId) return null;
-    if (kind.resumeBy === "gemini-index") return await resolveGeminiSessionIndex(cwd, this.sessionId);
-    return this.sessionId;
-  }
-
-  // (Re)create the tmux session running `command`. killExisting tears down the old session first.
-  // Reports only whether `tmux new-session` launched — NOT whether the inner TUI booted; the
-  // caller must confirm liveness via waitUntilReady before trusting `ready`/`currentModel`.
-  private async createTmuxSession(command: string[], killExisting = false): Promise<{ ok: boolean; detail: string }> {
-    const { sessionName, cwd, promptDir } = this.config;
-    if (killExisting) {
       await tmux(["kill-session", "-t", sessionName]).catch(() => {});
+      this.ready = false;
+      this.devLog("model_switch_resume", { sessionName, requestedModel, sessionId: this.sessionId, command: scrubCommand(resumeCommand) });
+      const resumed = await tmux([
+        "new-session", "-d", "-s", sessionName, "-c", cwd, "-x", "400", "-y", "120",
+        "--", ...resumeCommand,
+      ]);
+      if (resumed.code !== 0) {
+        throw new Error(`failed to resume tmux session '${sessionName}' with model '${requestedModel}': ${resumed.stderr.trim() || `exit ${resumed.code}`}`);
+      }
+      this.currentModel = requestedModel;
+      await this.persistState();
+      await this.waitUntilReady(startupTimeoutMs, signal);
+      this.ready = true;
+      this.devLog("model_switch_ready", { sessionName, requestedModel, sessionId: this.sessionId });
+      return;
     }
-    this.ready = false;
-    await mkdir(promptDir, { recursive: true });
-    // Wide window => less line wrapping => cleaner capture. `--` ends tmux option parsing so the
-    // rest is the command run inside the session (must include any prompt-dir access grant).
-    const created = await tmux([
-      "new-session", "-d", "-s", sessionName, "-c", cwd, "-x", "400", "-y", "120",
-      "--", ...sessionEnvPrefix(), ...command,
-    ]);
-    if (created.code !== 0) return { ok: false, detail: created.stderr.trim() || `exit ${created.code}` };
-    this.startedAtMs = Date.now();
-    return { ok: true, detail: "" };
+
+    if (!exists) {
+      await mkdir(promptDir, { recursive: true });
+      if (this.config.useOutputFile) await sweepOrphanedOutputFiles(promptDir);
+      if (this.config.policyFile) {
+        await writeFile(this.config.policyFile.path, this.config.policyFile.content, "utf8");
+      }
+      const freshSessionId = this.config.freshSessionId?.() ?? null;
+      const launchId = freshSessionId ?? this.sessionId;
+      this.sessionId = freshSessionId;
+      this.currentModel = null;
+      const created = await tmux([
+        "new-session", "-d", "-s", sessionName, "-c", cwd, "-x", "400", "-y", "120",
+        "--", ...(this.config.launchCommandForModel?.(requestedModel, launchId) ?? launchCommand),
+      ]);
+      if (created.code !== 0) {
+        throw new Error(`failed to start tmux session '${sessionName}': ${created.stderr.trim() || `exit ${created.code}`}`);
+      }
+      this.untrackedExistingSession = liveSessionUntrackedState(this.untrackedExistingSession, false, true);
+      this.devLog("session_created", { sessionName, requestedModel, sessionId: launchId });
+      await this.waitUntilReady(startupTimeoutMs, signal);
+    }
+    if (requestedModel) this.currentModel = requestedModel;
+    if (shouldPersistLiveSessionState(this.untrackedExistingSession)) await this.persistState();
+    this.ready = true;
   }
 
-  // The TUI takes a moment to boot. We don't know an exact "ready" string across versions, so we
-  // wait until the captured pane is non-empty and stable across two consecutive reads. Returns
-  // true only when that confirmed-live state was observed; false on abort or timeout (a never-
-  // booted pane), so callers can distinguish a live session from a dead one.
-  private async waitUntilReady(timeoutMs: number, signal: AbortSignal): Promise<boolean> {
+  private async refreshSessionId(): Promise<void> {
+    if (this.sessionId) return;
+    this.sessionId = await this.config.discoverSessionId?.(this.config.cwd) ?? null;
+    if (this.sessionId) {
+      this.untrackedExistingSession = liveSessionUntrackedState(this.untrackedExistingSession, false, true);
+      await this.persistState();
+      this.devLog("session_id_discovered", { sessionId: this.sessionId });
+    }
+  }
+
+  private async persistState(): Promise<void> {
+    await saveLiveSessionState(this.config.stateKey, {
+      sessionId: this.sessionId,
+      currentModel: this.currentModel,
+    }).catch(() => {});
+    this.devLog("session_state_persisted", { stateKey: this.config.stateKey, sessionId: this.sessionId, currentModel: this.currentModel });
+  }
+
+  private devLog(event: string, data?: Record<string, unknown>): void {
+    this.config.devLog?.(event, data);
+  }
+
+  private usedModelForLog(): string {
+    return this.currentModel ?? "cli-default";
+  }
+
+  private async waitUntilReady(timeoutMs: number, signal: AbortSignal): Promise<void> {
+    const { sessionName } = this.config;
     const deadline = Date.now() + timeoutMs;
     let previous = "";
     let stableReads = 0;
     while (Date.now() < deadline) {
-      // Bail out promptly on shutdown — sleep() resolves immediately when aborted, so without
-      // this guard the loop would busy-spin spawning `tmux capture-pane` until the deadline.
-      if (signal.aborted) return false;
+      if (signal.aborted) return;
       await sleep(700, signal);
+      const sessionExists = (await tmux(["has-session", "-t", sessionName])).code === 0;
+      if (!sessionExists) {
+        this.devLog("session_startup_crash", { sessionName, elapsed: timeoutMs - (deadline - Date.now()) });
+        throw new Error(
+          `session '${sessionName}' died during startup — the CLI likely crashed or exited immediately. ` +
+            `Check that the reviewer CLI is installed, authenticated, and that the launch args are valid.`,
+        );
+      }
       const current = await this.capture();
       if (current.trim().length > 0 && current === previous) {
-        if (++stableReads >= 2) return true;
+        if (++stableReads >= 2) return;
       } else {
         stableReads = 0;
       }
       previous = current;
     }
-    return false; // timed out without observing a confirmed-live pane
+    this.devLog("session_startup_timeout", { sessionName, timeoutMs });
+    console.error(
+      `[reviewer] WARNING: session '${sessionName}' pane was empty/unstable for ${timeoutMs}ms; ` +
+        `the CLI may have stalled on startup. Proceeding — the deliver timeout will catch it.`,
+    );
   }
 
   private async capture(): Promise<string> {
-    // -p prints to stdout, -S - includes the full scrollback (post clear-history it is just this
-    // job), -J joins wrapped lines so a soft-wrapped marker still matches.
     const result = await tmux(["capture-pane", "-t", this.config.sessionName, "-p", "-J", "-S", "-"]);
     return result.stdout;
   }
@@ -628,9 +859,70 @@ async function tmux(args: string[]): Promise<{ code: number; stdout: string; std
 
 // A fake session for local testing without claude/tmux: echoes a canned review.
 export class EchoSession implements ReviewerSession {
-  async deliver(prompt: string, jobId: string): Promise<string> {
-    return `No findings. (echo reviewer for job ${jobId}; prompt was ${prompt.length} chars)\npatch is correct`;
+  async deliver(prompt: string, jobId: string, _signal?: AbortSignal, model?: string | null): Promise<string> {
+    const modelText = model?.trim() ? `; model ${model.trim()}` : "";
+    return `No findings. (echo reviewer for job ${jobId}; prompt was ${prompt.length} chars${modelText})\npatch is correct`;
   }
+}
+
+function normalizedModel(model?: string | null): string | null {
+  const trimmed = model?.trim();
+  return trimmed ? trimmed : null;
+}
+
+export function isUnknownExistingSession(exists: boolean, ready: boolean, hasPersistedSessionId: boolean): boolean {
+  return exists && !ready && !hasPersistedSessionId;
+}
+
+export function shouldRejectUnknownExistingSession(attachedUnknownExistingSession: boolean, requestedModel: string | null): boolean {
+  return attachedUnknownExistingSession && Boolean(requestedModel);
+}
+
+export function shouldPersistLiveSessionState(attachedUnknownExistingSession: boolean): boolean {
+  return !attachedUnknownExistingSession;
+}
+
+export function liveSessionUntrackedState(previouslyUntracked: boolean, attachedUnknownExistingSession: boolean, createdTrackedSession = false): boolean {
+  if (createdTrackedSession) return false;
+  return previouslyUntracked || attachedUnknownExistingSession;
+}
+
+export function devLoggingEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const value = env.CODE_ASSISTANT_PEERS_DEV_LOG?.trim().toLowerCase();
+  return value === "1" || value === "true" || value === "yes";
+}
+
+export function defaultDevLogPath(scope: string, cwd = process.cwd()): string {
+  return join(cwd, ".code-assistant-peers-dev", `${scope}.jsonl`);
+}
+
+export function createDevLogger(scope: string, env: NodeJS.ProcessEnv = process.env, cwd = process.cwd()): DevLogger {
+  if (!devLoggingEnabled(env)) return () => {};
+  const path = env.CODE_ASSISTANT_PEERS_DEV_LOG_PATH?.trim() || defaultDevLogPath(scope, cwd);
+  try {
+    mkdirSyncForLog(dirname(path));
+  } catch {
+    return () => {};
+  }
+  return (event, data = {}) => {
+    try {
+      appendFileSync(path, JSON.stringify({ ts: new Date().toISOString(), scope, event, ...data }) + "\n", "utf8");
+    } catch {
+      // Dev logging must never affect reviewer behavior.
+    }
+  };
+}
+
+function mkdirSyncForLog(dir: string): void {
+  mkdirSync(dir, { recursive: true });
+}
+
+function scrubCommand(command: string[]): string[] {
+  return command.map((part) => (looksSensitive(part) ? "<redacted>" : part));
+}
+
+function looksSensitive(value: string): boolean {
+  return /(api[_-]?key|token|secret|password|bearer)/i.test(value);
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
@@ -660,8 +952,6 @@ async function main(): Promise<void> {
 
   const brokerUrl = process.env.CODE_ASSISTANT_PEERS_BROKER_URL ?? DEFAULT_BROKER_URL;
 
-  // Singleton guard: at most one real worker per broker (echo/dev workers are exempt). Prevents
-  // two workers from driving the same per-repo tmux session concurrently.
   let releaseLock: (() => void) | null = null;
   if (!echo) {
     releaseLock = acquireWorkerLock(brokerUrl);
@@ -678,17 +968,16 @@ async function main(): Promise<void> {
 
   if (process.env.ANTHROPIC_API_KEY && !echo) {
     console.error(
-      "[reviewer] note: ANTHROPIC_API_KEY is set in the worker environment, but reviewer sessions are " +
-        "launched with an isolated env that strips it — claude sessions stay on subscription auth. " +
-        "Unset it anyway to keep spawn-fallback reviews (claude -p) off API-key billing.",
+      "[reviewer] WARNING: ANTHROPIC_API_KEY is set — Claude Code will bill to the API key, NOT your subscription. " +
+        "Unset it (and log in via claude.ai) for subscription billing.",
     );
   }
 
   const baseCwd = process.env.CODE_ASSISTANT_PEERS_REVIEWER_CWD ?? process.cwd();
   const sessionBaseName = process.env.CODE_ASSISTANT_PEERS_TMUX_SESSION ?? "peer-reviewer";
+  const devLog = createDevLogger("reviewer", process.env, baseCwd);
+  devLog("worker_start", { brokerUrl, baseCwd, once, echo, sessionBaseName });
 
-  // One session per (reviewer kind, repo cwd): a job's reviewer picks the CLI, its cwd pins the
-  // session to that repo, and the worker caches/reuses the pair.
   const sessionFor = (reviewer: string, cwd: string): ReviewerSession => {
     if (echo) return new EchoSession();
     const kind = liveCliKindFor(reviewer);
@@ -697,18 +986,35 @@ async function main(): Promise<void> {
     }
     const repoCwd = cwd || baseCwd;
     const kindPromptDir = process.env.CODE_ASSISTANT_PEERS_REVIEWER_PROMPT_DIR ?? kind.promptDir(repoCwd);
+    const stateKey = liveSessionStateKey(reviewer, repoCwd);
+    const persistedState = loadLiveSessionState(stateKey);
+    const initialSessionId = persistedState?.sessionId ?? kind.initialSessionId?.() ?? null;
     return new TmuxCliSession({
       sessionName: sessionNameFor(sessionBaseName, kind.slug, repoCwd),
       cwd: repoCwd,
+      launchCommand: kind.launchCommand(repoCwd, kindPromptDir),
+      launchCommandForModel: (model, sessionId) => kind.launchCommand(repoCwd, kindPromptDir, model, sessionId),
+      resumeCommandForModel: kind.resumeCommand ? (sessionId, model) => kind.resumeCommand!(repoCwd, kindPromptDir, sessionId, model) : undefined,
+      initialSessionId,
+      initialModel: persistedState?.currentModel ?? null,
+      hasPersistedSessionId: Boolean(persistedState?.sessionId),
+      stateKey,
+      discoverSessionId: kind.discoverSessionId,
       promptDir: kindPromptDir,
-      kind,
-      // Default: KEEP conversation memory across reviews (resume-on-switch preserves it too).
-      // "always" clears before every review for isolated rounds; "never" kept as a legacy alias.
+      clearCommand: kind.clearCommand,
       clearBetweenReviews: process.env.CODE_ASSISTANT_PEERS_REVIEWER_CLEAR === "always",
       startupTimeoutMs: envInt("CODE_ASSISTANT_PEERS_REVIEWER_STARTUP_MS", 30_000),
       deliverTimeoutMs: envInt("CODE_ASSISTANT_PEERS_REVIEW_TIMEOUT_MS", DEFAULT_DELIVER_TIMEOUT_MS),
       pollIntervalMs: envInt("CODE_ASSISTANT_PEERS_REVIEWER_POLL_MS", DEFAULT_POLL_INTERVAL_MS),
+      useOutputFile: (kind.useOutputFile ?? false) &&
+        !process.env[`CODE_ASSISTANT_PEERS_REVIEWER_${kind.slug.toUpperCase()}_ARGS`],
+      policyFile: kind.policyContent && !process.env[`CODE_ASSISTANT_PEERS_REVIEWER_${kind.slug.toUpperCase()}_ARGS`]
+        ? { path: join(kindPromptDir, "reviewer-policy.toml"), content: kind.policyContent(kindPromptDir) }
+        : undefined,
+      freshSessionId: kind.initialSessionId,
+      outputFileWriteMethod: kind.slug === "codex" ? "shell" : "write_file_tool",
       rateLimitPatterns: (process.env.CODE_ASSISTANT_PEERS_RATE_LIMIT_PATTERNS ?? "").split(",").map((p) => p.trim()).filter(Boolean),
+      devLog: (event, data) => devLog(event, { reviewer, cwd: repoCwd, ...data }),
     });
   };
 
@@ -719,249 +1025,205 @@ async function main(): Promise<void> {
     signal: controller.signal,
     once,
     rateLimitCooldownMs: envInt("CODE_ASSISTANT_PEERS_RATE_LIMIT_COOLDOWN_MS", DEFAULT_RATE_LIMIT_COOLDOWN_MS),
-    log: (message) => console.error(`[reviewer] ${message}`),
+    log: (message) => {
+      console.error(`[reviewer] ${message}`);
+      devLog("worker_log", { message });
+    },
   });
+  devLog("worker_stop", { brokerUrl });
   releaseLock?.();
 }
 
 // ---------------------------------------------------------------------------
-// Live CLI kinds — which interactive TUI a channel reviewer id maps to, how to launch it
-// read-only with access to the prompt dir, and how to reset its conversation between reviews.
-// Generic: any `<cli>-live` adapter routes here; unknown ids surface as a job error so the host
-// falls back to spawning that adapter's headless CLI.
+// Live CLI kinds
 // ---------------------------------------------------------------------------
 
 export interface LiveCliKind {
-  slug: string; // session-name segment, e.g. peer-reviewer-<slug>-<repo>-<hash>
-  // Parent dir for the per-job prompt file. The session must be able to Read it: claude grants
-  // it via --add-dir; gemini puts it INSIDE the (trusted) repo cwd to avoid a second trust
-  // prompt that --include-directories would raise; codex reads absolute paths under its sandbox.
+  slug: string;
   promptDir: (cwd: string) => string;
-  // Argv for a FRESH session. sessionId is baked in where the CLI supports assigning one
-  // (claude/gemini --session-id; codex cannot); model is baked in when already requested.
-  launchCommand: (cwd: string, promptDir: string, sessionId: string | null, model: string | null) => string[];
-  // Argv that relaunches the CLI RESUMING sessionRef on a new model (conversation preserved).
-  // sessionRef: assigned uuid (claude), per-project list index (gemini), captured rollout uuid
-  // (codex). NEVER use --last/latest here — session stores are shared with the user's own
-  // sessions (codex is even machine-global), so only explicit refs are safe.
-  resumeCommand: (promptDir: string, sessionRef: string, model: string) => string[];
-  // How this kind gets a resumable id: "assign" = we hand the CLI a uuid at launch;
-  // "capture" = recover it later from the CLI's own session store (codex rollout files).
-  idStrategy: "assign" | "capture";
-  // What resumeCommand's sessionRef is resolved from: the uuid itself, or gemini's
-  // per-project session list index looked up by our uuid.
-  resumeBy: "uuid" | "gemini-index";
+  launchCommand: (cwd: string, promptDir: string, model?: string | null, sessionId?: string | null) => string[];
+  resumeCommand?: (cwd: string, promptDir: string, sessionId: string, model?: string | null) => string[];
+  initialSessionId?: () => string;
+  discoverSessionId?: (cwd: string) => Promise<string | null>;
   clearCommand: string | null;
+  useOutputFile?: boolean;
+  policyContent?: (promptDir: string) => string;
 }
 
 const SHARED_PROMPT_DIR = join(tmpdir(), "peer-reviewer-prompts");
+const LIVE_SESSION_STATE_PATH = join(homedir(), ".code-assistant-peers", "live-sessions.json");
 
-function claudeBaseArgs(): string[] {
-  return parseArgsEnv(process.env.CODE_ASSISTANT_PEERS_REVIEWER_CLAUDE_ARGS) ?? DEFAULT_REVIEWER_CLAUDE_ARGS;
+interface LiveSessionState {
+  sessionId: string | null;
+  currentModel: string | null;
 }
-function geminiBaseArgs(): string[] {
-  return parseArgsEnv(process.env.CODE_ASSISTANT_PEERS_REVIEWER_GEMINI_ARGS) ?? ["--skip-trust", "--approval-mode", "plan"];
+
+function liveSessionStateKey(reviewer: string, cwd: string): string {
+  return `${reviewer}|${cwd}`;
 }
-function codexBaseArgs(): string[] {
-  return parseArgsEnv(process.env.CODE_ASSISTANT_PEERS_REVIEWER_CODEX_ARGS) ?? ["--sandbox", "read-only"];
+
+function loadLiveSessionState(key: string): LiveSessionState | null {
+  try {
+    const parsed = JSON.parse(readFileSync(LIVE_SESSION_STATE_PATH, "utf8")) as Record<string, LiveSessionState>;
+    const state = parsed[key];
+    if (!state || typeof state !== "object") return null;
+    return {
+      sessionId: typeof state.sessionId === "string" && state.sessionId.trim() ? state.sessionId : null,
+      currentModel: typeof state.currentModel === "string" && state.currentModel.trim() ? state.currentModel : null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function saveLiveSessionState(key: string, state: LiveSessionState): Promise<void> {
+  let parsed: Record<string, LiveSessionState> = {};
+  try {
+    parsed = JSON.parse(await readFile(LIVE_SESSION_STATE_PATH, "utf8")) as Record<string, LiveSessionState>;
+  } catch {
+    parsed = {};
+  }
+  parsed[key] = state;
+  await mkdir(dirname(LIVE_SESSION_STATE_PATH), { recursive: true });
+  await writeFile(LIVE_SESSION_STATE_PATH, JSON.stringify(parsed, null, 2), "utf8");
 }
 
 export const LIVE_CLI_KINDS: Record<string, LiveCliKind> = {
   "claude-live": {
     slug: "claude",
-    promptDir: () => SHARED_PROMPT_DIR,
-    launchCommand: (_cwd, promptDir, sessionId, model) => [
+    promptDir: (cwd) => join(SHARED_PROMPT_DIR, shortHash(cwd)),
+    launchCommand: (_cwd, promptDir, model, sessionId) => [
       "claude",
-      ...claudeBaseArgs(),
       ...(sessionId ? ["--session-id", sessionId] : []),
       ...(model ? ["--model", model] : []),
+      ...(parseArgsEnv(process.env.CODE_ASSISTANT_PEERS_REVIEWER_CLAUDE_ARGS) ??
+        buildDefaultReviewerClaudeArgs(promptDir, resolveReviewerWorkflow())),
       "--add-dir",
       promptDir,
     ],
-    resumeCommand: (promptDir, sessionRef, model) => [
+    resumeCommand: (_cwd, promptDir, sessionId, model) => [
       "claude",
-      ...claudeBaseArgs(),
       "--resume",
-      sessionRef,
-      "--model",
-      model,
+      sessionId,
+      ...(model ? ["--model", model] : []),
+      ...(parseArgsEnv(process.env.CODE_ASSISTANT_PEERS_REVIEWER_CLAUDE_ARGS) ??
+        buildDefaultReviewerClaudeArgs(promptDir, resolveReviewerWorkflow())),
       "--add-dir",
       promptDir,
     ],
-    idStrategy: "assign",
-    resumeBy: "uuid",
+    initialSessionId: randomUUID,
     clearCommand: "/clear",
+    useOutputFile: true,
   },
   "gemini-live": {
     slug: "gemini",
-    // Inside the repo cwd (already trusted via --skip-trust) so gemini can Read it without the
-    // separate `--include-directories` trust prompt that stalls a detached session.
     promptDir: (cwd) => join(cwd, ".peer-review"),
-    launchCommand: (_cwd, _promptDir, sessionId, model) => [
-      "gemini",
-      ...geminiBaseArgs(),
-      ...(sessionId ? ["--session-id", sessionId] : []),
-      ...(model ? ["-m", model] : []),
-    ],
-    // gemini --resume takes the per-project session list INDEX (resolved from our uuid via
-    // --list-sessions), not the uuid itself.
-    resumeCommand: (_promptDir, sessionRef, model) => [
-      "gemini",
-      ...geminiBaseArgs(),
-      "-m",
-      model,
-      "--resume",
-      sessionRef,
-    ],
-    idStrategy: "assign",
-    resumeBy: "gemini-index",
+    policyContent: (promptDir) => buildGeminiReviewerPolicy(promptDir),
+    launchCommand: (_cwd, promptDir, model, sessionId) => {
+      const customArgs = parseArgsEnv(process.env.CODE_ASSISTANT_PEERS_REVIEWER_GEMINI_ARGS);
+      return [
+        "gemini",
+        ...(sessionId ? ["--session-id", sessionId] : []),
+        ...(model ? ["--model", model] : []),
+        ...(customArgs ?? [
+          ...DEFAULT_REVIEWER_GEMINI_ARGS,
+          "--admin-policy", join(promptDir, "reviewer-policy.toml"),
+        ]),
+      ];
+    },
+    resumeCommand: (_cwd, promptDir, sessionId, model) => {
+      const customArgs = parseArgsEnv(process.env.CODE_ASSISTANT_PEERS_REVIEWER_GEMINI_ARGS);
+      return [
+        "gemini",
+        "--resume",
+        sessionId,
+        ...(model ? ["--model", model] : []),
+        ...(customArgs ?? [
+          ...DEFAULT_REVIEWER_GEMINI_ARGS,
+          "--admin-policy", join(promptDir, "reviewer-policy.toml"),
+        ]),
+      ];
+    },
+    initialSessionId: randomUUID,
     clearCommand: "/clear",
+    useOutputFile: true,
   },
   "codex-live": {
     slug: "codex",
-    promptDir: () => SHARED_PROMPT_DIR,
-    launchCommand: (_cwd, _promptDir, _sessionId, model) => [
-      "codex",
-      ...codexBaseArgs(),
-      ...(model ? ["-m", model] : []),
-    ],
-    // codex resume continues the recorded session (uuid captured from its rollout file); the
-    // model is overridden via config since resume has no -m flag of its own.
-    resumeCommand: (_promptDir, sessionRef, model) => [
-      "codex",
-      "resume",
-      sessionRef,
-      "-c",
-      `model=${JSON.stringify(model)}`,
-    ],
-    idStrategy: "capture",
-    resumeBy: "uuid",
+    promptDir: (cwd) => join(cwd, ".peer-review"),
+    launchCommand: (cwd, promptDir, model) => {
+      const customArgs = parseArgsEnv(process.env.CODE_ASSISTANT_PEERS_REVIEWER_CODEX_ARGS);
+      if (customArgs) return ["codex", ...(model ? ["-m", model] : []), ...customArgs];
+      setupReviewerCodexHome(cwd);
+      return [
+        "env", `CODEX_HOME=${REVIEWER_CODEX_HOME}`,
+        "codex",
+        ...(model ? ["-m", model] : []),
+        ...buildDefaultReviewerCodexArgs(promptDir, resolveReviewerWorkflow()),
+      ];
+    },
+    resumeCommand: (cwd, promptDir, sessionId, model) => {
+      const customArgs = parseArgsEnv(process.env.CODE_ASSISTANT_PEERS_REVIEWER_CODEX_ARGS);
+      if (customArgs) return ["codex", "resume", sessionId, ...(model ? ["-m", model] : []), ...customArgs];
+      setupReviewerCodexHome(cwd);
+      return [
+        "env", `CODEX_HOME=${REVIEWER_CODEX_HOME}`,
+        "codex", "resume", sessionId,
+        ...(model ? ["-m", model] : []),
+        ...buildDefaultReviewerCodexArgs(promptDir, resolveReviewerWorkflow()),
+      ];
+    },
+    discoverSessionId: latestCodexSessionIdForCwd,
     clearCommand: "/new",
+    useOutputFile: true,
   },
 };
 
-// ---------------------------------------------------------------------------
-// Session environment isolation
-//
-// The reviewer TUIs must NOT inherit the spawning process's environment: when the worker is
-// auto-started from a host coding agent (or a dev shell inside one), nested-session variables
-// leak in and break the CLIs — observed concretely as Claude sessions no longer persisting
-// their conversation transcripts (which silently breaks resume-on-model-switch). Launch every
-// session through `env -i` with an explicit allowlist instead — the same posture
-// buildReviewCommandEnv takes for spawned headless reviewers. ANTHROPIC_API_KEY is deliberately
-// absent so claude stays on subscription auth.
-// ---------------------------------------------------------------------------
-
-const SESSION_ENV_ALLOWLIST = [
-  "PATH",
-  "HOME",
-  "USER",
-  "SHELL",
-  "TMPDIR",
-  "LANG",
-  "LC_ALL",
-  "CLAUDE_CONFIG_DIR",
-  "CODEX_HOME",
-  "OPENAI_API_KEY",
-  "GEMINI_API_KEY",
-  "GOOGLE_API_KEY",
-  "GOOGLE_GENAI_USE_VERTEXAI",
-  "GOOGLE_CLOUD_PROJECT",
-  "GOOGLE_CLOUD_LOCATION",
-  "GOOGLE_APPLICATION_CREDENTIALS",
-];
-
-export function sessionEnvPrefix(sourceEnv: NodeJS.ProcessEnv = process.env): string[] {
-  const pairs = SESSION_ENV_ALLOWLIST.flatMap((key) =>
-    sourceEnv[key] !== undefined ? [`${key}=${sourceEnv[key]}`] : [],
-  );
-  // TERM must be re-set explicitly because `env -i` wipes the one tmux provides to the pane.
-  return ["env", "-i", ...pairs, `TERM=${sourceEnv.TERM ?? "xterm-256color"}`];
-}
-
-// ---------------------------------------------------------------------------
-// Session-id helpers for resume-on-model-switch
-// ---------------------------------------------------------------------------
-
-export function codexSessionsDir(): string {
-  return process.env.CODE_ASSISTANT_PEERS_CODEX_SESSIONS_DIR ?? join(homedir(), ".codex", "sessions");
-}
-
-// rollout-2026-06-12T09-41-24-<uuid>.jsonl -> <uuid>
-export function codexSessionIdFromRolloutPath(path: string): string | null {
-  const match = /rollout-.*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i.exec(path);
-  return match ? match[1] : null;
-}
-
-// Find OUR codex session by content: its transcript is the only one in the world containing the
-// given per-job marker, so this never confuses the user's own (machine-global) codex sessions.
-// Scans newest-first and bounds the scan; returns null when nothing matches (caller falls back).
-export async function findCodexSessionId(dir: string, marker: string, sinceMs = 0, scanLimit = 50): Promise<string | null> {
-  let entries: string[];
-  try {
-    entries = (await readdir(dir, { recursive: true })) as string[];
-  } catch {
-    return null;
-  }
-  const files = entries.filter((entry) => entry.endsWith(".jsonl")).map((entry) => join(dir, entry));
-  const dated = (await Promise.all(files.map(async (file) => ({
-    file,
-    mtimeMs: (await stat(file).catch(() => null))?.mtimeMs ?? 0,
-  }))))
-    .filter((entry) => entry.mtimeMs >= sinceMs) // our rollout can't predate the session launch
-    .sort((a, b) => b.mtimeMs - a.mtimeMs);
-  const scanned = dated.slice(0, scanLimit);
-  for (const { file } of scanned) {
+export async function latestCodexSessionIdForCwd(cwd: string): Promise<string | null> {
+  const useReviewerHome = !process.env.CODE_ASSISTANT_PEERS_REVIEWER_CODEX_ARGS;
+  const roots = useReviewerHome
+    ? [join(REVIEWER_CODEX_HOME, "sessions")]
+    : [join(homedir(), ".codex", "sessions")];
+  const files = (
+    await Promise.all(roots.map((r) => recentFiles(r, 100).catch(() => [] as string[])))
+  ).flat();
+  for (const file of files) {
+    const firstLine = (await readFile(file, "utf8").catch(() => "")).split("\n", 1)[0];
+    if (!firstLine) continue;
     try {
-      if ((await readFile(file, "utf8")).includes(marker)) return codexSessionIdFromRolloutPath(file);
+      const parsed = JSON.parse(firstLine) as { type?: string; payload?: { id?: string; cwd?: string; originator?: string } };
+      if (parsed.type === "session_meta" && parsed.payload?.cwd === cwd && parsed.payload.originator === "codex-tui" && parsed.payload.id) {
+        return parsed.payload.id;
+      }
     } catch {
-      // unreadable rollout — skip
+      // Ignore unrelated/corrupt session files.
     }
   }
-  if (dated.length > scanLimit) {
-    console.error(`[reviewer] codex session capture scanned the ${scanLimit} newest of ${dated.length} candidate rollouts without a match; resume may fall back to a fresh session.`);
-  }
   return null;
 }
 
-// Parse `gemini --list-sessions` output ("  3. <preview>... (20 hours ago) [<uuid>]") and return
-// the list index for OUR uuid. Index-by-uuid keeps us off "latest", which could be the user's
-// own gemini session in the same repo.
-export function parseGeminiSessionIndex(listOutput: string, sessionId: string): string | null {
-  for (const line of listOutput.split("\n")) {
-    const match = /^\s*(\d+)\.\s.*\[([0-9a-fA-F-]{36})\]\s*$/.exec(line);
-    if (match && match[2].toLowerCase() === sessionId.toLowerCase()) return match[1];
+async function recentFiles(dir: string, limit: number): Promise<string[]> {
+  const entries = await readdir(dir, { withFileTypes: true });
+  const files: { path: string; mtimeMs: number }[] = [];
+  for (const entry of entries) {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      for (const child of await recentFiles(path, limit)) {
+        const info = await stat(child);
+        files.push({ path: child, mtimeMs: info.mtimeMs });
+      }
+    } else if (entry.isFile()) {
+      const info = await stat(path);
+      files.push({ path, mtimeMs: info.mtimeMs });
+    }
   }
-  return null;
-}
-
-async function resolveGeminiSessionIndex(cwd: string, sessionId: string): Promise<string | null> {
-  // Use the same isolated env as the launched session (env -i + allowlist) so the probe sees the
-  // identical config/auth the real session does — and never inherits nested-CLI leakage.
-  const [, , ...envPairs] = sessionEnvPrefix();
-  const env = Object.fromEntries(envPairs.map((pair) => {
-    const eq = pair.indexOf("=");
-    return [pair.slice(0, eq), pair.slice(eq + 1)];
-  }));
-  const proc = Bun.spawn(["gemini", "--list-sessions"], { cwd, env, stdout: "pipe", stderr: "pipe" });
-  const timer = setTimeout(() => proc.kill(), 30_000);
-  try {
-    const [stdout] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
-    return parseGeminiSessionIndex(stdout, sessionId);
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timer);
-  }
+  return files.sort((a, b) => b.mtimeMs - a.mtimeMs).slice(0, limit).map((file) => file.path);
 }
 
 export function liveCliKindFor(reviewer: string): LiveCliKind | null {
   return LIVE_CLI_KINDS[reviewer] ?? null;
 }
 
-// Stable, tmux-safe session name per CLI kind + repo cwd: "<base>-<kind>-<repo-slug>-<hash>".
-// The hash disambiguates same-named repos in different paths; the slug keeps it human-readable
-// in `tmux ls`.
 export function sessionNameFor(base: string, kind: string, cwd: string): string {
   const slug = (cwd.split("/").filter(Boolean).pop() ?? "repo").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 24) || "repo";
   return `${base}-${kind}-${slug}-${shortHash(cwd)}`;
@@ -973,16 +1235,11 @@ function shortHash(value: string): string {
   return h.toString(36);
 }
 
-// Ensure only ONE reviewer worker runs per broker. Without this, an autostart race (two MCP
-// servers both seeing "no broker" at once) could leave two workers polling the same broker and
-// driving the same per-repo tmux session concurrently — interleaved send-keys/capture corrupts
-// both. The lock is keyed by broker URL so distinct brokers get independent workers. Returns a
-// release fn, or null if another LIVE worker already holds the lock (caller should exit).
 export function acquireWorkerLock(brokerUrl: string): (() => void) | null {
   const lockPath = join(tmpdir(), `code-assistant-peers-reviewer-${shortHash(brokerUrl)}.lock`);
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const fd = openSync(lockPath, "wx"); // exclusive create — fails if the lock already exists
+      const fd = openSync(lockPath, "wx");
       writeSync(fd, String(process.pid));
       closeSync(fd);
       return () => {
@@ -994,9 +1251,9 @@ export function acquireWorkerLock(brokerUrl: string): (() => void) | null {
       };
     } catch (error) {
       if ((error as NodeJS.ErrnoException)?.code !== "EEXIST") throw error;
-      if (lockHolderAlive(lockPath)) return null; // a live worker owns it
+      if (lockHolderAlive(lockPath)) return null;
       try {
-        unlinkSync(lockPath); // stale lock (holder died) — drop it and retry once
+        unlinkSync(lockPath);
       } catch {
         // raced with another reclaimer; loop will retry
       }
@@ -1009,7 +1266,7 @@ function lockHolderAlive(lockPath: string): boolean {
   try {
     const pid = Number(readFileSync(lockPath, "utf8").trim());
     if (!Number.isFinite(pid) || pid <= 0) return false;
-    process.kill(pid, 0); // throws if the process does not exist
+    process.kill(pid, 0);
     return true;
   } catch {
     return false;

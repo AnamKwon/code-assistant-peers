@@ -101,54 +101,51 @@ export function resolveAutoPeerSetupConfig(
   availability: AssistantSetupAvailability,
 ): AutoPeerSetupResult {
   const targetSet = new Set(targets);
-  const selected = BUILTIN_SETUP_ASSISTANTS.filter((id) => {
-    if (targets.length === 1 && targetSet.has(id)) return false;
-    return Boolean(availability[id]?.ok);
-  });
+  // Include ALL available assistants (including the setup target itself) because the target's
+  // -live variant is a separate interactive tmux session and acts as an independent peer reviewer.
+  // Previously the setup target was excluded to avoid self-review, but with the no-aggregate
+  // architecture the target's live session IS a legitimate peer (different model / fresh context).
+  const selected = BUILTIN_SETUP_ASSISTANTS.filter((id) => Boolean(availability[id]?.ok));
   const skipped = BUILTIN_SETUP_ASSISTANTS
     .filter((id) => !selected.includes(id))
     .map((id) => ({
-      id,
-      reason: targetSet.has(id) && targets.length === 1
-        ? "same as the only setup target"
-        : availability[id]?.detail ?? "not checked",
+      id: liveSetupPeerId(id),
+      reason: availability[id]?.detail ?? "not checked",
     }));
 
   if (selected.length === 0) {
     const details = BUILTIN_SETUP_ASSISTANTS
       .map((id) => `${id}: ${availability[id]?.detail ?? "not checked"}`)
       .join("; ");
-    throw new Error(`--peers=auto could not find an available peer assistant different from the setup target. ${details}`);
-  }
-  for (const target of targets) {
-    if (selected.filter((id) => id !== target).length > 0) continue;
-    const details = BUILTIN_SETUP_ASSISTANTS
-      .map((id) => `${id}: ${availability[id]?.detail ?? "not checked"}`)
-      .join("; ");
-    throw new Error(`--peers=auto could not find an available peer assistant for HOST_ASSISTANT=${target}. ${details}`);
+    throw new Error(`--peers=auto could not find any available peer assistant. ${details}`);
   }
 
   return {
-    peers: selected.join(","),
-    selected,
+    peers: selected.map(liveSetupPeerId).join(","),
+    selected: selected.map(liveSetupPeerId),
     skipped,
   };
 }
 
+function liveSetupPeerId(id: string): string {
+  return `${id}-live`;
+}
+
 export function resolveGeminiAutoPeerReadiness(env: NodeJS.ProcessEnv): { ok: boolean; detail: string } {
+  // --peers=auto always selects gemini-live (tmux interactive session).
+  // gemini-live uses the interactive Gemini CLI which supports both API key and OAuth login.
+  // There is no reason to exclude it from auto-selection: the CLI will prompt for auth on first
+  // launch if needed, and the tmux session persists the authenticated state across reviews.
   if (isTruthySetupEnv(env.GOOGLE_GENAI_USE_VERTEXAI)) {
-    return {
-      ok: false,
-      detail: "gemini found, but --peers=auto does not select Gemini in Vertex AI mode. Use --peers=gemini to opt into Vertex credentials.",
-    };
+    // Vertex AI requires specific credentials; always include but note the requirement.
+    return { ok: true, detail: "gemini found (Vertex AI mode; ensure GOOGLE_APPLICATION_CREDENTIALS or gcloud auth is configured)" };
   }
   if (env.GEMINI_API_KEY?.trim() || env.GOOGLE_API_KEY?.trim()) {
     return { ok: true, detail: "gemini found and API key environment is set" };
   }
-  return {
-    ok: false,
-    detail: "gemini found, but --peers=auto only selects Gemini when GEMINI_API_KEY/GOOGLE_API_KEY is set. Use --peers=gemini to opt into Gemini CLI OAuth or Vertex credentials.",
-  };
+  // No API key set — still include gemini-live because it authenticates via OAuth in the
+  // interactive CLI session (gemini login). Default to tmux usage.
+  return { ok: true, detail: "gemini found; gemini-live will authenticate via the interactive Gemini CLI (run 'gemini' once to login if not yet authenticated)" };
 }
 
 export function upsertCodexMcpTimeoutConfig(current: string, serverPath: string, timeoutSec: number): string {

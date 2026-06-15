@@ -19,14 +19,14 @@
 
 ## 功能
 
-- 内置 Claude Code / Codex adapter
+- 内置 Claude Code / Codex / Gemini adapter
+- 默认 peer routing 优先使用 `claude-live`、`codex-live`、`gemini-live`。
 - `claude-live` adapter：把 Claude 审查发送到后台运行的交互式 Claude 会话（使用订阅额度，不使用 `claude -p`，自动启动并支持 `claude -p` fallback）
 - 支持通过 stdin 或 argv 接收 prompt 的自定义 CLI adapter
 - 代码修改后的 mandatory review gate
 - `normal`, `adversarial`, `gate`, `collaborative` 审查模式
 - `peer_fix` workflow：reviewer 只提出修复建议，不直接编辑文件
 - SQLite 持久化 task memory、review rounds、findings、async status
-- 同状态 dedup：仓库状态与选项和上次完成的审查一致时直接返回已记录的审查（零 token；`force_review` 可强制重跑）
 - 用于避免 MCP host timeout 的 async-first review flow
 - 用于 MCP 注册和本地诊断的 `setup`, `doctor`
 - `CLAUDE.md` 和 `AGENTS.md` project rule installer
@@ -71,7 +71,7 @@ bun cli.ts setup claude
 bun cli.ts setup both --workflow=peer_fix --mode=gate
 
 # 配置 multi-peer review
-bun cli.ts setup both --peers=claude,codex,gemini --mode=adversarial
+bun cli.ts setup both --peers=claude-live,codex-live,gemini-live --mode=adversarial
 
 # 在当前项目安装 CLAUDE.md / AGENTS.md rules
 bun cli.ts setup both --install-rules
@@ -122,16 +122,17 @@ gemini -> gemini --skip-trust --approval-mode plan -p ""  # 提示词通过 stdi
 ```
 
 第四个内置 adapter `claude-live` 不会启动 `claude -p`，而是通过 localhost broker 把审查发送到
-**后台运行的交互式 Claude 会话**，因此 Claude 审查计入**订阅额度**而不是 Agent SDK 信用额度。
+**后台运行的交互式 Claude 会话**，因此 Claude 审查保留在**订阅额度**。自 2026-06-15 起，
+`claude -p` / Agent SDK 审查使用单独的 programmatic/API 信用额度。
 broker 和 reviewer worker 会在第一次 `claude-live` 审查时自动启动；会话按仓库隔离且为只读；
 broker/会话不可用时自动 fallback 到启动 `claude -p`。在原本使用 `claude` 作为 peer 的地方直接
-替换即可（`PEER_ASSISTANTS=claude-live` 或 `codex,claude-live`）。详细配置与计费验证清单见
+替换即可（`PEER_ASSISTANTS=claude-live` 或 `codex-live,claude-live`）。详细配置与计费验证清单见
 [broker/REVIEWER.md](../broker/REVIEWER.md)。
 
 `gemini-live`、`codex-live` 以相同方式路由（交互式 Gemini/Codex 会话，不可用时回退到无头 CLI）。与 Claude
-不同，它们没有计费池差异，好处是**持久会话 + 跨审查记忆**（默认保留；`CODE_ASSISTANT_PEERS_REVIEWER_CLEAR=always` 则每次审查前清空）。切换模型时会在 resume 同一会话的前提下重启，因此 `review_model` 也适用于实时会话。
-self-review 等 host 侧流程也可通过 `CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS=1` 在 host 的实时会话中运行；
-由 `CODE_ASSISTANT_PEERS_SELF_REVIEW`（默认 `codex` / `all` / `none` / `claude,codex` 等）决定哪些 host 自审。
+不同，它们没有计费池差异，好处是**持久会话 + 跨审查记忆**（`CODE_ASSISTANT_PEERS_REVIEWER_CLEAR=never`）。
+self-review 和 aggregate 等 host 侧 pass 默认也使用 host 的 live adapter。若要强制使用 headless host 路径，
+设置 `CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS=0`。由 `CODE_ASSISTANT_PEERS_SELF_REVIEW`（默认 `codex` / `all` / `none` / `claude,codex` 等）决定哪些 host 自审。
 
 其他 CLI 可以通过 `CODE_ASSISTANT_PEERS_ASSISTANTS` 注册，`prompt_transport` 可取
 `stdin`、`argv` 或 `channel`（`channel` 表示不启动 command，而是把审查发送到 live-reviewer
@@ -153,14 +154,14 @@ export CODE_ASSISTANT_PEERS_ASSISTANTS='{
 指定 host/peer：
 
 ```bash
-HOST_ASSISTANT=gemini PEER_ASSISTANT=codex code-assistant-peers-server
-HOST_ASSISTANT=codex PEER_ASSISTANT=gemini code-assistant-peers-server
+HOST_ASSISTANT=gemini PEER_ASSISTANT=codex-live code-assistant-peers-server
+HOST_ASSISTANT=codex PEER_ASSISTANT=gemini-live code-assistant-peers-server
 ```
 
 multi-peer review：
 
 ```bash
-HOST_ASSISTANT=claude PEER_ASSISTANTS=codex,gemini,glm code-assistant-peers-server
+HOST_ASSISTANT=claude PEER_ASSISTANTS=codex-live,gemini-live,glm code-assistant-peers-server
 ```
 
 结果状态：
@@ -262,13 +263,18 @@ review prompt 与 Codex 风格的 review heuristic 对齐：
 | `HOST_ASSISTANT` | required | 当前 host assistant id |
 | `PEER_ASSISTANT` | inferred | reviewer assistant id |
 | `PEER_ASSISTANTS` | unset | multi-peer reviewer id 列表 |
-| `CODE_ASSISTANT_PEERS_REVIEW_MODEL` | unset | host 未传 review_model 时的默认值（推荐 `auto`：小 diff 自动路由到低成本模型） |
-| `CODE_ASSISTANT_PEERS_MEMORY_ROUNDS` | `3` | 内联到 prompt 的最近审查轮数（未解决 findings 始终全部包含） |
-| `CODE_ASSISTANT_PEERS_REVIEWER_CLEAR` | keep | 实时会话默认保留对话记忆；`always` 则每次审查前清空 |
+| `CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS` | live by default | 设置为 `0`, `false`, `no`, `off` 时强制 host-side pass 使用 headless CLI |
 | `CODE_ASSISTANT_PEERS_ASSISTANTS` | built-ins only | custom CLI adapter JSON |
+| `CODE_ASSISTANT_PEERS_PROBE_MODELS` | unset | 设置为 `1` 时对 known model candidates 执行小型 live probe |
+| `CODE_ASSISTANT_PEERS_MODEL_PROBE_TIMEOUT_MS` | `30000` | model probe timeout |
+| `CODE_ASSISTANT_PEERS_DEV_LOG` | unset | 设置为 `1` 时记录 broker jobs、`requestedModel`/`usedModel`、tmux resume、marker extraction 的 JSONL log |
+| `CODE_ASSISTANT_PEERS_DEV_LOG_PATH` | `<cwd>/.code-assistant-peers-dev/<scope>.jsonl` | developer JSONL log path。默认目录已加入 gitignore |
 | `CODE_ASSISTANT_PEERS_WORKFLOW` | `review_only` | `review_only` 或 `peer_fix` |
 | `CODE_ASSISTANT_PEERS_REVIEW_MODE` | `normal` | `normal`, `adversarial`, `gate`, `collaborative` |
 | `CODE_ASSISTANT_PEERS_REVIEW_FOCUS` | unset | 默认 review focus |
+| `CODE_ASSISTANT_PEERS_CONTEXT_PROVIDER` | `symbols` | `symbols`, `serena`, `serena-auto`, `serena-direct`, `off` |
+| `CODE_ASSISTANT_PEERS_SERENA_COMMAND` | unset | Serena MCP stdio server command |
+| `CODE_ASSISTANT_PEERS_SERENA_CONTEXT_BUDGET` | `8000` | Serena semantic context 字符预算 |
 | `CODE_ASSISTANT_PEERS_HOME` | `~/.mcp-code-assistant-peers` | SQLite storage |
 | `CODE_ASSISTANT_PEERS_DIFF_BUDGET` | `12000` | diff 字符预算 |
 | `CODE_ASSISTANT_PEERS_REVIEW_OUTPUT_BUDGET` | `6000` | tool response 字符预算 |
