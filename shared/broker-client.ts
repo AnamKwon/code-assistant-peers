@@ -41,6 +41,7 @@ export async function reviewViaBroker(
   timeoutMs: number,
   cwd = "",
   pollIntervalMs = 1000,
+  model?: string | null,
 ): Promise<BrokerReply> {
   const base = brokerUrl();
   // Bound the WHOLE operation (submit + polling) by timeoutMs — compute the deadline up front
@@ -52,7 +53,7 @@ export async function reviewViaBroker(
       method: "POST",
       headers: { "content-type": "application/json" },
       // cwd routes the review to a per-repo reviewer session on the worker side.
-      body: JSON.stringify({ reviewer, prompt, cwd }),
+      body: JSON.stringify({ reviewer, prompt, cwd, model: model?.trim() || undefined }),
       signal: AbortSignal.timeout(Math.min(REQUEST_TIMEOUT_MS, Math.max(1, deadline - Date.now()))),
     });
     if (!submit.ok) return { ok: false, text: "", error: `broker submit failed (HTTP ${submit.status})` };
