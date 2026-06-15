@@ -71,21 +71,43 @@ appears on demand. The MCP server logs one line to stderr when it auto-starts th
 
 ## Other live reviewers: `gemini-live`, `codex-live`
 
-The worker is generic over the reviewer CLI: `gemini-live` drives an interactive Gemini CLI
-session (`--skip-trust --approval-mode plan`, reset with `/clear`) and `codex-live` drives an
-interactive Codex TUI (`--sandbox read-only`, reset with `/new`). Unlike Claude there is **no
-known headless-vs-interactive billing split** for these — the benefit is a persistent per-repo
-session whose conversation memory can be kept across reviews
+The worker is generic over the reviewer CLI:
+
+**`gemini-live`** drives an interactive Gemini CLI session with:
+- `--skip-trust --approval-mode auto_edit` — auto-approves file-edit tools (write_file, replace)
+  without showing approval dialogs.
+- `--admin-policy <.peer-review/reviewer-policy.toml>` — the policy provides a hard shell+write
+  boundary: DENY `run_shell_command` (priority 5.600, blocks prompt-injection via shell),
+  ALLOW `write_file` to `.peer-review/` (priority 5.500), DENY `write_file` elsewhere (priority
+  5.100). Admin tier (5.x) overrides auto_edit tier (1.x), so the net result is: writes to
+  .peer-review/ are auto-approved; writes elsewhere are hard-denied; shell is hard-denied.
+- `--admin-policy <.peer-review/reviewer-policy.toml>` — a per-session policy written before launch.
+  Admin-policy tier (5.x) overrides the built-in autoEdit tier (1.x) so:
+  - DENY rule (priority 5.100) blocks `write_file`/`replace` to paths outside `.peer-review/`
+  - ALLOW rule (priority 5.500) permits writes inside `.peer-review/` for output files.
+  This gives a hard write boundary equivalent to claude's `--disallowedTools`.
+- Reset with `/clear` between reviews.
+
+**`codex-live`** drives an interactive Codex TUI with:
+- `--sandbox workspace-write -a never` — allows writes to the workspace. Note: `--sandbox read-only
+  --add-dir .peer-review/` does NOT work (codex ignores `--add-dir` in read-only mode), so
+  workspace-write is the only option that enables file output. The write-safety boundary for codex
+  is the injected `-c instructions=...` (advisory, not a hard sandbox).
+- Reset with `/new` between reviews.
+
+Unlike Claude there is **no known headless-vs-interactive billing split** for these — the benefit
+is a persistent per-repo session whose conversation memory can be kept across reviews
 (`CODE_ASSISTANT_PEERS_REVIEWER_CLEAR=never`). Both fall back to their headless CLI if the
 broker/session is unavailable. Both are live-verified.
 
-Prompt-file location differs by CLI to satisfy each one's read-permission model: claude/codex
-read it from a shared tmp dir (claude grants it with `--add-dir`); **gemini reads it from a
-`.peer-review/` dir inside the repo cwd** — gemini's `--include-directories` would otherwise
-raise a second "trust this folder?" prompt that stalls a detached session, and the repo cwd is
-already trusted via `--skip-trust`. The per-job file is deleted after each review; the empty
-`.peer-review/` dir is untracked by git. Gemini must be authenticated once interactively
-(`gemini` → login, or set `GEMINI_API_KEY`); the cached creds then work in the detached session.
+Both `gemini-live` and `codex-live` use **file-based review output**: the reviewer writes the
+review to `.peer-review/<jobId>-output.md` and the worker polls that file (falling back to
+`capture-pane` if the file is absent). Prompt files and output files are both in `.peer-review/`
+inside the repo cwd (gitignored), which each CLI can read and write under their respective
+permission models.
+
+Gemini must be authenticated once interactively (`gemini` → login, or set `GEMINI_API_KEY`);
+the cached creds then work in the detached session.
 
 ## Host-side passes on the live session
 
@@ -131,13 +153,23 @@ CODE_ASSISTANT_PEERS_REVIEWER_CWD="$PWD" bun broker/reviewer.ts
 | `CODE_ASSISTANT_PEERS_TMUX_SESSION` | `peer-reviewer` | tmux session BASE name (sessions are `<base>-<kind>-<repo>-<hash>`, one per CLI kind + repo) |
 | `CODE_ASSISTANT_PEERS_REVIEWER_CWD` | cwd | repo dir the reviewer runs in |
 | `CODE_ASSISTANT_PEERS_REVIEWER_CLAUDE_ARGS` | read-only flags | override `claude` args (JSON array or space-separated) |
-| `CODE_ASSISTANT_PEERS_REVIEWER_GEMINI_ARGS` | `--skip-trust --approval-mode plan` | override `gemini` args (JSON array or space-separated) |
-| `CODE_ASSISTANT_PEERS_REVIEWER_CODEX_ARGS` | `--sandbox read-only` | override `codex` args (JSON array or space-separated) |
-| `CODE_ASSISTANT_PEERS_REVIEWER_PROMPT_DIR` | per-kind | override where the per-job prompt file is written (claude/codex: a tmp dir; gemini: `<cwd>/.peer-review`) |
-| `CODE_ASSISTANT_PEERS_REVIEWER_CLEAR` | `always` | `never` keeps the session's conversation memory across reviews (richer follow-up context; note the session is per-REPO, so other tasks' history accumulates too, and a long-lived context will eventually auto-compact) |
+| `CODE_ASSISTANT_PEERS_REVIEWER_GEMINI_ARGS` | `--skip-trust --approval-mode auto_edit --admin-policy <.peer-review/reviewer-policy.toml>` | override `gemini` args (JSON array or space-separated); disables the auto-written policy file |
+| `CODE_ASSISTANT_PEERS_REVIEWER_CODEX_ARGS` | `--sandbox workspace-write -a never` (+ `-c instructions=...`) | override `codex` args; set to `--sandbox read-only` to disable file output (reverts to capture-pane extraction) |
+| `CODE_ASSISTANT_PEERS_REVIEWER_PROMPT_DIR` | per-kind | override where the per-job prompt/output files are written (claude: repo-hash subdir of TMPDIR; gemini/codex: `<cwd>/.peer-review`) |
+| `CODE_ASSISTANT_PEERS_REVIEWER_CLEAR` | *(keep history)* | Default: keep conversation memory across reviews so the reviewer accumulates repo knowledge. Set `always` to reset before each review (old behavior). Session is per-REPO, so history from other tasks in the same repo accumulates too; long-lived contexts will eventually auto-compact. |
 | `CODE_ASSISTANT_PEERS_REVIEWER_STARTUP_MS` | `30000` | how long to wait for the TUI to boot |
 | `CODE_ASSISTANT_PEERS_REVIEW_TIMEOUT_MS` | `600000` | per-review deliver timeout |
 | `CODE_ASSISTANT_PEERS_REVIEWER_POLL_MS` | `1000` | pane poll interval |
+| `CODE_ASSISTANT_PEERS_DEV_LOG` | unset | set to `1`, `true`, or `yes` to write developer-only JSONL events for broker jobs, model choices, tmux session creation/resume, and marker extraction |
+| `CODE_ASSISTANT_PEERS_DEV_LOG_PATH` | `<cwd>/.code-assistant-peers-dev/<scope>.jsonl` | optional explicit JSONL path for developer logging |
+
+Developer logging is intentionally opt-in. It is useful when repeatedly validating live model
+switching, tmux resume/session-id behavior, and marker extraction, but production/default runs do
+not write these files. The default log directory is ignored by git. If `CODE_ASSISTANT_PEERS_DEV_LOG_PATH`
+is set, broker and reviewer processes write to that same JSONL file so their events can be read in
+one timeline. Model-related events include `requestedModel` and `usedModel`; when no explicit model
+was requested, `usedModel` is recorded as `cli-default` because the worker cannot know the CLI's
+provider-side default model name.
 
 ## Read-only safety
 
@@ -149,14 +181,23 @@ state needed to review uncommitted changes.
 
 ## How delivery / capture works (and its limits)
 
-- The (large) review prompt is written to a temp file; the worker sends the session a SHORT
-  instruction ("read this file, review it, print `PEER-REVIEW-BEGIN-<jobId>`, the review, then
-  `PEER-REVIEW-DONE-<jobId>-END`").
-- Completion is detected by polling `capture-pane` until **both per-job-unique markers** have been
-  emitted (each also appears once in the echoed instruction, so each must appear at least twice).
-  The review is the text between the last BEGIN and the last DONE — wrapping the body in two
-  markers structurally excludes the echoed instruction, preamble narration, and tool-status
-  chrome; `clear-history` per job keeps the scrollback to the current job.
+For **claude-live**, **gemini-live**, and **codex-live** (file-output mode):
+- The prompt is written to a temp file. The reviewer is instructed to **write the review to a
+  per-job output file** using its Write tool AND **also print the review to the terminal** with
+  BEGIN/DONE markers. Two extraction paths run in parallel each poll cycle:
+  1. **File polling** (primary): `extractReviewFromFile` reads `<promptDir>/<jobId>-output.md`.
+     Preferred because it contains no TUI chrome.
+  2. **capture-pane** (fallback): if the file is absent or incomplete, the terminal capture is
+     tried. This ensures completion is detected even if the file write fails (policy mismatch,
+     tool refusal, unexpected model behavior).
+
+For **claude-live** only, `capture-pane` extraction is also the exclusive path when the user
+overrides `CODE_ASSISTANT_PEERS_REVIEWER_CLAUDE_ARGS` (disabling file output).
+
+For sessions without file-output mode:
+- The worker sends a SHORT instruction ("read this file, review it, print `PEER-REVIEW-BEGIN-<jobId>`,
+  the review, then `PEER-REVIEW-DONE-<jobId>-END`"). The instruction is echoed in the pane, so
+  each marker must appear **at least twice** (echo + emitted) for extraction to succeed.
 - This scrapes a rendered TUI screen, so capture is **best-effort**: very long reviews, heavy
   repaints, or unusual wrapping can degrade extraction. A wide pane (`-x 400`) and `capture-pane -J`
   (join wrapped lines) mitigate it. If the marker never appears within the timeout, the worker
@@ -170,35 +211,24 @@ failing — at the cost of the credit pool for that one review.
 
 ## review_model and the live session
 
-`review_model` / `review_models` (host-selected reviewer models) apply to **spawned CLI
-reviewers**. The live channel session reviews with whatever model it is running, so a requested
-model is logged-and-ignored on the broker path and only takes effect if that review falls back to
-spawning `claude -p`. To change the live reviewer's model, switch it in the tmux session
-(`/model`) or relaunch the worker with `CODE_ASSISTANT_PEERS_REVIEWER_CLAUDE_ARGS='... --model opus'`.
+`review_model` / `review_models` (host-selected reviewer models) apply to spawned CLI reviewers and
+to live channel reviewers. The host-selected model is included in the broker job payload and in the
+persisted command trace, for example `["<broker>", "claude-live", "--model", "opus"]`.
 
 Confirmed behavior:
 - Headless reviewers receive the selected model in the spawned command, e.g.
   `claude -p ... --model opus` or `gemini ... --model pro`.
-- Live reviewers currently keep one tmux TUI session per reviewer kind + repo. The broker job
-  payload does not include a model, and the worker does not send `/model`, so per-request model
-  selection is not applied while the broker path succeeds.
+- Live reviewers keep one tmux TUI session per reviewer kind + repo. The worker tracks the current
+  model for that session. If the next review requests a different model, the worker kills and
+  relaunches the same tmux session through the CLI resume/session-id path with the requested model.
+- Claude and Gemini start with an explicit generated `--session-id`, then resume by that id.
+- Codex starts normally, then the worker discovers the saved Codex session id from
+  `~/.codex/sessions/**/session_meta`. A Codex live model switch therefore requires at least one
+  completed saved Codex review before the worker can resume it with a different model.
 - With the default `CODE_ASSISTANT_PEERS_REVIEWER_CLEAR=always`, the process/session is reused but
   the conversation is reset before each review. Use `CODE_ASSISTANT_PEERS_REVIEWER_CLEAR=never`
   when the goal is to preserve reviewer memory across related reviews, accepting cross-task context
   bleed within the same repo and eventual auto-compaction.
-
-Preferred future design:
-1. Keep **one live tmux session per reviewer kind + repo** instead of starting a separate session
-   for every model.
-2. Add the resolved host-selected model to the broker job payload.
-3. Have the worker track the current model for each live session and send `/model <id>` only when
-   the next review requests a different model.
-4. Record the selection in the persisted round command, for example
-   `["<broker>", "claude-live", "--model", "opus"]`, so audits can distinguish "reviewed through
-   broker" from "reviewed through broker with requested model switch".
-5. Use CLI resume/session-id support only as a fallback design. `resume --last` is ambiguous when
-   unrelated sessions exist; a safe resume flow would need exact session ids stored by reviewer,
-   repo, and requested model state.
 
 ## Verification checklist (the remaining empirical step)
 
