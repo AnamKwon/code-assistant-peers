@@ -19,7 +19,8 @@ CLI 기반 코딩 어시스턴트끼리 서로 코드를 검토하게 만드는 
 
 ## 주요 기능
 
-- Claude Code/Codex 기본 adapter
+- Claude Code/Codex/Gemini 기본 adapter
+- 기본 peer routing은 `claude-live`, `codex-live`, `gemini-live`를 우선 사용합니다.
 - Claude 리뷰를 백그라운드 인터랙티브 Claude 세션으로 보내는 `claude-live` adapter (구독 풀 사용, `claude -p` 미사용, 자동 시작 + `claude -p` fallback)
 - stdin 또는 argv prompt를 받는 커스텀 CLI adapter
 - 코드 수정 후 호출해야 하는 mandatory review gate
@@ -70,7 +71,7 @@ bun cli.ts setup claude
 bun cli.ts setup both --workflow=peer_fix --mode=gate
 
 # multi-peer review 설정
-bun cli.ts setup both --peers=claude,codex,gemini --mode=adversarial
+bun cli.ts setup both --peers=claude-live,codex-live,gemini-live --mode=adversarial
 
 # 설치된 Claude/Codex/Gemini reviewer 자동 감지
 # Gemini 자동 선택은 GEMINI_API_KEY/GOOGLE_API_KEY가 있을 때만 사용합니다.
@@ -125,17 +126,17 @@ gemini -> gemini --skip-trust --approval-mode plan -p ""  # 프롬프트는 stdi
 ```
 
 네 번째 기본 adapter인 `claude-live`는 `claude -p`를 실행하지 않고 localhost broker를 통해
-**백그라운드 인터랙티브 Claude 세션**으로 리뷰를 보냅니다. 그래서 Claude 리뷰가 Agent SDK
-크레딧 풀이 아닌 **구독 풀**에 남습니다. broker와 reviewer worker는 첫 `claude-live` 리뷰 때
+**백그라운드 인터랙티브 Claude 세션**으로 리뷰를 보냅니다. 2026-06-15 이후 `claude -p` / Agent SDK
+리뷰는 별도 programmatic/API 크레딧 풀을 사용하므로, live 경로를 통해 Claude 리뷰를 **구독 풀**에 남깁니다. broker와 reviewer worker는 첫 `claude-live` 리뷰 때
 자동으로 시작되고, 세션은 repo별 read-only이며, broker/세션 장애 시 `claude -p` 실행으로
 fallback합니다. peer로 `claude`를 쓰던 자리에 그대로 사용하면 됩니다
-(`PEER_ASSISTANTS=claude-live` 또는 `codex,claude-live`). 자세한 설정과 과금 확인 체크리스트는
+(`PEER_ASSISTANTS=claude-live` 또는 `codex-live,claude-live`). 자세한 설정과 과금 확인 체크리스트는
 [broker/REVIEWER.md](../broker/REVIEWER.md)를 참고하세요.
 
 `gemini-live`, `codex-live`도 같은 방식으로 라우팅됩니다(인터랙티브 Gemini/Codex 세션, 실패 시 헤드리스
 CLI로 폴백). Claude와 달리 과금 분리는 없고, 장점은 **세션 유지 + 리뷰 간 메모리**입니다
-(`CODE_ASSISTANT_PEERS_REVIEWER_CLEAR=never`). 자가리뷰 등 host 측 패스도
-`CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS=1`로 host의 라이브 세션에서 돌릴 수 있고, 자가리뷰 대상은
+(`CODE_ASSISTANT_PEERS_REVIEWER_CLEAR=never`). 자가리뷰와 aggregate 같은 host 측 패스도 기본적으로
+host의 live adapter를 사용합니다. headless host 경로를 강제하려면 `CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS=0`을 설정하세요. 자가리뷰 대상은
 `CODE_ASSISTANT_PEERS_SELF_REVIEW`(기본 `codex` / `all` / `none` / `claude,codex` 등)로 정합니다.
 
 다른 CLI는 `CODE_ASSISTANT_PEERS_ASSISTANTS`에 JSON으로 등록합니다. `prompt_transport`는
@@ -158,14 +159,14 @@ export CODE_ASSISTANT_PEERS_ASSISTANTS='{
 명시적 host/peer 설정:
 
 ```bash
-HOST_ASSISTANT=gemini PEER_ASSISTANT=codex code-assistant-peers-server
-HOST_ASSISTANT=codex PEER_ASSISTANT=gemini code-assistant-peers-server
+HOST_ASSISTANT=gemini PEER_ASSISTANT=codex-live code-assistant-peers-server
+HOST_ASSISTANT=codex PEER_ASSISTANT=gemini-live code-assistant-peers-server
 ```
 
 multi-peer review:
 
 ```bash
-HOST_ASSISTANT=claude PEER_ASSISTANTS=codex,gemini,glm code-assistant-peers-server
+HOST_ASSISTANT=claude PEER_ASSISTANTS=codex-live,gemini-live,glm code-assistant-peers-server
 ```
 
 결과 상태:
@@ -254,7 +255,7 @@ peer review는 설정에 따라 토큰을 많이 사용할 수 있습니다. MCP
 
 주요 비용 원인:
 
-- `PEER_ASSISTANTS=claude,codex,gemini`는 사용 가능한 peer마다 review prompt를 한 번씩 보냅니다.
+- `PEER_ASSISTANTS=claude-live,codex-live,gemini-live`는 사용 가능한 peer마다 review prompt를 한 번씩 보냅니다. host 자신의 base/live variant는 런타임에 제거됩니다.
 - Codex host self-review는 `normal`/`adversarial` 모드에서 Codex pass를 하나 더 추가합니다.
 - aggregate pass는 peer output과 repository/task context를 다시 받아 최종 결과를 합칩니다.
 - `CODE_ASSISTANT_PEERS_DIFF_BUDGET`은 raw diff 포함량을 제어합니다. 기본값은 `12000`자입니다.
@@ -262,8 +263,8 @@ peer review는 설정에 따라 토큰을 많이 사용할 수 있습니다. MCP
 - reviewer는 diff만으로 부족하면 repository를 직접 inspect할 수 있으므로 Claude print mode나 Codex exec가 추가 파일을 읽을 수 있습니다.
 - 이전 review round memory가 후속 round prompt에 포함되어, 반복 리뷰일수록 prompt가 커질 수 있습니다.
 
-과금 풀 참고: 2026-06-15부터 `claude -p`로 실행되는 리뷰는 Claude 구독이 아닌 별도의 Agent SDK
-월간 크레딧에서 차감됩니다. `claude-live` adapter는 리뷰를 백그라운드 인터랙티브 세션으로
+과금 풀 참고: 2026-06-15부터 `claude -p` / Agent SDK로 실행되는 리뷰는 Claude 구독이 아닌 별도의 programmatic/API
+월간 크레딧에서 차감됩니다. 기본 live routing은 `claude-live`를 우선 사용해 리뷰를 백그라운드 인터랙티브 세션으로
 보내 Claude 리뷰를 구독 풀에 유지합니다 — [broker/REVIEWER.md](../broker/REVIEWER.md) 참고.
 
 저비용 권장 설정:
@@ -305,10 +306,18 @@ CODE_ASSISTANT_PEERS_CONTEXT_PROVIDER=off
 | `HOST_ASSISTANT` | required | 현재 host assistant id |
 | `PEER_ASSISTANT` | inferred | reviewer assistant id |
 | `PEER_ASSISTANTS` | unset | multi-peer reviewer id 목록 |
+| `CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS` | live by default | `0`, `false`, `no`, `off`로 설정하면 host-side pass를 headless CLI로 강제 |
 | `CODE_ASSISTANT_PEERS_ASSISTANTS` | built-ins only | custom CLI adapter JSON |
+| `CODE_ASSISTANT_PEERS_PROBE_MODELS` | unset | `1`이면 known model candidate를 작은 live probe로 확인 |
+| `CODE_ASSISTANT_PEERS_MODEL_PROBE_TIMEOUT_MS` | `30000` | model probe timeout |
+| `CODE_ASSISTANT_PEERS_DEV_LOG` | unset | `1`이면 broker job, `requestedModel`/`usedModel`, tmux resume, marker extraction JSONL 로그 기록 |
+| `CODE_ASSISTANT_PEERS_DEV_LOG_PATH` | `<cwd>/.code-assistant-peers-dev/<scope>.jsonl` | developer JSONL 로그 경로. 기본 디렉터리는 gitignore됨 |
 | `CODE_ASSISTANT_PEERS_WORKFLOW` | `review_only` | `review_only` 또는 `peer_fix` |
 | `CODE_ASSISTANT_PEERS_REVIEW_MODE` | `normal` | `normal`, `adversarial`, `gate`, `collaborative` |
 | `CODE_ASSISTANT_PEERS_REVIEW_FOCUS` | unset | 기본 review focus |
+| `CODE_ASSISTANT_PEERS_CONTEXT_PROVIDER` | `symbols` | `symbols`, `serena`, `serena-auto`, `serena-direct`, `off` |
+| `CODE_ASSISTANT_PEERS_SERENA_COMMAND` | unset | Serena MCP stdio server 실행 명령 |
+| `CODE_ASSISTANT_PEERS_SERENA_CONTEXT_BUDGET` | `8000` | Serena semantic context 문자 예산 |
 | `CODE_ASSISTANT_PEERS_HOME` | `~/.mcp-code-assistant-peers` | SQLite 저장 위치 |
 | `CODE_ASSISTANT_PEERS_DIFF_BUDGET` | `12000` | diff 포함 문자 예산 |
 | `CODE_ASSISTANT_PEERS_REVIEW_OUTPUT_BUDGET` | `6000` | tool response 문자 예산 |
