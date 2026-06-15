@@ -405,7 +405,7 @@ const TOOLS = [
         },
         poll_interval_ms: {
           type: "number" as const,
-          description: "Polling interval in milliseconds. Defaults to 1000.",
+          description: "Polling interval in milliseconds. Defaults to 500 and is capped at 5000.",
         },
       },
       required: ["task_id"],
@@ -1133,7 +1133,7 @@ async function waitForPeerReviewTool(args: unknown) {
   const taskId = String(parsed.task_id ?? "").trim();
   if (!taskId) return textResult("task_id is required", true);
   const timeoutSeconds = clampNumber(Number(parsed.timeout_seconds ?? 30), 1, 90);
-  const pollIntervalMs = clampNumber(Number(parsed.poll_interval_ms ?? 1000), 250, 5000);
+  const pollIntervalMs = clampNumber(Number(parsed.poll_interval_ms ?? 500), 100, 5000);
   const deadline = Date.now() + timeoutSeconds * 1000;
 
   while (Date.now() <= deadline) {
@@ -1377,70 +1377,53 @@ async function runMultiPeerReviewTool(
     return textResult(body, committedStatus === "review_failed");
   }
 
-  const aggregatePromptResult = await buildMultiPeerAggregatePrompt(task, options, peerResults, skippedPeers, selfReviewResult, snapshot);
-  const aggregatePrompt = aggregatePromptResult.prompt;
-  const aggregateStartedAt = new Date().toISOString();
-  // The aggregate pass runs as the HOST — for a claude host that spawns `claude -p` (credit
-  // pool). liveHostReviewer optionally routes it through the host's live session instead.
-  const aggregateReviewer = liveHostReviewer(task.host);
-  const aggregateResult = await runReviewCommand(
-    aggregateReviewer,
-    task.cwd,
-    aggregatePrompt,
-    resolveReviewerModel(aggregateReviewer, options, buildReviewModelRoutingContext(options, snapshot)),
-  );
-  const aggregateCompletedAt = new Date().toISOString();
-  const aggregateWarning = [aggregatePromptResult.warning, selfReviewFailureWarning].filter(Boolean).join("\n") || undefined;
-  const aggregateReview: PeerReviewResult = {
-    reviewer: task.host,
-    command: aggregateResult.command,
-    exit_code: aggregateResult.exitCode,
-    stdout: aggregateResult.stdout,
-    stderr: aggregateResult.stderr,
-    started_at: aggregateStartedAt,
-    completed_at: aggregateCompletedAt,
-    warning: aggregateWarning,
-  };
-  const aggregateCommit = await withReviewCommitLock(task.id, expectedSignature, async (current) => {
+  // No aggregate pass — all peer results delivered directly to the host.
+  // The host (Claude Code) reads each reviewer's findings and decides what to fix.
+  // This eliminates a redundant synthesis step and saves tokens.
+  const finalCompletedAt = new Date().toISOString();
+  const finalCommit = await withReviewCommitLock(task.id, expectedSignature, async (current) => {
     const resolvedStatus = resolveMultiPeerTaskStatus({
       successfulPeerReviews: statusResults.filter((result) => result.review.exit_code === 0).length,
       failedPeerReviews: statusResults.filter((result) => result.review.exit_code !== 0).length,
       skippedPeers: skippedPeers.length,
-      aggregateExitCode: aggregateResult.exitCode,
+      aggregateExitCode: 0,
     });
-    current.review = aggregateReview;
+    const lastPeer = statusResults[statusResults.length - 1];
+    if (lastPeer) current.review = lastPeer.review;
     current.status = resolvedStatus;
-    current.updated_at = aggregateCompletedAt;
-    const aggregateRound = await appendReviewRoundAndSaveTask(current, aggregateReview, aggregatePrompt);
-    return { round: aggregateRound, status: resolvedStatus };
+    current.updated_at = finalCompletedAt;
+    await saveTask(current);
+    return resolvedStatus;
   });
-  if (!aggregateCommit) {
-    log(`Skipping stale multi-peer aggregate finalization for task ${task.id}.`);
+  if (!finalCommit) {
+    log(`Skipping stale multi-peer finalization for task ${task.id}.`);
     return textResult("Review was superseded by a newer request.", true);
   }
-  const aggregateRound = aggregateCommit.round;
-  const aggregateStatus = aggregateCommit.status;
+
+  const peerOutputs = reviewResults.map((result) => {
+    return [
+      `--- Reviewer: ${result.label} (round ${result.round.round}, exit ${result.review.exit_code}) ---`,
+      result.review.stdout.trim()
+        ? compactForToolResult(result.review.stdout, Math.floor(REVIEW_OUTPUT_BUDGET / Math.max(1, reviewResults.length)))
+        : "(no output)",
+      shouldIncludeStderr(result.review.exit_code, result.review.stderr)
+        ? `stderr: ${compactForToolResult(result.review.stderr, 1000)}`
+        : "",
+    ].filter(Boolean).join("\n");
+  }).join("\n\n");
 
   const body = [
     `Multi-peer review completed for task ${task.id}.`,
     `Requested peers: ${taskPeers.join(", ")}`,
     `Reviewed by: ${reviewResults.map((result) => result.label).join(", ")}`,
     skippedPeers.length ? `Skipped unavailable peers:\n${skippedPeers.map((item) => `- ${item.reviewer}: ${item.available.detail}`).join("\n")}` : "",
-    peerResults.length ? `Peer rounds: ${peerResults.map((result) => `${result.round.round} (${result.label}, exit ${result.review.exit_code})`).join(", ")}` : "",
-    selfReviewResult ? `Self-review round: ${selfReviewResult.round.round} (${selfReviewResult.label}, exit ${selfReviewResult.review.exit_code}).` : "",
-    selfReviewFailureWarning ? `Self-review warning: ${selfReviewFailureWarning}` : "",
-    `Aggregate round: ${aggregateRound.round} (${task.host}, exit ${aggregateResult.exitCode}).`,
-    aggregateWarning ? `Aggregate warning: ${aggregateWarning}` : "",
-    aggregateResult.stdout.trim()
-      ? `Aggregated review output:\n${compactForToolResult(aggregateResult.stdout, REVIEW_OUTPUT_BUDGET)}`
-      : "",
-    shouldIncludeStderr(aggregateResult.exitCode, aggregateResult.stderr)
-      ? `Aggregate reviewer stderr:\n${compactForToolResult(aggregateResult.stderr, Math.min(REVIEW_OUTPUT_BUDGET, 3000))}`
-      : "",
-    `Task status: ${aggregateStatus}`,
+    selfReviewFailureWarning ? `Warning: ${selfReviewFailureWarning}` : "",
+    peerOutputs,
+    `Task status: ${finalCommit}`,
+    "Report the codex-live, gemini-live review result to the user, including any actionable findings.",
   ].filter(Boolean).join("\n\n");
 
-  return textResult(body, aggregateStatus === "review_failed");
+  return textResult(body, finalCommit === "review_failed");
 }
 
 async function runSinglePeerRound(

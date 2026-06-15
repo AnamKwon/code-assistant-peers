@@ -30,7 +30,7 @@ export function buildReviewCommand(reviewer: AssistantHost, model?: string | nul
   const adapter = getAssistantAdapter(reviewer);
   let command = adapter.command.map((part) => part === "{system_prompt}" ? REVIEWER_SYSTEM_PROMPT : part);
   command = insertModelArg(command, adapter, model);
-  if (reviewer !== "claude") return command;
+  if (reviewer !== "claude" && reviewer !== "claude-live") return command;
 
   const serenaCommand = parseSerenaCommand(process.env.CODE_ASSISTANT_PEERS_SERENA_COMMAND);
   const mcpConfig = JSON.stringify({
@@ -65,11 +65,10 @@ export async function runReviewCommand(
     // Auto-start the broker + backgrounded reviewer worker if they are not already running, so a
     // host only has to pick `claude-live` — no manual daemon launch. Idempotent + reused.
     await ensureChannelBackend(cwd);
-    // The requested model rides along on the job; the worker switches the live session to it
-    // (restart + resume, conversation preserved) when it differs from the session's current model.
-    const reply = await reviewViaBroker(reviewer, prompt, resolveChannelTimeoutMs(), cwd, model?.trim() || null);
+    const reply = await reviewViaBroker(reviewer, prompt, resolveChannelTimeoutMs(), cwd, 250, model);
     if (reply.ok) {
-      return { exitCode: 0, stdout: reply.text, stderr: "", command: ["<broker>", reviewer] };
+      const command = model?.trim() ? ["<broker>", reviewer, "--model", model.trim()] : ["<broker>", reviewer];
+      return { exitCode: 0, stdout: reply.text, stderr: "", command };
     }
     console.error(`[code-assistant-peers] broker channel unavailable (${reply.error}); falling back to spawning ${reviewer}.`);
     transport = "stdin";

@@ -1,5 +1,8 @@
 import type { AssistantAdapter, AssistantHost } from "./types.ts";
+import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
+
+const BUILTIN_REVIEWER_MODELS = loadBuiltinReviewerModels();
 
 export const BUILTIN_ASSISTANTS: Record<string, AssistantAdapter> = {
   codex: {
@@ -8,13 +11,7 @@ export const BUILTIN_ASSISTANTS: Record<string, AssistantAdapter> = {
     prompt_transport: "stdin",
     description: "OpenAI Codex CLI in read-only exec mode.",
     model_arg: "-m",
-    models: [
-      { id: "gpt-5.5", quality: "highest", cost: "high", latency: "high", routing: ["deep", "long_context"], description: "Newest frontier model candidate for the highest-risk Codex reviews." },
-      { id: "gpt-5.4", quality: "highest", cost: "high", latency: "medium", routing: ["balanced", "long_context"], description: "Frontier model candidate for strong general Codex review and broad contexts." },
-      { id: "gpt-5.3-codex", quality: "highest", cost: "high", latency: "high", routing: ["deep", "balanced"], description: "Codex-optimized model candidate for agentic coding and deep code review." },
-      { id: "gpt-5.4-mini", quality: "high", cost: "medium", latency: "low", routing: ["fast", "balanced"], description: "Lower-latency GPT-5.4 family model candidate for routine review." },
-      { id: "gpt-5.4-nano", quality: "medium", cost: "low", latency: "low", routing: ["fast"], description: "Lowest-cost GPT-5.4 family model candidate for small low-risk diffs." },
-    ],
+    models: BUILTIN_REVIEWER_MODELS.codex,
     env_allowlist: [
       "PATH",
       "HOME",
@@ -71,15 +68,7 @@ export const BUILTIN_ASSISTANTS: Record<string, AssistantAdapter> = {
     prompt_transport: "stdin",
     description: "Claude Code print mode with read-only review tools.",
     model_arg: "--model",
-    models: [
-      { id: "haiku", quality: "medium", cost: "low", latency: "low", routing: ["fast"], description: "Fast review for docs and small low-risk diffs." },
-      { id: "sonnet", quality: "high", cost: "medium", latency: "medium", routing: ["balanced"], description: "Balanced default review model." },
-      { id: "opus", quality: "highest", cost: "high", latency: "high", routing: ["deep"], description: "Deep review for security, migrations, large diffs, and release gates." },
-      { id: "best", quality: "highest", cost: "high", latency: "high", routing: ["deep"], description: "Claude Code alias for the most capable available model." },
-      { id: "sonnet[1m]", quality: "high", cost: "high", latency: "medium", routing: ["balanced", "long_context"], description: "Long-context Sonnet alias for large review contexts." },
-      { id: "opus[1m]", quality: "highest", cost: "high", latency: "high", routing: ["deep", "long_context"], description: "Long-context Opus alias for broad or truncated review contexts." },
-      { id: "opusplan", quality: "highest", cost: "high", latency: "high", routing: ["deep"], description: "Claude Code planning alias that uses Opus for planning and Sonnet for execution." },
-    ],
+    models: BUILTIN_REVIEWER_MODELS.claude,
     env_allowlist: [
       "PATH",
       "HOME",
@@ -99,17 +88,7 @@ export const BUILTIN_ASSISTANTS: Record<string, AssistantAdapter> = {
     description: "Gemini CLI headless review mode.",
     timeout_ms: 180000,
     model_arg: "--model",
-    models: [
-      { id: "auto", quality: "high", cost: "medium", latency: "medium", routing: ["balanced"], description: "Gemini CLI automatic model selection." },
-      { id: "pro", quality: "highest", cost: "high", latency: "high", routing: ["deep"], description: "Gemini CLI Pro alias for complex reasoning review." },
-      { id: "flash", quality: "high", cost: "low", latency: "low", routing: ["balanced", "fast"], description: "Gemini CLI Flash alias for fast balanced review." },
-      { id: "flash-lite", quality: "medium", cost: "low", latency: "low", routing: ["fast"], description: "Gemini CLI Flash Lite alias for small low-risk review." },
-      { id: "gemini-3-pro-preview", quality: "highest", cost: "high", latency: "high", routing: ["deep"], description: "Gemini 3 Pro preview model candidate." },
-      { id: "gemini-3-flash-preview", quality: "high", cost: "medium", latency: "low", routing: ["balanced", "fast"], description: "Gemini 3 Flash preview model candidate." },
-      { id: "gemini-2.5-pro", quality: "highest", cost: "high", latency: "high", routing: ["deep"], description: "Gemini 2.5 Pro model candidate." },
-      { id: "gemini-2.5-flash", quality: "high", cost: "low", latency: "low", routing: ["balanced", "fast"], description: "Gemini 2.5 Flash model candidate." },
-      { id: "gemini-2.5-flash-lite", quality: "medium", cost: "low", latency: "low", routing: ["fast"], description: "Gemini 2.5 Flash Lite model candidate." },
-    ],
+    models: BUILTIN_REVIEWER_MODELS.gemini,
     env_allowlist: [
       "PATH",
       "HOME",
@@ -154,11 +133,11 @@ BUILTIN_ASSISTANTS["codex-live"] = {
 };
 
 // Host-side review passes (codex self-review, the aggregate pass, collaborative host rounds)
-// normally spawn the HOST's headless CLI — for a claude host that is `claude -p` (credit pool).
-// With CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS=1, those passes route through the host's live
-// adapter instead, keeping the session persistent (and, for claude, on the subscription pool).
+// default to the HOST's live adapter when one exists. For Claude this avoids `claude -p`, which
+// now draws from the separate programmatic/API credit pool instead of the subscription pool.
+// Set CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS=0/off/false to force the legacy headless path.
 export function liveHostReviewer(host: AssistantHost, env: NodeJS.ProcessEnv = process.env, registry = loadAssistantRegistry()): AssistantHost {
-  if (env.CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS !== "1") return host;
+  if (isFalseyEnv(env.CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS)) return host;
   if (host.endsWith("-live")) return host;
   const live = `${host}-live`;
   return registry[live] ? live : host;
@@ -166,6 +145,12 @@ export function liveHostReviewer(host: AssistantHost, env: NodeJS.ProcessEnv = p
 
 let cachedCustomConfig: string | undefined;
 let cachedRegistry: Record<string, AssistantAdapter> | null = null;
+
+function loadBuiltinReviewerModels(): Record<string, AssistantAdapter["models"]> {
+  const text = readFileSync(new URL("./reviewer-models.json", import.meta.url), "utf8");
+  const parsed = JSON.parse(text) as Record<string, unknown>;
+  return Object.fromEntries(Object.entries(parsed).map(([id, models]) => [id, parseOptionalModels(id, models)]));
+}
 
 export function loadAssistantRegistry(env = process.env): Record<string, AssistantAdapter> {
   if (env === process.env && cachedRegistry && cachedCustomConfig === env.CODE_ASSISTANT_PEERS_ASSISTANTS) {
@@ -204,7 +189,12 @@ export function peersFor(
 ): AssistantHost[] {
   const configuredPeers = parseAssistantList(peersValue);
   if (configuredPeers.length > 0) {
-    const peers = unique(configuredPeers).filter((id) => id !== host);
+    // Allow a -live variant of the host's own base (e.g. claude-live when host=claude):
+    // it runs in a separate interactive tmux session and acts as an independent peer reviewer.
+    // Only filter out exact same-base same-transport duplicates (headless host = headless peer).
+    const peers = unique(configuredPeers).filter(
+      (id) => id.endsWith("-live") || baseAssistantId(id) !== baseAssistantId(host),
+    );
     if (peers.length === 0) throw new Error("PEER_ASSISTANTS must include at least one assistant different from HOST_ASSISTANT");
     for (const peer of peers) {
       if (!registry[peer]) {
@@ -221,17 +211,28 @@ export function peersFor(
       const available = Object.keys(registry).sort().join(", ");
       throw new Error(`PEER_ASSISTANT must be one of: ${available}`);
     }
-    if (configuredPeer === host) throw new Error("PEER_ASSISTANT must differ from HOST_ASSISTANT");
+    if (baseAssistantId(configuredPeer) === baseAssistantId(host)) throw new Error("PEER_ASSISTANT must differ from HOST_ASSISTANT");
     return [configuredPeer];
   }
 
-  if (host === "claude" && registry.codex) return ["codex"];
-  if (host === "codex") {
-    const defaultPeers = ["claude", "gemini"].filter((id) => Boolean(registry[id]));
+  if (baseAssistantId(host) === "claude") {
+    // Include claude-live as a peer even though it shares the same base as the host.
+    // claude-live runs in a SEPARATE interactive tmux session (potentially a different model),
+    // giving an independent review perspective. The host does NOT run a synthesis aggregate —
+    // all peer results are delivered directly for the host to process.
+    const defaultPeers = ["codex", "gemini", "claude"]
+      .map((id) => preferredLiveAssistant(id, registry))
+      .filter((id): id is string => Boolean(id));
+    if (defaultPeers.length > 0) return defaultPeers;
+  }
+  if (baseAssistantId(host) === "codex") {
+    const defaultPeers = ["claude", "gemini"]
+      .map((id) => preferredLiveAssistant(id, registry))
+      .filter((id): id is string => Boolean(id));
     if (defaultPeers.length > 0) return defaultPeers;
   }
 
-  const fallback = Object.keys(registry).find((id) => id !== host);
+  const fallback = Object.keys(registry).find((id) => baseAssistantId(id) !== baseAssistantId(host));
   if (!fallback) throw new Error("At least two assistant adapters are required, or PEER_ASSISTANT must be set.");
   return [fallback];
 }
@@ -418,6 +419,10 @@ export function isTruthyEnv(value: string | undefined): boolean {
   return ["1", "true", "yes", "on"].includes(value?.trim().toLowerCase() ?? "");
 }
 
+function isFalseyEnv(value: string | undefined): boolean {
+  return ["0", "false", "no", "off"].includes(value?.trim().toLowerCase() ?? "");
+}
+
 export function hasNonBlankEnv(value: string | undefined): boolean {
   return Boolean(value?.trim());
 }
@@ -447,6 +452,17 @@ function parseAssistantList(value: string | undefined): string[] {
     if (!id) throw new Error(`Invalid assistant id '${part}' in PEER_ASSISTANTS`);
     return id;
   });
+}
+
+function preferredLiveAssistant(base: string, registry: Record<string, AssistantAdapter>): string | null {
+  const live = `${base}-live`;
+  if (registry[live]) return live;
+  if (registry[base]) return base;
+  return null;
+}
+
+function baseAssistantId(id: string): string {
+  return id.endsWith("-live") ? id.slice(0, -"-live".length) : id;
 }
 
 function unique(values: string[]): string[] {

@@ -40,8 +40,8 @@ export async function reviewViaBroker(
   prompt: string,
   timeoutMs: number,
   cwd = "",
-  model: string | null = null,
-  pollIntervalMs = 1000,
+  pollIntervalMs = 250,
+  model?: string | null,
 ): Promise<BrokerReply> {
   const base = brokerUrl();
   // Bound the WHOLE operation (submit + polling) by timeoutMs — compute the deadline up front
@@ -52,9 +52,8 @@ export async function reviewViaBroker(
     const submit = await fetch(`${base}/jobs`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      // cwd routes the review to a per-repo reviewer session; model (optional) asks the worker
-      // to run this review on a specific model (switching the live session if needed).
-      body: JSON.stringify({ reviewer, prompt, cwd, model }),
+      // cwd routes the review to a per-repo reviewer session on the worker side.
+      body: JSON.stringify({ reviewer, prompt, cwd, model: model?.trim() || undefined }),
       signal: AbortSignal.timeout(Math.min(REQUEST_TIMEOUT_MS, Math.max(1, deadline - Date.now()))),
     });
     if (!submit.ok) return { ok: false, text: "", error: `broker submit failed (HTTP ${submit.status})` };
@@ -65,9 +64,18 @@ export async function reviewViaBroker(
     return { ok: false, text: "", error: `broker submit failed: ${error instanceof Error ? error.message : String(error)}` };
   }
 
+  // Poll with check-before-sleep: on the terminal iteration (when postResult() just fired) the
+  // result is already in the broker's in-memory map. Sleeping first adds up to pollIntervalMs of
+  // pure idle time after the reviewer finishes. Check immediately, then sleep between retries.
+  let firstPoll = true;
   while (Date.now() < deadline) {
-    // Clamp the inter-poll sleep to the remaining budget so it cannot overshoot the deadline.
-    await sleep(Math.min(pollIntervalMs, deadline - Date.now()));
+    if (!firstPoll) {
+      // Clamp the inter-poll sleep to the remaining budget so it cannot overshoot the deadline.
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      await sleep(Math.min(pollIntervalMs, remaining));
+    }
+    firstPoll = false;
     const remaining = deadline - Date.now();
     if (remaining <= 0) break;
     try {
