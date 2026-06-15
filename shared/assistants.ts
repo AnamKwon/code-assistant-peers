@@ -133,11 +133,11 @@ BUILTIN_ASSISTANTS["codex-live"] = {
 };
 
 // Host-side review passes (codex self-review, the aggregate pass, collaborative host rounds)
-// normally spawn the HOST's headless CLI — for a claude host that is `claude -p` (credit pool).
-// With CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS=1, those passes route through the host's live
-// adapter instead, keeping the session persistent (and, for claude, on the subscription pool).
+// default to the HOST's live adapter when one exists. For Claude this avoids `claude -p`, which
+// now draws from the separate programmatic/API credit pool instead of the subscription pool.
+// Set CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS=0/off/false to force the legacy headless path.
 export function liveHostReviewer(host: AssistantHost, env: NodeJS.ProcessEnv = process.env, registry = loadAssistantRegistry()): AssistantHost {
-  if (env.CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS !== "1") return host;
+  if (isFalseyEnv(env.CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS)) return host;
   if (host.endsWith("-live")) return host;
   const live = `${host}-live`;
   return registry[live] ? live : host;
@@ -189,7 +189,12 @@ export function peersFor(
 ): AssistantHost[] {
   const configuredPeers = parseAssistantList(peersValue);
   if (configuredPeers.length > 0) {
-    const peers = unique(configuredPeers).filter((id) => id !== host);
+    // Allow a -live variant of the host's own base (e.g. claude-live when host=claude):
+    // it runs in a separate interactive tmux session and acts as an independent peer reviewer.
+    // Only filter out exact same-base same-transport duplicates (headless host = headless peer).
+    const peers = unique(configuredPeers).filter(
+      (id) => id.endsWith("-live") || baseAssistantId(id) !== baseAssistantId(host),
+    );
     if (peers.length === 0) throw new Error("PEER_ASSISTANTS must include at least one assistant different from HOST_ASSISTANT");
     for (const peer of peers) {
       if (!registry[peer]) {
@@ -206,17 +211,28 @@ export function peersFor(
       const available = Object.keys(registry).sort().join(", ");
       throw new Error(`PEER_ASSISTANT must be one of: ${available}`);
     }
-    if (configuredPeer === host) throw new Error("PEER_ASSISTANT must differ from HOST_ASSISTANT");
+    if (baseAssistantId(configuredPeer) === baseAssistantId(host)) throw new Error("PEER_ASSISTANT must differ from HOST_ASSISTANT");
     return [configuredPeer];
   }
 
-  if (host === "claude" && registry.codex) return ["codex"];
-  if (host === "codex") {
-    const defaultPeers = ["claude", "gemini"].filter((id) => Boolean(registry[id]));
+  if (baseAssistantId(host) === "claude") {
+    // Include claude-live as a peer even though it shares the same base as the host.
+    // claude-live runs in a SEPARATE interactive tmux session (potentially a different model),
+    // giving an independent review perspective. The host does NOT run a synthesis aggregate —
+    // all peer results are delivered directly for the host to process.
+    const defaultPeers = ["codex", "gemini", "claude"]
+      .map((id) => preferredLiveAssistant(id, registry))
+      .filter((id): id is string => Boolean(id));
+    if (defaultPeers.length > 0) return defaultPeers;
+  }
+  if (baseAssistantId(host) === "codex") {
+    const defaultPeers = ["claude", "gemini"]
+      .map((id) => preferredLiveAssistant(id, registry))
+      .filter((id): id is string => Boolean(id));
     if (defaultPeers.length > 0) return defaultPeers;
   }
 
-  const fallback = Object.keys(registry).find((id) => id !== host);
+  const fallback = Object.keys(registry).find((id) => baseAssistantId(id) !== baseAssistantId(host));
   if (!fallback) throw new Error("At least two assistant adapters are required, or PEER_ASSISTANT must be set.");
   return [fallback];
 }
@@ -403,6 +419,10 @@ export function isTruthyEnv(value: string | undefined): boolean {
   return ["1", "true", "yes", "on"].includes(value?.trim().toLowerCase() ?? "");
 }
 
+function isFalseyEnv(value: string | undefined): boolean {
+  return ["0", "false", "no", "off"].includes(value?.trim().toLowerCase() ?? "");
+}
+
 export function hasNonBlankEnv(value: string | undefined): boolean {
   return Boolean(value?.trim());
 }
@@ -432,6 +452,17 @@ function parseAssistantList(value: string | undefined): string[] {
     if (!id) throw new Error(`Invalid assistant id '${part}' in PEER_ASSISTANTS`);
     return id;
   });
+}
+
+function preferredLiveAssistant(base: string, registry: Record<string, AssistantAdapter>): string | null {
+  const live = `${base}-live`;
+  if (registry[live]) return live;
+  if (registry[base]) return base;
+  return null;
+}
+
+function baseAssistantId(id: string): string {
+  return id.endsWith("-live") ? id.slice(0, -"-live".length) : id;
 }
 
 function unique(values: string[]): string[] {

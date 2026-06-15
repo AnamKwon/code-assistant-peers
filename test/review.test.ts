@@ -52,13 +52,18 @@ describe("assistant routing", () => {
   });
 
   test("selects the first default peer for Claude and Codex", () => {
-    expect(peerFor("claude")).toBe("codex");
-    expect(peerFor("codex")).toBe("claude");
+    expect(peerFor("claude")).toBe("codex-live");
+    expect(peerFor("codex")).toBe("claude-live");
   });
 
-  test("defaults Codex peer review to Claude and Gemini", () => {
-    expect(peersFor("codex")).toEqual(["claude", "gemini"]);
-    expect(peerFor("codex")).toBe("claude");
+  test("defaults Claude peer review to Codex, Gemini, and Claude live reviewers", () => {
+    // claude-live is now a default peer: separate tmux session, no aggregate synthesis needed.
+    expect(peersFor("claude")).toEqual(["codex-live", "gemini-live", "claude-live"]);
+  });
+
+  test("defaults Codex peer review to Claude and Gemini live reviewers", () => {
+    expect(peersFor("codex")).toEqual(["claude-live", "gemini-live"]);
+    expect(peerFor("codex")).toBe("claude-live");
   });
 
   test("defaults self-review to Codex host only (no env)", () => {
@@ -188,6 +193,15 @@ describe("assistant routing", () => {
       else process.env.PEER_ASSISTANT = previous;
     }
   });
+
+  test("allows live variants of the host as peers (separate interactive session)", () => {
+    // claude-live is allowed as a peer for claude host: it's a separate tmux session.
+    expect(peersFor("claude", "claude-live,codex-live")).toEqual(["claude-live", "codex-live"]);
+    // Headless claude is still filtered (same base, no -live); codex-live passes through.
+    expect(peersFor("claude", "claude,codex-live")).toEqual(["codex-live"]);
+    // Only headless same-base → throws (no peer remaining).
+    expect(() => peersFor("claude", "claude")).toThrow("PEER_ASSISTANTS must include at least one");
+  });
 });
 
 describe("multi-peer review behavior", () => {
@@ -282,57 +296,63 @@ describe("multi-peer review behavior", () => {
 });
 
 describe("setup helpers", () => {
-  test("auto-selects setup peers from available assistant CLIs", () => {
+  test("auto-selects setup peers from available assistant CLIs (including target's live variant)", () => {
+    // For codex target: includes claude-live, codex-live (target's own live variant), gemini-live
     expect(resolveAutoPeerSetupConfig(["codex"], {
       claude: { ok: true, detail: "/bin/claude" },
       codex: { ok: true, detail: "/bin/codex" },
       gemini: { ok: true, detail: "/bin/gemini" },
-    }).peers).toBe("claude,gemini");
+    }).peers).toBe("claude-live,codex-live,gemini-live");
 
+    // For codex target without claude: only codex-live + gemini-live
     expect(resolveAutoPeerSetupConfig(["codex"], {
       claude: { ok: false, detail: "missing" },
       codex: { ok: true, detail: "/bin/codex" },
       gemini: { ok: true, detail: "/bin/gemini" },
-    }).peers).toBe("gemini");
+    }).peers).toBe("codex-live,gemini-live");
 
+    // Multi-target: all available assistants included
     expect(resolveAutoPeerSetupConfig(["claude", "codex"], {
       claude: { ok: true, detail: "/bin/claude" },
       codex: { ok: true, detail: "/bin/codex" },
       gemini: { ok: false, detail: "no auth" },
-    }).peers).toBe("claude,codex");
+    }).peers).toBe("claude-live,codex-live");
   });
 
   test("auto peer setup fails when no reviewer is available", () => {
     expect(() => resolveAutoPeerSetupConfig(["codex"], {
       claude: { ok: false, detail: "missing" },
-      codex: { ok: true, detail: "/bin/codex" },
+      codex: { ok: false, detail: "missing" },
       gemini: { ok: false, detail: "no auth" },
-    })).toThrow("--peers=auto could not find an available peer assistant");
+    })).toThrow("--peers=auto could not find any available peer assistant");
 
-    expect(() => resolveAutoPeerSetupConfig(["claude", "codex"], {
+    // Now claude-live is always included for claude target, so this no longer throws
+    // (claude-live is available when claude is available)
+    expect(resolveAutoPeerSetupConfig(["claude", "codex"], {
       claude: { ok: true, detail: "/bin/claude" },
       codex: { ok: false, detail: "missing" },
       gemini: { ok: false, detail: "no auth" },
-    })).toThrow("--peers=auto could not find an available peer assistant for HOST_ASSISTANT=claude");
+    }).peers).toBe("claude-live");
   });
 
-  test("Gemini auto peer readiness is conservative", () => {
+  test("Gemini auto peer readiness always selects gemini-live (tmux default)", () => {
+    // API key path
     expect(resolveGeminiAutoPeerReadiness({ GEMINI_API_KEY: "key" } as NodeJS.ProcessEnv).ok).toBe(true);
     expect(resolveGeminiAutoPeerReadiness({ GOOGLE_API_KEY: "key" } as NodeJS.ProcessEnv).ok).toBe(true);
 
+    // OAuth-only (no API key) — now also ok; gemini-live authenticates via interactive CLI
     const oauthOnly = resolveGeminiAutoPeerReadiness({} as NodeJS.ProcessEnv);
-    expect(oauthOnly.ok).toBe(false);
-    expect(oauthOnly.detail).toContain("--peers=gemini");
-    expect(oauthOnly.detail).toContain("Gemini CLI OAuth or Vertex credentials");
+    expect(oauthOnly.ok).toBe(true);
+    expect(oauthOnly.detail).toContain("gemini-live");
 
+    // Vertex AI mode — now also ok (user must ensure credentials; always include gemini-live)
     const vertexMode = resolveGeminiAutoPeerReadiness({
       GEMINI_API_KEY: "key",
       GOOGLE_GENAI_USE_VERTEXAI: "true",
       GOOGLE_CLOUD_PROJECT: "project",
       GOOGLE_CLOUD_LOCATION: "us-central1",
     } as NodeJS.ProcessEnv);
-    expect(vertexMode.ok).toBe(false);
-    expect(vertexMode.detail).toContain("Vertex AI mode");
+    expect(vertexMode.ok).toBe(true);
   });
 
   test("adds codex MCP timeout section when missing", () => {
