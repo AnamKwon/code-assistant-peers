@@ -96,6 +96,9 @@ export interface ReviewRequestOptions {
   self_review?: boolean;
   review_model?: string | null;
   review_models?: Record<string, string>;
+  // Bypass the same-state dedup: re-run reviewers even when the repository state and review
+  // options match the latest completed review.
+  force_review?: boolean;
 }
 
 export type ReviewModelRoutingTier = "fast" | "balanced" | "deep" | "long_context";

@@ -76,7 +76,7 @@ session (`--skip-trust --approval-mode plan`, reset with `/clear`) and `codex-li
 interactive Codex TUI (`--sandbox read-only`, reset with `/new`). Unlike Claude there is **no
 known headless-vs-interactive billing split** for these — the benefit is a persistent per-repo
 session whose conversation memory can be kept across reviews
-(`CODE_ASSISTANT_PEERS_REVIEWER_CLEAR=never`). Both fall back to their headless CLI if the
+(kept by DEFAULT; set `CODE_ASSISTANT_PEERS_REVIEWER_CLEAR=always` for isolated reviews). Both fall back to their headless CLI if the
 broker/session is unavailable. Both are live-verified.
 
 Prompt-file location differs by CLI to satisfy each one's read-permission model: claude/codex
@@ -134,8 +134,10 @@ CODE_ASSISTANT_PEERS_REVIEWER_CWD="$PWD" bun broker/reviewer.ts
 | `CODE_ASSISTANT_PEERS_REVIEWER_GEMINI_ARGS` | `--skip-trust --approval-mode plan` | override `gemini` args (JSON array or space-separated) |
 | `CODE_ASSISTANT_PEERS_REVIEWER_CODEX_ARGS` | `--sandbox read-only` | override `codex` args (JSON array or space-separated) |
 | `CODE_ASSISTANT_PEERS_REVIEWER_PROMPT_DIR` | per-kind | override where the per-job prompt file is written (claude/codex: a tmp dir; gemini: `<cwd>/.peer-review`) |
-| `CODE_ASSISTANT_PEERS_REVIEWER_CLEAR` | `always` | `never` keeps the session's conversation memory across reviews (richer follow-up context; note the session is per-REPO, so other tasks' history accumulates too, and a long-lived context will eventually auto-compact) |
+| `CODE_ASSISTANT_PEERS_REVIEWER_CLEAR` | keep memory | DEFAULT keeps the session's conversation memory across reviews (note the session is per-REPO, so other tasks' history accumulates too, and a long-lived context will eventually auto-compact). `always` clears before every review for isolated rounds; `never` is a legacy alias for the default |
 | `CODE_ASSISTANT_PEERS_REVIEWER_STARTUP_MS` | `30000` | how long to wait for the TUI to boot |
+| `CODE_ASSISTANT_PEERS_RATE_LIMIT_PATTERNS` | unset | extra comma-separated, case-insensitive substrings that mark a usage/rate-limit notice |
+| `CODE_ASSISTANT_PEERS_RATE_LIMIT_COOLDOWN_MS` | `900000` | how long a rate-limited reviewer is skipped when the notice gives no explicit reset time |
 | `CODE_ASSISTANT_PEERS_REVIEW_TIMEOUT_MS` | `600000` | per-review deliver timeout |
 | `CODE_ASSISTANT_PEERS_REVIEWER_POLL_MS` | `1000` | pane poll interval |
 
@@ -168,13 +170,50 @@ If the broker or the reviewer worker is unavailable, `runReviewCommand` **falls 
 `claude -p`** (logs the reason to stderr). So the gate degrades to current behavior rather than
 failing — at the cost of the credit pool for that one review.
 
-## review_model and the live session
+## Model switching on the live session (review_model applied)
 
-`review_model` / `review_models` (host-selected reviewer models) apply to **spawned CLI
-reviewers**. The live channel session reviews with whatever model it is running, so a requested
-model is logged-and-ignored on the broker path and only takes effect if that review falls back to
-spawning `claude -p`. To change the live reviewer's model, switch it in the tmux session
-(`/model`) or relaunch the worker with `CODE_ASSISTANT_PEERS_REVIEWER_CLAUDE_ARGS='... --model opus'`.
+`review_model` / `review_models` now apply to live reviewers too. The requested model rides on
+the broker job; when it differs from the session's current model, the worker **restarts the
+session resuming the same conversation** on the new model — memory preserved, verified live on
+all three CLIs:
+
+| CLI | first launch | switch (restart + resume) | session ref |
+|---|---|---|---|
+| claude | `--session-id <uuid> --model X` | `--resume <uuid> --model Y` | uuid we assign |
+| gemini | `--session-id <uuid> -m X` | `-m Y --resume <index>` | per-project list index looked up from our uuid (`--list-sessions`) |
+| codex | `-m X` (cannot assign an id) | `codex resume <uuid> -c model=Y` | rollout uuid captured by grepping `~/.codex/sessions` for our unique job marker |
+
+Never `--last`/`latest`: session stores are shared with the user's own sessions (codex is even
+machine-global), so only explicit refs are used. If no resumable ref exists (e.g. a reused
+user-launched session, or codex before its first review), the switch restarts FRESH and logs
+`conversation memory reset`. No model requested / same model = no restart at all.
+
+Submission is echo-verified: a TUI that is still settling after a resume can swallow keystrokes,
+so the worker re-sends the instruction (up to 3 times) until its BEGIN marker appears in the pane.
+
+## Usage / rate-limit handling
+
+If a reviewer CLI runs out of its plan/usage limit, its TUI never emits the review markers — so
+the worker would otherwise poll for the full deliver timeout (default 10 min) and then fall back
+to spawning the same headless CLI (also limited). Instead:
+
+- **Fast detection**: each poll scans the pane for a usage/rate-limit notice (claude "usage/plan
+  limit reached", codex "… limit … resets …", gemini "quota exceeded"/"resource exhausted"/429,
+  etc.). On a match the review fails immediately with a clear `usage/rate limit` error instead of
+  timing out. Add CLI-specific phrases via `CODE_ASSISTANT_PEERS_RATE_LIMIT_PATTERNS`
+  (comma-separated, case-insensitive). A miss safely degrades to the normal timeout.
+- **Cooldown (no retry storm)**: the worker then blocks that reviewer (kind × repo) until the
+  message's "resets HH:MM" time, or `CODE_ASSISTANT_PEERS_RATE_LIMIT_COOLDOWN_MS` (default 15 min)
+  if none is given. Jobs for a cooled-down reviewer are skipped immediately with a
+  `reviewer X is rate-limited` error — **no session boot, no waiting**. Other reviewers are
+  unaffected, so a multi-peer review keeps running on the models that still have budget.
+
+## Session environment isolation
+
+Reviewer TUIs are launched through `env -i` with an explicit allowlist (PATH/HOME/auth vars
+etc.) — inheriting the spawning process's environment breaks nested CLIs (observed: Claude
+sessions stopped persisting transcripts, which silently broke resume). `ANTHROPIC_API_KEY` is
+deliberately NOT allowlisted so claude stays on subscription auth.
 
 ## Verification checklist (the remaining empirical step)
 
@@ -194,6 +233,6 @@ Run with the worker up and `PEER_ASSISTANTS=claude-live`:
 | | `claude -p` | tmux + live session |
 |---|---|---|
 | billing | credit pool (after 2026-06-15) ❌ | subscription ✅ (inferred; verify) |
-| concurrency | parallel (fresh process each) | serialized (one session) |
+| concurrency | parallel (fresh process each) | parallel across sessions (reviewer kind × repo); serialized within one session |
 | availability | always spawnable | session must be up (else fallback) |
 | stability | stable | TUI scraping is best-effort |

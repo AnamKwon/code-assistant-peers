@@ -40,6 +40,7 @@ export async function reviewViaBroker(
   prompt: string,
   timeoutMs: number,
   cwd = "",
+  model: string | null = null,
   pollIntervalMs = 1000,
 ): Promise<BrokerReply> {
   const base = brokerUrl();
@@ -51,8 +52,9 @@ export async function reviewViaBroker(
     const submit = await fetch(`${base}/jobs`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      // cwd routes the review to a per-repo reviewer session on the worker side.
-      body: JSON.stringify({ reviewer, prompt, cwd }),
+      // cwd routes the review to a per-repo reviewer session; model (optional) asks the worker
+      // to run this review on a specific model (switching the live session if needed).
+      body: JSON.stringify({ reviewer, prompt, cwd, model }),
       signal: AbortSignal.timeout(Math.min(REQUEST_TIMEOUT_MS, Math.max(1, deadline - Date.now()))),
     });
     if (!submit.ok) return { ok: false, text: "", error: `broker submit failed (HTTP ${submit.status})` };

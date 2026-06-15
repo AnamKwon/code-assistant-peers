@@ -26,6 +26,7 @@
 - `normal`, `adversarial`, `gate`, `collaborative` 审查模式
 - `peer_fix` workflow：reviewer 只提出修复建议，不直接编辑文件
 - SQLite 持久化 task memory、review rounds、findings、async status
+- 同状态 dedup：仓库状态与选项和上次完成的审查一致时直接返回已记录的审查（零 token；`force_review` 可强制重跑）
 - 用于避免 MCP host timeout 的 async-first review flow
 - 用于 MCP 注册和本地诊断的 `setup`, `doctor`
 - `CLAUDE.md` 和 `AGENTS.md` project rule installer
@@ -128,7 +129,7 @@ broker/会话不可用时自动 fallback 到启动 `claude -p`。在原本使用
 [broker/REVIEWER.md](../broker/REVIEWER.md)。
 
 `gemini-live`、`codex-live` 以相同方式路由（交互式 Gemini/Codex 会话，不可用时回退到无头 CLI）。与 Claude
-不同，它们没有计费池差异，好处是**持久会话 + 跨审查记忆**（`CODE_ASSISTANT_PEERS_REVIEWER_CLEAR=never`）。
+不同，它们没有计费池差异，好处是**持久会话 + 跨审查记忆**（默认保留；`CODE_ASSISTANT_PEERS_REVIEWER_CLEAR=always` 则每次审查前清空）。切换模型时会在 resume 同一会话的前提下重启，因此 `review_model` 也适用于实时会话。
 self-review 等 host 侧流程也可通过 `CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS=1` 在 host 的实时会话中运行；
 由 `CODE_ASSISTANT_PEERS_SELF_REVIEW`（默认 `codex` / `all` / `none` / `claude,codex` 等）决定哪些 host 自审。
 
@@ -261,6 +262,9 @@ review prompt 与 Codex 风格的 review heuristic 对齐：
 | `HOST_ASSISTANT` | required | 当前 host assistant id |
 | `PEER_ASSISTANT` | inferred | reviewer assistant id |
 | `PEER_ASSISTANTS` | unset | multi-peer reviewer id 列表 |
+| `CODE_ASSISTANT_PEERS_REVIEW_MODEL` | unset | host 未传 review_model 时的默认值（推荐 `auto`：小 diff 自动路由到低成本模型） |
+| `CODE_ASSISTANT_PEERS_MEMORY_ROUNDS` | `3` | 内联到 prompt 的最近审查轮数（未解决 findings 始终全部包含） |
+| `CODE_ASSISTANT_PEERS_REVIEWER_CLEAR` | keep | 实时会话默认保留对话记忆；`always` 则每次审查前清空 |
 | `CODE_ASSISTANT_PEERS_ASSISTANTS` | built-ins only | custom CLI adapter JSON |
 | `CODE_ASSISTANT_PEERS_WORKFLOW` | `review_only` | `review_only` 或 `peer_fix` |
 | `CODE_ASSISTANT_PEERS_REVIEW_MODE` | `normal` | `normal`, `adversarial`, `gate`, `collaborative` |

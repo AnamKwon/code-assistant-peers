@@ -3,13 +3,21 @@ import {
   LIVE_CLI_KINDS,
   type ReviewerSession,
   acquireWorkerLock,
+  RateLimitError,
   beginMarkerFor,
   claimNextJob,
+  detectRateLimit,
   doneMarkerFor,
   extractReviewFromCapture,
+  codexSessionIdFromRolloutPath,
+  findCodexSessionId,
   liveCliKindFor,
+  parseGeminiSessionIndex,
+  parseResetAtMs,
   runReviewerWorker,
+  sessionEnvPrefix,
   sessionNameFor,
+  stripRenderedLineNumbers,
 } from "../broker/reviewer.ts";
 
 interface MockJob {
@@ -17,6 +25,7 @@ interface MockJob {
   reviewer: string;
   prompt: string;
   cwd?: string;
+  model?: string | null;
 }
 
 // In-memory broker exposing exactly the endpoints the reviewer worker uses:
@@ -33,7 +42,7 @@ function startMockBroker(jobs: MockJob[]) {
       const { pathname } = new URL(req.url);
       if (req.method === "GET" && pathname === "/next") {
         const job = queue.shift();
-        return Response.json(job ? { id: job.id, reviewer: job.reviewer, prompt: job.prompt, cwd: job.cwd ?? "" } : { id: null });
+        return Response.json(job ? { id: job.id, reviewer: job.reviewer, prompt: job.prompt, cwd: job.cwd ?? "", model: job.model ?? null } : { id: null });
       }
       const resultMatch = pathname.match(/^\/jobs\/([^/]+)\/result$/);
       if (req.method === "POST" && resultMatch) {
@@ -150,6 +159,98 @@ describe("reviewer worker loop", () => {
     }
   });
 
+  test("the job's requested model is passed through to the session deliver", async () => {
+    const broker = startMockBroker([
+      { id: "m1", reviewer: "claude-live", prompt: "p", cwd: "/repo/a", model: "opus" },
+      { id: "m2", reviewer: "claude-live", prompt: "p", cwd: "/repo/a" }, // no model -> null
+    ]);
+    const seen: Array<{ job: string; model: string | null | undefined }> = [];
+    const session: ReviewerSession = {
+      deliver: async (_p, jobId, _s, model) => {
+        seen.push({ job: jobId, model });
+        return "ok";
+      },
+    };
+    const controller = new AbortController();
+    try {
+      const run = runReviewerWorker({ brokerUrl: broker.url, sessionFor: () => session, signal: controller.signal, pollIntervalMs: 5 });
+      await Bun.sleep(120);
+      controller.abort();
+      await run;
+      expect(seen).toEqual([{ job: "m1", model: "opus" }, { job: "m2", model: null }]);
+    } finally {
+      controller.abort();
+      broker.server.stop(true);
+    }
+  });
+
+  test("distinct sessions run in PARALLEL; same-session jobs stay serialized", async () => {
+    const broker = startMockBroker([
+      { id: "c1", reviewer: "claude-live", prompt: "p", cwd: "/repo/a" },
+      { id: "g1", reviewer: "gemini-live", prompt: "p", cwd: "/repo/a" }, // different session → parallel
+      { id: "c2", reviewer: "claude-live", prompt: "p", cwd: "/repo/a" }, // same session as c1 → after c1
+    ]);
+    const events: Array<{ job: string; type: "start" | "end"; at: number }> = [];
+    const sessionFor = (reviewer: string): ReviewerSession => ({
+      deliver: async (_prompt, jobId) => {
+        events.push({ job: jobId, type: "start", at: Date.now() });
+        await Bun.sleep(120);
+        events.push({ job: jobId, type: "end", at: Date.now() });
+        return `done by ${reviewer}`;
+      },
+    });
+    const controller = new AbortController();
+    try {
+      const run = runReviewerWorker({ brokerUrl: broker.url, sessionFor, signal: controller.signal, pollIntervalMs: 5 });
+      await Bun.sleep(450);
+      controller.abort();
+      await run;
+      const at = (job: string, type: "start" | "end") => events.find((e) => e.job === job && e.type === type)!.at;
+      // parallel: gemini started BEFORE claude's first job finished
+      expect(at("g1", "start")).toBeLessThan(at("c1", "end"));
+      // serialized: c2 (same session as c1) started only after c1 ended
+      expect(at("c2", "start")).toBeGreaterThanOrEqual(at("c1", "end"));
+      expect(broker.results.get("c1")?.result).toContain("done");
+      expect(broker.results.get("g1")?.result).toContain("done");
+      expect(broker.results.get("c2")?.result).toContain("done");
+    } finally {
+      controller.abort();
+      broker.server.stop(true);
+    }
+  });
+
+  test("a rate-limited reviewer is cooled down: later jobs are skipped without retry", async () => {
+    const broker = startMockBroker([
+      { id: "r1", reviewer: "claude-live", prompt: "p", cwd: "/repo/a" }, // hits the limit
+      { id: "r2", reviewer: "claude-live", prompt: "p", cwd: "/repo/a" }, // same reviewer -> skipped
+      { id: "ok", reviewer: "gemini-live", prompt: "p", cwd: "/repo/a" }, // different reviewer -> runs
+    ]);
+    let claudeDelivers = 0;
+    const sessionFor = (reviewer: string): ReviewerSession => ({
+      deliver: async () => {
+        if (reviewer === "claude-live") {
+          claudeDelivers++;
+          throw new RateLimitError("reviewer hit its usage/rate limit: usage limit reached", null);
+        }
+        return "patch is correct";
+      },
+    });
+    const controller = new AbortController();
+    try {
+      const run = runReviewerWorker({ brokerUrl: broker.url, sessionFor, signal: controller.signal, pollIntervalMs: 5, rateLimitCooldownMs: 60_000 });
+      await Bun.sleep(160);
+      controller.abort();
+      await run;
+      expect(claudeDelivers).toBe(1); // r1 tried once; r2 skipped WITHOUT calling deliver again
+      expect(broker.results.get("r1")?.error).toContain("usage/rate limit");
+      expect(broker.results.get("r2")?.error).toContain("rate-limited");
+      expect(broker.results.get("ok")?.result).toContain("patch is correct"); // other reviewer unaffected
+    } finally {
+      controller.abort();
+      broker.server.stop(true);
+    }
+  });
+
   test("an unsupported reviewer becomes a job error, not a worker crash", async () => {
     const broker = startMockBroker([
       { id: "u1", reviewer: "mystery-live", prompt: "p", cwd: "/repo/a" },
@@ -173,24 +274,96 @@ describe("reviewer worker loop", () => {
     }
   });
 
-  test("LIVE_CLI_KINDS maps each built-in live adapter to its CLI launch + reset + prompt dir", () => {
+  test("LIVE_CLI_KINDS maps each built-in live adapter to launch/resume commands + strategies", () => {
     expect(Object.keys(LIVE_CLI_KINDS).sort()).toEqual(["claude-live", "codex-live", "gemini-live"]);
 
     const claude = liveCliKindFor("claude-live")!;
-    expect(claude.launchCommand("/repo", claude.promptDir("/repo"))[0]).toBe("claude");
-    expect(claude.launchCommand("/repo", claude.promptDir("/repo"))).toContain("--add-dir");
+    const claudeLaunch = claude.launchCommand("/repo", claude.promptDir("/repo"), "uuid-1", "opus");
+    expect(claudeLaunch[0]).toBe("claude");
+    expect(claudeLaunch).toContain("--add-dir");
+    expect(claudeLaunch.join(" ")).toContain("--session-id uuid-1"); // assigned id baked into launch
+    expect(claudeLaunch.join(" ")).toContain("--model opus"); // first-launch model baked in
+    const claudeResume = claude.resumeCommand(claude.promptDir("/repo"), "uuid-1", "sonnet");
+    expect(claudeResume.join(" ")).toContain("--resume uuid-1");
+    expect(claudeResume.join(" ")).toContain("--model sonnet");
+    expect(claude.idStrategy).toBe("assign");
 
     const gemini = liveCliKindFor("gemini-live")!;
     expect(gemini.promptDir("/repo")).toBe("/repo/.peer-review"); // inside the trusted cwd
-    const gemCmd = gemini.launchCommand("/repo", gemini.promptDir("/repo"));
+    const gemCmd = gemini.launchCommand("/repo", gemini.promptDir("/repo"), "uuid-2", null);
     expect(gemCmd[0]).toBe("gemini");
     expect(gemCmd).not.toContain("--include-directories"); // avoids the second trust prompt
+    expect(gemCmd.join(" ")).toContain("--session-id uuid-2");
+    expect(gemini.resumeCommand("/p", "4", "flash").join(" ")).toContain("--resume 4"); // list INDEX, not uuid
+    expect(gemini.resumeBy).toBe("gemini-index");
 
     const codex = liveCliKindFor("codex-live")!;
-    expect(codex.launchCommand("/repo", codex.promptDir("/repo"))[0]).toBe("codex");
+    const cxLaunch = codex.launchCommand("/repo", codex.promptDir("/repo"), null, "gpt-5.4-mini");
+    expect(cxLaunch[0]).toBe("codex");
+    expect(cxLaunch).not.toContain("--session-id"); // codex cannot assign an id at launch
+    expect(cxLaunch.join(" ")).toContain("-m gpt-5.4-mini");
+    const cxResume = codex.resumeCommand("/p", "rollout-uuid", "gpt-5.4");
+    expect(cxResume.slice(0, 3)).toEqual(["codex", "resume", "rollout-uuid"]);
+    expect(cxResume.join(" ")).toContain("model=");
+    expect(codex.idStrategy).toBe("capture");
     expect(codex.clearCommand).toBe("/new");
 
     expect(liveCliKindFor("unknown-live")).toBeNull();
+  });
+
+  test("codex session id helpers: filename parsing + marker-based capture", async () => {
+    expect(codexSessionIdFromRolloutPath("/x/2026/06/12/rollout-2026-06-12T09-41-24-019eb946-ca67-7221-8e60-9fd5d450f572.jsonl"))
+      .toBe("019eb946-ca67-7221-8e60-9fd5d450f572");
+    expect(codexSessionIdFromRolloutPath("/x/not-a-rollout.txt")).toBeNull();
+
+    const { mkdtemp, mkdir: mkdirP, writeFile: writeF, rm: rmP } = await import("node:fs/promises");
+    const { tmpdir: tmp } = await import("node:os");
+    const { join: j } = await import("node:path");
+    const dir = await mkdtemp(j(tmp(), "codex-sessions-"));
+    try {
+      await mkdirP(j(dir, "2026/06/12"), { recursive: true });
+      const ours = j(dir, "2026/06/12", "rollout-2026-06-12T10-00-00-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl");
+      const theirs = j(dir, "2026/06/12", "rollout-2026-06-12T11-00-00-11111111-2222-3333-4444-555555555555.jsonl");
+      await writeF(ours, JSON.stringify({ text: "instruction with PEER-REVIEW-BEGIN-job-42 marker" }) + "\n");
+      await writeF(theirs, JSON.stringify({ text: "the user own unrelated session" }) + "\n");
+      // finds OURS by marker even though THEIRS is newer (never picks most-recent blindly)
+      expect(await findCodexSessionId(dir, "PEER-REVIEW-BEGIN-job-42")).toBe("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+      expect(await findCodexSessionId(dir, "PEER-REVIEW-BEGIN-job-99")).toBeNull();
+      // sinceMs floor excludes rollouts older than the session launch (future floor -> no match)
+      expect(await findCodexSessionId(dir, "PEER-REVIEW-BEGIN-job-42", Date.now() + 600_000)).toBeNull();
+    } finally {
+      await rmP(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("sessionEnvPrefix isolates the session env to the allowlist", () => {
+    const prefix = sessionEnvPrefix({
+      PATH: "/usr/bin",
+      HOME: "/Users/me",
+      TERM: "tmux-256color",
+      CLAUDECODE: "1", // nested-session leakage — must NOT pass through
+      CLAUDE_CODE_SESSION_ID: "parent-session",
+      ANTHROPIC_API_KEY: "sk-secret", // must NOT pass through (subscription auth only)
+      CLAUDE_CONFIG_DIR: "/Users/me/.claude-alt", // allowlisted
+    } as NodeJS.ProcessEnv);
+    expect(prefix.slice(0, 2)).toEqual(["env", "-i"]);
+    expect(prefix).toContain("PATH=/usr/bin");
+    expect(prefix).toContain("CLAUDE_CONFIG_DIR=/Users/me/.claude-alt");
+    expect(prefix).toContain("TERM=tmux-256color");
+    expect(prefix.join(" ")).not.toContain("CLAUDECODE");
+    expect(prefix.join(" ")).not.toContain("CLAUDE_CODE_SESSION_ID");
+    expect(prefix.join(" ")).not.toContain("ANTHROPIC_API_KEY");
+  });
+
+  test("gemini session index parsing matches our uuid, never position", () => {
+    const listing = [
+      "Available sessions for this project (3):",
+      "  1. <session_context> something recent... (1 hour ago) [841a449c-14aa-4b1e-8360-2504038181d1]",
+      "  2. <session_context> the user own session... (2 hours ago) [51272c1b-25e5-42a7-b6ab-8e77a6749710]",
+      "  3. <session_context> ours... (3 hours ago) [03FA3A39-CD84-43c3-9188-7EAE35004BA9]",
+    ].join("\n");
+    expect(parseGeminiSessionIndex(listing, "03fa3a39-cd84-43c3-9188-7eae35004ba9")).toBe("3"); // case-insensitive
+    expect(parseGeminiSessionIndex(listing, "ffffffff-ffff-ffff-ffff-ffffffffffff")).toBeNull();
   });
 
   test("claimNextJob returns null when the broker is unreachable", async () => {
@@ -275,5 +448,40 @@ describe("review extraction from a captured pane", () => {
   test("both markers contain no markdown/TUI-special characters", () => {
     expect(beginMarkerFor("job-1")).toMatch(/^[A-Za-z0-9_-]+$/);
     expect(doneMarkerFor("job-1")).toMatch(/^[A-Za-z0-9_-]+$/);
+  });
+
+  // Regression: the Gemini TUI renders responses with leading line numbers, which leaked into
+  // the extracted review ("2 I am Gemini..."). Strip only under the conservative signature.
+  test("detectRateLimit matches usage/rate-limit notices across CLIs but not normal review text", () => {
+    expect(detectRateLimit("...\n  5h limit reached, resets 19:08\n...")).toContain("resets 19:08");
+    expect(detectRateLimit("Error: quota exceeded for this project")).toContain("quota exceeded");
+    expect(detectRateLimit("429 Too Many Requests")).toBeTruthy();
+    expect(detectRateLimit("You have reached your weekly usage limit")).toBeTruthy();
+    // normal review content must NOT trip it
+    expect(detectRateLimit("No findings. The diff stays within the rate limiter's bounds.")).toBeNull();
+    expect(detectRateLimit("patch is correct")).toBeNull();
+    // custom extra pattern
+    expect(detectRateLimit("PLAN_CAP_HIT code 7", ["plan_cap_hit"])).toBeTruthy();
+  });
+
+  test("parseResetAtMs reads an explicit reset time as the next occurrence", () => {
+    const noon = new Date("2026-06-12T12:00:00").getTime();
+    const at1305 = parseResetAtMs("resets 13:05", noon)!;
+    expect(new Date(at1305).getHours()).toBe(13);
+    expect(new Date(at1305).getMinutes()).toBe(5);
+    // a time already past today rolls to tomorrow
+    const at1100 = parseResetAtMs("resets at 11:00", noon)!;
+    expect(at1100).toBeGreaterThan(noon);
+    expect(parseResetAtMs("no reset here", noon)).toBeNull();
+  });
+
+  test("strips Gemini's rendered line numbers but never genuine content", () => {
+    expect(stripRenderedLineNumbers(" 2 I am Gemini, trained by Google.\n 3 The channel works.")).toBe(
+      "I am Gemini, trained by Google.\nThe channel works.",
+    );
+    expect(stripRenderedLineNumbers(" 2 Only one numbered line")).toBe(" 2 Only one numbered line"); // single line — left alone
+    expect(stripRenderedLineNumbers("No findings.\npatch is correct")).toBe("No findings.\npatch is correct");
+    expect(stripRenderedLineNumbers("1. first item\n2. second item")).toBe("1. first item\n2. second item"); // markdown list
+    expect(stripRenderedLineNumbers("3 issues found\n2 tests failed")).toBe("3 issues found\n2 tests failed"); // not increasing
   });
 });

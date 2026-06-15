@@ -19,24 +19,86 @@
 //       bun broker/reviewer.ts --echo     # fake session that echoes the prompt (no claude; dev)
 
 import { closeSync, openSync, readFileSync, unlinkSync, writeSync } from "node:fs";
-import { mkdir, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 const DEFAULT_BROKER_URL = "http://127.0.0.1:7899";
 const DEFAULT_POLL_INTERVAL_MS = 1000;
 const DEFAULT_DELIVER_TIMEOUT_MS = 600_000;
+// How long a reviewer (kind × repo) is skipped after it reports a usage/rate limit, when the
+// limit message gives no explicit reset time. Override with CODE_ASSISTANT_PEERS_RATE_LIMIT_COOLDOWN_MS.
+const DEFAULT_RATE_LIMIT_COOLDOWN_MS = 15 * 60_000;
+
+// Thrown when a reviewer's pane shows it has hit a usage/rate limit, so the worker can stop
+// waiting for a marker that will never come and cool the reviewer down instead of retrying.
+export class RateLimitError extends Error {
+  constructor(message: string, readonly resetAtMs: number | null) {
+    super(message);
+    this.name = "RateLimitError";
+  }
+}
+
+// Best-effort detection of a usage/rate-limit notice in a captured pane. Patterns are broad and
+// CLI-agnostic (claude "usage limit"/"plan limit", codex "rate limit", gemini "quota exceeded"/
+// "resource exhausted"/429); a miss simply degrades to the normal deliver timeout, so a false
+// negative is safe. Extra patterns via CODE_ASSISTANT_PEERS_RATE_LIMIT_PATTERNS (comma-separated,
+// case-insensitive substrings). Returns the matched line (for the error message) or null.
+const RATE_LIMIT_PATTERNS = [
+  /\busage limit(?:s)? (?:reached|exceeded)\b/i,
+  /\b(?:rate|usage) limit(?:ed)?\b.*\b(?:reached|exceeded|hit)\b/i,
+  /\bplan limit(?:s)? (?:reached|exceeded)\b/i,
+  // A usage gauge that pairs "limit" with a "resets …" clause on one line is a quota notice, not
+  // review prose (which rarely says both) — covers codex's "5h limit … resets 19:08" style.
+  /\blimit\b[^\n]*\bresets?\b/i,
+  /\bquota exceeded\b/i,
+  /\bresource exhausted\b/i,
+  /\b(?:reached|hit) your .*\blimit\b/i,
+  /\byou(?:'ve| have) (?:reached|hit|exceeded)\b.*\blimit\b/i,
+  /\bout of (?:usage )?credits\b/i,
+  /\b429\b.*\b(?:limit|quota|exhaust)/i,
+  /\btoo many requests\b/i,
+];
+
+export function detectRateLimit(capture: string, extraPatterns: string[] = []): string | null {
+  const lines = capture.split("\n");
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    if (RATE_LIMIT_PATTERNS.some((re) => re.test(line))) return line.trim();
+    const lower = line.toLowerCase();
+    if (extraPatterns.some((p) => p && lower.includes(p.toLowerCase()))) return line.trim();
+  }
+  return null;
+}
+
+// Parse an explicit reset time from a limit notice ("resets 19:08", "resets at 21:05",
+// "resets 16:05 on 19 Jun"). Returns epoch ms for the next occurrence of that HH:MM, or null.
+export function parseResetAtMs(text: string, nowMs: number): number | null {
+  const match = /\bresets?\b[^0-9]{0,8}(\d{1,2}):(\d{2})/i.exec(text);
+  if (!match) return null;
+  const h = Number(match[1]);
+  const m = Number(match[2]);
+  if (h > 23 || m > 59) return null;
+  const now = new Date(nowMs);
+  const reset = new Date(nowMs);
+  reset.setHours(h, m, 0, 0);
+  if (reset.getTime() <= now.getTime()) reset.setTime(reset.getTime() + 24 * 60 * 60_000); // next day
+  return reset.getTime();
+}
 
 export interface ReviewJob {
   id: string;
   reviewer: string;
   prompt: string;
   cwd: string; // repo dir this review is for ("" => worker default); routes to a per-repo session
+  // Model the review should run on (null = session default). When it differs from the session's
+  // current model, the session is switched (restart + resume, conversation preserved).
+  model: string | null;
 }
 
 // A reviewer backend. The real one drives a live `claude` TUI; tests/dev inject fakes.
 export interface ReviewerSession {
-  deliver(prompt: string, jobId: string, signal: AbortSignal): Promise<string>;
+  deliver(prompt: string, jobId: string, signal: AbortSignal, model?: string | null): Promise<string>;
   close?(): Promise<void>;
 }
 
@@ -51,6 +113,8 @@ export interface ReviewerWorkerOptions {
   pollIntervalMs?: number;
   once?: boolean;
   log?: (message: string) => void;
+  // Cooldown after a reviewer reports a usage/rate limit with no explicit reset time.
+  rateLimitCooldownMs?: number;
 }
 
 // Claim the next pending job from the broker. Returns null when there is nothing to do or the
@@ -63,9 +127,9 @@ export async function claimNextJob(brokerUrl: string, signal: AbortSignal): Prom
     return null;
   }
   if (!res.ok) return null;
-  const body = (await res.json().catch(() => ({}))) as { id?: string | null; reviewer?: string; prompt?: string; cwd?: string };
+  const body = (await res.json().catch(() => ({}))) as { id?: string | null; reviewer?: string; prompt?: string; cwd?: string; model?: string | null };
   if (!body.id || !body.prompt) return null;
-  return { id: body.id, reviewer: String(body.reviewer ?? "claude-live"), prompt: body.prompt, cwd: String(body.cwd ?? "") };
+  return { id: body.id, reviewer: String(body.reviewer ?? "claude-live"), prompt: body.prompt, cwd: String(body.cwd ?? ""), model: body.model ? String(body.model) : null };
 }
 
 async function postResult(brokerUrl: string, jobId: string, result: string): Promise<void> {
@@ -87,6 +151,12 @@ async function postError(brokerUrl: string, jobId: string, error: string): Promi
 // The worker loop: claim → deliver to the live session → report result/error. Bounded only by
 // the abort signal. A failed delivery is reported as a job error (not a crash) so one bad review
 // never takes the worker down.
+//
+// Concurrency model: jobs for DIFFERENT sessions (reviewer kind × repo) run in PARALLEL — a
+// multi-peer review that fans out to claude-live + gemini-live + codex-live boots and runs all
+// three TUIs concurrently instead of paying their wall-clock times in sequence. Jobs for the
+// SAME session are serialized via a per-session promise chain, because one TUI cannot interleave
+// two reviews (send-keys/capture would corrupt both).
 export async function runReviewerWorker(options: ReviewerWorkerOptions): Promise<void> {
   const { brokerUrl, sessionFor, signal } = options;
   const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
@@ -104,6 +174,46 @@ export async function runReviewerWorker(options: ReviewerWorkerOptions): Promise
     return session;
   };
 
+  // Reviewers (kind × repo) that hit a usage/rate limit are cooled down until this epoch-ms, so
+  // we stop booting/poking a reviewer that can't answer instead of retrying every job.
+  const cooldownMs = options.rateLimitCooldownMs ?? DEFAULT_RATE_LIMIT_COOLDOWN_MS;
+  const blockedUntil = new Map<string, number>();
+  const now = () => Date.now();
+
+  // processJob never rejects — failures are reported to the broker as job errors.
+  const processJob = async (job: ReviewJob): Promise<void> => {
+    const key = `${job.reviewer}|${job.cwd}`;
+    const blocked = blockedUntil.get(key);
+    if (blocked && now() < blocked) {
+      const mins = Math.ceil((blocked - now()) / 60_000);
+      const msg = `reviewer ${job.reviewer} is rate-limited (cooling down ~${mins} min); skipped without retry — use another peer or wait`;
+      await postError(brokerUrl, job.id, msg).catch(() => {});
+      log(`job ${job.id} skipped: ${msg}`);
+      return;
+    }
+    log(`claimed job ${job.id} (${job.reviewer}, cwd=${job.cwd || "(default)"})`);
+    try {
+      const review = await resolveSession(job.reviewer, job.cwd).deliver(job.prompt, job.id, signal, job.model);
+      await postResult(brokerUrl, job.id, review);
+      log(`job ${job.id} reviewed (${review.length} chars)`);
+    } catch (error) {
+      if (error instanceof RateLimitError) {
+        const until = error.resetAtMs && error.resetAtMs > now() ? error.resetAtMs : now() + cooldownMs;
+        blockedUntil.set(key, until);
+        log(`job ${job.id} failed (rate limit); cooling down ${job.reviewer} until ${new Date(until).toISOString()}`);
+        await postError(brokerUrl, job.id, error.message).catch(() => {});
+        return;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      await postError(brokerUrl, job.id, `reviewer worker failed: ${message}`).catch(() => {});
+      log(`job ${job.id} failed: ${message}`);
+    }
+  };
+
+  // Tail of the in-order work chain per session key. Chaining serializes same-session jobs while
+  // distinct sessions proceed independently (= in parallel).
+  const chains = new Map<string, Promise<void>>();
+
   try {
     while (!signal.aborted) {
       const job = await claimNextJob(brokerUrl, signal);
@@ -113,20 +223,24 @@ export async function runReviewerWorker(options: ReviewerWorkerOptions): Promise
         continue;
       }
 
-      log(`claimed job ${job.id} (${job.reviewer}, cwd=${job.cwd || "(default)"})`);
-      try {
-        const review = await resolveSession(job.reviewer, job.cwd).deliver(job.prompt, job.id, signal);
-        await postResult(brokerUrl, job.id, review);
-        log(`job ${job.id} reviewed (${review.length} chars)`);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        await postError(brokerUrl, job.id, `reviewer worker failed: ${message}`).catch(() => {});
-        log(`job ${job.id} failed: ${message}`);
+      if (options.once) {
+        await processJob(job);
+        return;
       }
 
-      if (options.once) return;
+      const key = `${job.reviewer}|${job.cwd}`;
+      const next = (chains.get(key) ?? Promise.resolve()).then(() => processJob(job));
+      chains.set(key, next);
+      // Drop the entry once it settles IF it is still the tail, so the Map stays proportional to
+      // in-flight sessions rather than every distinct repo the worker ever touched.
+      void next.finally(() => {
+        if (chains.get(key) === next) chains.delete(key);
+      });
+      // Loop straight back to claim the next job — concurrent sessions start immediately.
     }
   } finally {
+    // Let in-flight reviews finish reporting before tearing the sessions down.
+    await Promise.allSettled([...chains.values()]);
     for (const session of sessions.values()) await session.close?.();
   }
 }
@@ -171,7 +285,28 @@ export function extractReviewFromCapture(capture: string, jobId: string): string
   if (lastDone <= lastBegin) return null; // mid-repaint / out-of-order — keep polling
 
   const between = capture.slice(lastBegin + begin.length, lastDone);
-  return cleanCapturedReview(between);
+  return stripRenderedLineNumbers(cleanCapturedReview(between));
+}
+
+// The Gemini TUI renders responses with leading line numbers (" 2 I am Gemini...", " 3 ..."),
+// which leak into the captured body. Strip them only under a conservative signature so genuine
+// content is never mangled: at least two non-empty lines AND every non-empty line starts with a
+// bare integer (followed by whitespace) AND those integers are strictly increasing. Markdown
+// lists ("1. foo") don't match (dot, not whitespace, follows the digits).
+export function stripRenderedLineNumbers(text: string): string {
+  const lines = text.split("\n");
+  const numbered = lines
+    .map((line) => /^\s*(\d+)(\s|$)/.exec(line))
+    .map((match, index) => ({ match, index, blank: lines[index].trim() === "" }));
+  const nonBlank = numbered.filter((entry) => !entry.blank);
+  if (nonBlank.length < 2 || nonBlank.some((entry) => !entry.match)) return text;
+  for (let i = 1; i < nonBlank.length; i++) {
+    if (Number(nonBlank[i].match![1]) <= Number(nonBlank[i - 1].match![1])) return text;
+  }
+  return lines
+    .map((line) => line.replace(/^\s*\d+(\s|$)/, ""))
+    .join("\n")
+    .trim();
 }
 
 // Strip TUI chrome from scraped pane text: box-drawing borders, the leading "> " input echo,
@@ -205,21 +340,20 @@ function cleanCapturedReview(text: string): string {
 export interface TmuxSessionConfig {
   sessionName: string;
   cwd: string;
-  // Full argv launched inside the tmux session (CLI binary + read-only flags + any prompt-dir
-  // access grant such as claude's --add-dir or gemini's --include-directories).
-  launchCommand: string[];
-  // Dir the per-job prompt files are written to. Must be readable by the session (see above).
+  // Dir the per-job prompt files are written to. Must be readable by the session.
   promptDir: string;
-  // Slash command that resets the TUI's conversation (claude/gemini: "/clear", codex: "/new").
-  // null = the CLI has no known reset command; reviews then share the conversation.
-  clearCommand: string | null;
-  // Send the clear command before each review (default true). False keeps the live session's
-  // conversation memory across reviews of this repo — richer follow-up context at the cost of
-  // cross-task bleed and unbounded context growth.
+  // CLI kind: command building (launch/resume), session-id strategy, conversation reset command.
+  kind: LiveCliKind;
+  // Send the kind's clear command before each review. Default FALSE (keep conversation memory
+  // across reviews); set CODE_ASSISTANT_PEERS_REVIEWER_CLEAR=always for isolated reviews. Keeping
+  // memory means the per-REPO session also accumulates other tasks' history and will eventually
+  // auto-compact.
   clearBetweenReviews: boolean;
   startupTimeoutMs: number;
   deliverTimeoutMs: number;
   pollIntervalMs: number;
+  // Extra case-insensitive substrings that mark a usage/rate-limit notice in the pane.
+  rateLimitPatterns: string[];
 }
 
 // Read-only launch: plan mode + edit tools disallowed so a reviewed diff containing injected
@@ -235,10 +369,44 @@ export const DEFAULT_REVIEWER_CLAUDE_ARGS = [
 
 export class TmuxCliSession implements ReviewerSession {
   private ready = false;
-  constructor(private readonly config: TmuxSessionConfig) {}
+  // Model the live session is currently running (null = unknown / CLI default).
+  private currentModel: string | null = null;
+  // Session id used for resume-on-model-switch. Assigned up front where the CLI supports it
+  // (claude/gemini --session-id); captured lazily from rollout files for codex; null when the
+  // session is not resumable (e.g. we reused a user-launched session).
+  private sessionId: string | null;
+  // Last delivered job id — its unique BEGIN marker identifies OUR codex transcript on capture.
+  private lastJobId: string | null = null;
+  // When the session was first launched — lower bound for codex rollout-file mtime filtering.
+  private startedAtMs = 0;
 
-  async deliver(prompt: string, jobId: string, signal: AbortSignal): Promise<string> {
-    await this.ensureSession(signal);
+  constructor(private readonly config: TmuxSessionConfig) {
+    this.sessionId = config.kind.idStrategy === "assign" ? crypto.randomUUID() : null;
+  }
+
+  async deliver(prompt: string, jobId: string, signal: AbortSignal, model?: string | null): Promise<string> {
+    // Don't boot a session for a job that arrives during shutdown (the worker drains its chains
+    // on abort) — bail before any tmux work.
+    if (signal.aborted) throw new Error("reviewer worker is shutting down");
+    try {
+      return await this.deliverInner(prompt, jobId, signal, model);
+    } catch (error) {
+      // A failed delivery may have left the pane dead/wedged (e.g. a resume that never booted, or
+      // swallowed input). Drop readiness so the NEXT job re-boots via ensureSession instead of
+      // reusing a broken session forever.
+      this.ready = false;
+      throw error;
+    }
+  }
+
+  private async deliverInner(prompt: string, jobId: string, signal: AbortSignal, model?: string | null): Promise<string> {
+    const desired = model?.trim() || null;
+    await this.ensureSession(signal, desired);
+    // Switch the EXISTING session to the requested model (restart + resume keeps the
+    // conversation). No-op when no model was requested or it already matches.
+    if (desired && desired !== this.currentModel) {
+      await this.switchModel(desired, signal);
+    }
     const begin = beginMarkerFor(jobId);
     const done = doneMarkerFor(jobId);
     const { sessionName, promptDir, deliverTimeoutMs, pollIntervalMs } = this.config;
@@ -255,14 +423,13 @@ export class TmuxCliSession implements ReviewerSession {
       `then exactly ${done} on the final line.`;
 
     try {
-      // Reset the reused session's CONVERSATION before each review (default): this single live
-      // session serves every review, so without a reset its context grows unbounded and earlier
-      // reviews bleed into later ones. Opt out (CODE_ASSISTANT_PEERS_REVIEWER_CLEAR=never) to
-      // keep the session's memory across reviews — e.g. follow-up rounds that benefit from what
-      // the reviewer already read. NOTE the session is per-REPO, not per-task, so without a
-      // reset history from other tasks in the same repo accumulates too.
-      if (this.config.clearBetweenReviews && this.config.clearCommand) {
-        await tmux(["send-keys", "-t", sessionName, "-l", "--", this.config.clearCommand]);
+      // Conversation reset is OPT-IN (CODE_ASSISTANT_PEERS_REVIEWER_CLEAR=always): by default the
+      // session keeps its memory across reviews so follow-up rounds benefit from what the
+      // reviewer already read. NOTE the session is per-REPO, not per-task, so the default also
+      // accumulates other tasks' history and a long-lived context will eventually auto-compact —
+      // use "always" for isolated, bounded-context rounds.
+      if (this.config.clearBetweenReviews && this.config.kind.clearCommand) {
+        await tmux(["send-keys", "-t", sessionName, "-l", "--", this.config.kind.clearCommand]);
         await sleep(150, signal);
         await tmux(["send-keys", "-t", sessionName, "Enter"]);
         await sleep(600, signal); // let the reset settle before we wipe scrollback
@@ -271,9 +438,22 @@ export class TmuxCliSession implements ReviewerSession {
       // rendered pane history only — NOT the session's conversation memory — so it is safe (and
       // required for clean extraction) regardless of clearBetweenReviews.
       await tmux(["clear-history", "-t", sessionName]);
-      await tmux(["send-keys", "-t", sessionName, "-l", "--", instruction]);
-      await sleep(150, signal); // let the TUI register the paste before submitting
-      await tmux(["send-keys", "-t", sessionName, "Enter"]);
+      // Submit with echo verification: a TUI that is still booting (especially right after a
+      // resume relaunch) can swallow keystrokes. The echoed instruction contains the BEGIN
+      // marker, so its absence from the pane means the input was lost — retry a few times.
+      let submitted = false;
+      for (let attempt = 0; attempt < 3 && !submitted; attempt++) {
+        await tmux(["send-keys", "-t", sessionName, "-l", "--", instruction]);
+        await sleep(150, signal); // let the TUI register the paste before submitting
+        await tmux(["send-keys", "-t", sessionName, "Enter"]);
+        const echoDeadline = Date.now() + 5_000;
+        while (Date.now() < echoDeadline && !submitted) {
+          await sleep(500, signal);
+          if ((await this.capture()).includes(begin)) submitted = true;
+        }
+      }
+      if (!submitted) throw new Error("the live session did not accept the review instruction (input swallowed)");
+      this.lastJobId = jobId; // marker is now part of the transcript (used for codex id capture)
 
       const deadline = Date.now() + deliverTimeoutMs;
       while (Date.now() < deadline) {
@@ -284,6 +464,13 @@ export class TmuxCliSession implements ReviewerSession {
         const capture = await this.capture();
         const review = extractReviewFromCapture(capture, jobId);
         if (review !== null) return review;
+        // Stop early if the reviewer reports a usage/rate limit — the marker will never arrive,
+        // so fail fast (and let the worker cool this reviewer down) instead of polling for the
+        // full deliver timeout.
+        const limited = detectRateLimit(capture, this.config.rateLimitPatterns);
+        if (limited) {
+          throw new RateLimitError(`reviewer hit its usage/rate limit: ${limited}`, parseResetAtMs(limited, Date.now()));
+        }
       }
       throw new Error(`timed out after ${deliverTimeoutMs}ms waiting for the review marker in the live session`);
     } finally {
@@ -296,49 +483,129 @@ export class TmuxCliSession implements ReviewerSession {
   }
 
   // Ensure a tmux session running the interactive reviewer TUI exists and is ready for input.
-  // If the session already exists we reuse it (the user may have launched it themselves).
-  private async ensureSession(signal: AbortSignal): Promise<void> {
+  // If the session already exists we reuse it (the user may have launched it themselves) — but a
+  // reused session was not launched with our session id, so it is not resumable by us.
+  private async ensureSession(signal: AbortSignal, desiredModel: string | null = null): Promise<void> {
     if (this.ready) return;
-    const { sessionName, cwd, launchCommand, promptDir, startupTimeoutMs } = this.config;
+    const { sessionName, cwd, promptDir, kind, startupTimeoutMs } = this.config;
 
     const exists = (await tmux(["has-session", "-t", sessionName])).code === 0;
     if (!exists) {
-      await mkdir(promptDir, { recursive: true });
-      // Wide window => less line wrapping => cleaner capture. `--` ends tmux option parsing so
-      // the rest is the command run inside the session. launchCommand must already include the
-      // CLI's prompt-dir access grant (e.g. --add-dir / --include-directories).
-      const created = await tmux([
-        "new-session", "-d", "-s", sessionName, "-c", cwd, "-x", "400", "-y", "120",
-        "--", ...launchCommand,
-      ]);
-      if (created.code !== 0) {
-        throw new Error(`failed to start tmux session '${sessionName}': ${created.stderr.trim() || `exit ${created.code}`}`);
+      // Bake the requested model into the FIRST launch — cheaper than booting on the default
+      // model and immediately restarting to switch.
+      const launched = await this.createTmuxSession(kind.launchCommand(cwd, promptDir, this.sessionId, desiredModel));
+      if (!launched.ok) {
+        throw new Error(`failed to start tmux session '${sessionName}': ${launched.detail}`);
       }
-      await this.waitUntilReady(startupTimeoutMs, signal);
+      // `ready`/`currentModel` are only trustworthy once the pane is CONFIRMED live — otherwise a
+      // later job would short-circuit ensureSession and send keys into a half-booted/dead TUI.
+      if (!(await this.waitUntilReady(startupTimeoutMs, signal))) {
+        throw new Error(`tmux session '${sessionName}' did not become ready within ${startupTimeoutMs}ms`);
+      }
+      this.currentModel = desiredModel;
+    } else {
+      // Reused (likely user-launched) session: unknown identity and model, and we can't confirm
+      // boot state, so trust that an existing session is usable but treat it as non-resumable.
+      this.sessionId = null;
+      this.currentModel = null;
     }
     this.ready = true;
   }
 
+  // Switch the live session to `desired` by restarting it with the kind's resume command, which
+  // preserves the conversation. Falls back to a FRESH session (memory reset, logged) when no
+  // resumable ref exists, the resume relaunch fails to start, or the resumed pane never boots
+  // (e.g. an expired/bad ref where `tmux new-session` still exits 0 but the inner CLI dies).
+  private async switchModel(desired: string, signal: AbortSignal): Promise<void> {
+    const { kind, cwd, promptDir, sessionName, startupTimeoutMs } = this.config;
+
+    const ref = await this.resolveResumeRef();
+    if (ref && kind.resumeCommand) {
+      const resumed = await this.createTmuxSession(kind.resumeCommand(promptDir, ref, desired), true);
+      // Success requires BOTH new-session exiting 0 AND the pane actually booting — the latter is
+      // what catches a resume whose inner command died on a bad ref.
+      if (resumed.ok && (await this.waitUntilReady(startupTimeoutMs, signal))) {
+        this.ready = true;
+        this.currentModel = desired;
+        console.error(`[reviewer] ${sessionName}: switched model to ${desired} (resumed session ${ref}, conversation preserved)`);
+        return;
+      }
+      console.error(`[reviewer] ${sessionName}: resume to ${desired} did not come up (${resumed.ok ? "pane never booted" : resumed.detail}); restarting fresh (conversation memory reset).`);
+    } else {
+      console.error(`[reviewer] ${sessionName}: no resumable session ref; model switch restarts fresh (conversation memory reset).`);
+    }
+
+    // Fresh fallback: new identity, requested model baked into the launch.
+    this.sessionId = kind.idStrategy === "assign" ? crypto.randomUUID() : null;
+    this.lastJobId = null;
+    const fresh = await this.createTmuxSession(kind.launchCommand(cwd, promptDir, this.sessionId, desired), true);
+    if (!fresh.ok || !(await this.waitUntilReady(startupTimeoutMs, signal))) {
+      this.ready = false; // leave it un-ready so the next job re-boots instead of reusing a dead pane
+      throw new Error(`failed to restart session '${sessionName}' for model switch to ${desired}`);
+    }
+    this.ready = true;
+    this.currentModel = desired;
+  }
+
+  // The reference the kind's resume command needs: assigned uuid (claude), per-project list
+  // index resolved from our uuid (gemini), or the rollout uuid captured by grepping for our
+  // unique job marker (codex). null = not resumable.
+  private async resolveResumeRef(): Promise<string | null> {
+    const { kind, cwd } = this.config;
+    if (kind.idStrategy === "capture") {
+      if (!this.lastJobId) return null; // nothing delivered yet — fresh restart loses nothing
+      // Only consider rollouts touched since this session launched (minus slack) so a busy
+      // machine-global store can't push our file past the scan window.
+      return await findCodexSessionId(codexSessionsDir(), beginMarkerFor(this.lastJobId), this.startedAtMs - 60_000);
+    }
+    if (!this.sessionId) return null;
+    if (kind.resumeBy === "gemini-index") return await resolveGeminiSessionIndex(cwd, this.sessionId);
+    return this.sessionId;
+  }
+
+  // (Re)create the tmux session running `command`. killExisting tears down the old session first.
+  // Reports only whether `tmux new-session` launched — NOT whether the inner TUI booted; the
+  // caller must confirm liveness via waitUntilReady before trusting `ready`/`currentModel`.
+  private async createTmuxSession(command: string[], killExisting = false): Promise<{ ok: boolean; detail: string }> {
+    const { sessionName, cwd, promptDir } = this.config;
+    if (killExisting) {
+      await tmux(["kill-session", "-t", sessionName]).catch(() => {});
+    }
+    this.ready = false;
+    await mkdir(promptDir, { recursive: true });
+    // Wide window => less line wrapping => cleaner capture. `--` ends tmux option parsing so the
+    // rest is the command run inside the session (must include any prompt-dir access grant).
+    const created = await tmux([
+      "new-session", "-d", "-s", sessionName, "-c", cwd, "-x", "400", "-y", "120",
+      "--", ...sessionEnvPrefix(), ...command,
+    ]);
+    if (created.code !== 0) return { ok: false, detail: created.stderr.trim() || `exit ${created.code}` };
+    this.startedAtMs = Date.now();
+    return { ok: true, detail: "" };
+  }
+
   // The TUI takes a moment to boot. We don't know an exact "ready" string across versions, so we
-  // wait until the captured pane is non-empty and stable across two consecutive reads.
-  private async waitUntilReady(timeoutMs: number, signal: AbortSignal): Promise<void> {
+  // wait until the captured pane is non-empty and stable across two consecutive reads. Returns
+  // true only when that confirmed-live state was observed; false on abort or timeout (a never-
+  // booted pane), so callers can distinguish a live session from a dead one.
+  private async waitUntilReady(timeoutMs: number, signal: AbortSignal): Promise<boolean> {
     const deadline = Date.now() + timeoutMs;
     let previous = "";
     let stableReads = 0;
     while (Date.now() < deadline) {
       // Bail out promptly on shutdown — sleep() resolves immediately when aborted, so without
       // this guard the loop would busy-spin spawning `tmux capture-pane` until the deadline.
-      if (signal.aborted) return;
+      if (signal.aborted) return false;
       await sleep(700, signal);
       const current = await this.capture();
       if (current.trim().length > 0 && current === previous) {
-        if (++stableReads >= 2) return;
+        if (++stableReads >= 2) return true;
       } else {
         stableReads = 0;
       }
       previous = current;
     }
-    // Don't hard-fail: proceed and let the deliver timeout catch a truly dead session.
+    return false; // timed out without observing a confirmed-live pane
   }
 
   private async capture(): Promise<string> {
@@ -411,8 +678,9 @@ async function main(): Promise<void> {
 
   if (process.env.ANTHROPIC_API_KEY && !echo) {
     console.error(
-      "[reviewer] WARNING: ANTHROPIC_API_KEY is set — Claude Code will bill to the API key, NOT your subscription. " +
-        "Unset it (and log in via claude.ai) for subscription billing.",
+      "[reviewer] note: ANTHROPIC_API_KEY is set in the worker environment, but reviewer sessions are " +
+        "launched with an isolated env that strips it — claude sessions stay on subscription auth. " +
+        "Unset it anyway to keep spawn-fallback reviews (claude -p) off API-key billing.",
     );
   }
 
@@ -432,14 +700,15 @@ async function main(): Promise<void> {
     return new TmuxCliSession({
       sessionName: sessionNameFor(sessionBaseName, kind.slug, repoCwd),
       cwd: repoCwd,
-      launchCommand: kind.launchCommand(repoCwd, kindPromptDir),
       promptDir: kindPromptDir,
-      clearCommand: kind.clearCommand,
-      // "never" keeps the session's conversation memory across reviews; anything else clears.
-      clearBetweenReviews: process.env.CODE_ASSISTANT_PEERS_REVIEWER_CLEAR !== "never",
+      kind,
+      // Default: KEEP conversation memory across reviews (resume-on-switch preserves it too).
+      // "always" clears before every review for isolated rounds; "never" kept as a legacy alias.
+      clearBetweenReviews: process.env.CODE_ASSISTANT_PEERS_REVIEWER_CLEAR === "always",
       startupTimeoutMs: envInt("CODE_ASSISTANT_PEERS_REVIEWER_STARTUP_MS", 30_000),
       deliverTimeoutMs: envInt("CODE_ASSISTANT_PEERS_REVIEW_TIMEOUT_MS", DEFAULT_DELIVER_TIMEOUT_MS),
       pollIntervalMs: envInt("CODE_ASSISTANT_PEERS_REVIEWER_POLL_MS", DEFAULT_POLL_INTERVAL_MS),
+      rateLimitPatterns: (process.env.CODE_ASSISTANT_PEERS_RATE_LIMIT_PATTERNS ?? "").split(",").map((p) => p.trim()).filter(Boolean),
     });
   };
 
@@ -449,6 +718,7 @@ async function main(): Promise<void> {
     sessionFor,
     signal: controller.signal,
     once,
+    rateLimitCooldownMs: envInt("CODE_ASSISTANT_PEERS_RATE_LIMIT_COOLDOWN_MS", DEFAULT_RATE_LIMIT_COOLDOWN_MS),
     log: (message) => console.error(`[reviewer] ${message}`),
   });
   releaseLock?.();
@@ -467,22 +737,59 @@ export interface LiveCliKind {
   // it via --add-dir; gemini puts it INSIDE the (trusted) repo cwd to avoid a second trust
   // prompt that --include-directories would raise; codex reads absolute paths under its sandbox.
   promptDir: (cwd: string) => string;
-  launchCommand: (cwd: string, promptDir: string) => string[];
+  // Argv for a FRESH session. sessionId is baked in where the CLI supports assigning one
+  // (claude/gemini --session-id; codex cannot); model is baked in when already requested.
+  launchCommand: (cwd: string, promptDir: string, sessionId: string | null, model: string | null) => string[];
+  // Argv that relaunches the CLI RESUMING sessionRef on a new model (conversation preserved).
+  // sessionRef: assigned uuid (claude), per-project list index (gemini), captured rollout uuid
+  // (codex). NEVER use --last/latest here — session stores are shared with the user's own
+  // sessions (codex is even machine-global), so only explicit refs are safe.
+  resumeCommand: (promptDir: string, sessionRef: string, model: string) => string[];
+  // How this kind gets a resumable id: "assign" = we hand the CLI a uuid at launch;
+  // "capture" = recover it later from the CLI's own session store (codex rollout files).
+  idStrategy: "assign" | "capture";
+  // What resumeCommand's sessionRef is resolved from: the uuid itself, or gemini's
+  // per-project session list index looked up by our uuid.
+  resumeBy: "uuid" | "gemini-index";
   clearCommand: string | null;
 }
 
 const SHARED_PROMPT_DIR = join(tmpdir(), "peer-reviewer-prompts");
 
+function claudeBaseArgs(): string[] {
+  return parseArgsEnv(process.env.CODE_ASSISTANT_PEERS_REVIEWER_CLAUDE_ARGS) ?? DEFAULT_REVIEWER_CLAUDE_ARGS;
+}
+function geminiBaseArgs(): string[] {
+  return parseArgsEnv(process.env.CODE_ASSISTANT_PEERS_REVIEWER_GEMINI_ARGS) ?? ["--skip-trust", "--approval-mode", "plan"];
+}
+function codexBaseArgs(): string[] {
+  return parseArgsEnv(process.env.CODE_ASSISTANT_PEERS_REVIEWER_CODEX_ARGS) ?? ["--sandbox", "read-only"];
+}
+
 export const LIVE_CLI_KINDS: Record<string, LiveCliKind> = {
   "claude-live": {
     slug: "claude",
     promptDir: () => SHARED_PROMPT_DIR,
-    launchCommand: (_cwd, promptDir) => [
+    launchCommand: (_cwd, promptDir, sessionId, model) => [
       "claude",
-      ...(parseArgsEnv(process.env.CODE_ASSISTANT_PEERS_REVIEWER_CLAUDE_ARGS) ?? DEFAULT_REVIEWER_CLAUDE_ARGS),
+      ...claudeBaseArgs(),
+      ...(sessionId ? ["--session-id", sessionId] : []),
+      ...(model ? ["--model", model] : []),
       "--add-dir",
       promptDir,
     ],
+    resumeCommand: (promptDir, sessionRef, model) => [
+      "claude",
+      ...claudeBaseArgs(),
+      "--resume",
+      sessionRef,
+      "--model",
+      model,
+      "--add-dir",
+      promptDir,
+    ],
+    idStrategy: "assign",
+    resumeBy: "uuid",
     clearCommand: "/clear",
   },
   "gemini-live": {
@@ -490,22 +797,163 @@ export const LIVE_CLI_KINDS: Record<string, LiveCliKind> = {
     // Inside the repo cwd (already trusted via --skip-trust) so gemini can Read it without the
     // separate `--include-directories` trust prompt that stalls a detached session.
     promptDir: (cwd) => join(cwd, ".peer-review"),
-    launchCommand: () => [
+    launchCommand: (_cwd, _promptDir, sessionId, model) => [
       "gemini",
-      ...(parseArgsEnv(process.env.CODE_ASSISTANT_PEERS_REVIEWER_GEMINI_ARGS) ?? ["--skip-trust", "--approval-mode", "plan"]),
+      ...geminiBaseArgs(),
+      ...(sessionId ? ["--session-id", sessionId] : []),
+      ...(model ? ["-m", model] : []),
     ],
+    // gemini --resume takes the per-project session list INDEX (resolved from our uuid via
+    // --list-sessions), not the uuid itself.
+    resumeCommand: (_promptDir, sessionRef, model) => [
+      "gemini",
+      ...geminiBaseArgs(),
+      "-m",
+      model,
+      "--resume",
+      sessionRef,
+    ],
+    idStrategy: "assign",
+    resumeBy: "gemini-index",
     clearCommand: "/clear",
   },
   "codex-live": {
     slug: "codex",
     promptDir: () => SHARED_PROMPT_DIR,
-    launchCommand: () => [
+    launchCommand: (_cwd, _promptDir, _sessionId, model) => [
       "codex",
-      ...(parseArgsEnv(process.env.CODE_ASSISTANT_PEERS_REVIEWER_CODEX_ARGS) ?? ["--sandbox", "read-only"]),
+      ...codexBaseArgs(),
+      ...(model ? ["-m", model] : []),
     ],
+    // codex resume continues the recorded session (uuid captured from its rollout file); the
+    // model is overridden via config since resume has no -m flag of its own.
+    resumeCommand: (_promptDir, sessionRef, model) => [
+      "codex",
+      "resume",
+      sessionRef,
+      "-c",
+      `model=${JSON.stringify(model)}`,
+    ],
+    idStrategy: "capture",
+    resumeBy: "uuid",
     clearCommand: "/new",
   },
 };
+
+// ---------------------------------------------------------------------------
+// Session environment isolation
+//
+// The reviewer TUIs must NOT inherit the spawning process's environment: when the worker is
+// auto-started from a host coding agent (or a dev shell inside one), nested-session variables
+// leak in and break the CLIs — observed concretely as Claude sessions no longer persisting
+// their conversation transcripts (which silently breaks resume-on-model-switch). Launch every
+// session through `env -i` with an explicit allowlist instead — the same posture
+// buildReviewCommandEnv takes for spawned headless reviewers. ANTHROPIC_API_KEY is deliberately
+// absent so claude stays on subscription auth.
+// ---------------------------------------------------------------------------
+
+const SESSION_ENV_ALLOWLIST = [
+  "PATH",
+  "HOME",
+  "USER",
+  "SHELL",
+  "TMPDIR",
+  "LANG",
+  "LC_ALL",
+  "CLAUDE_CONFIG_DIR",
+  "CODEX_HOME",
+  "OPENAI_API_KEY",
+  "GEMINI_API_KEY",
+  "GOOGLE_API_KEY",
+  "GOOGLE_GENAI_USE_VERTEXAI",
+  "GOOGLE_CLOUD_PROJECT",
+  "GOOGLE_CLOUD_LOCATION",
+  "GOOGLE_APPLICATION_CREDENTIALS",
+];
+
+export function sessionEnvPrefix(sourceEnv: NodeJS.ProcessEnv = process.env): string[] {
+  const pairs = SESSION_ENV_ALLOWLIST.flatMap((key) =>
+    sourceEnv[key] !== undefined ? [`${key}=${sourceEnv[key]}`] : [],
+  );
+  // TERM must be re-set explicitly because `env -i` wipes the one tmux provides to the pane.
+  return ["env", "-i", ...pairs, `TERM=${sourceEnv.TERM ?? "xterm-256color"}`];
+}
+
+// ---------------------------------------------------------------------------
+// Session-id helpers for resume-on-model-switch
+// ---------------------------------------------------------------------------
+
+export function codexSessionsDir(): string {
+  return process.env.CODE_ASSISTANT_PEERS_CODEX_SESSIONS_DIR ?? join(homedir(), ".codex", "sessions");
+}
+
+// rollout-2026-06-12T09-41-24-<uuid>.jsonl -> <uuid>
+export function codexSessionIdFromRolloutPath(path: string): string | null {
+  const match = /rollout-.*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i.exec(path);
+  return match ? match[1] : null;
+}
+
+// Find OUR codex session by content: its transcript is the only one in the world containing the
+// given per-job marker, so this never confuses the user's own (machine-global) codex sessions.
+// Scans newest-first and bounds the scan; returns null when nothing matches (caller falls back).
+export async function findCodexSessionId(dir: string, marker: string, sinceMs = 0, scanLimit = 50): Promise<string | null> {
+  let entries: string[];
+  try {
+    entries = (await readdir(dir, { recursive: true })) as string[];
+  } catch {
+    return null;
+  }
+  const files = entries.filter((entry) => entry.endsWith(".jsonl")).map((entry) => join(dir, entry));
+  const dated = (await Promise.all(files.map(async (file) => ({
+    file,
+    mtimeMs: (await stat(file).catch(() => null))?.mtimeMs ?? 0,
+  }))))
+    .filter((entry) => entry.mtimeMs >= sinceMs) // our rollout can't predate the session launch
+    .sort((a, b) => b.mtimeMs - a.mtimeMs);
+  const scanned = dated.slice(0, scanLimit);
+  for (const { file } of scanned) {
+    try {
+      if ((await readFile(file, "utf8")).includes(marker)) return codexSessionIdFromRolloutPath(file);
+    } catch {
+      // unreadable rollout — skip
+    }
+  }
+  if (dated.length > scanLimit) {
+    console.error(`[reviewer] codex session capture scanned the ${scanLimit} newest of ${dated.length} candidate rollouts without a match; resume may fall back to a fresh session.`);
+  }
+  return null;
+}
+
+// Parse `gemini --list-sessions` output ("  3. <preview>... (20 hours ago) [<uuid>]") and return
+// the list index for OUR uuid. Index-by-uuid keeps us off "latest", which could be the user's
+// own gemini session in the same repo.
+export function parseGeminiSessionIndex(listOutput: string, sessionId: string): string | null {
+  for (const line of listOutput.split("\n")) {
+    const match = /^\s*(\d+)\.\s.*\[([0-9a-fA-F-]{36})\]\s*$/.exec(line);
+    if (match && match[2].toLowerCase() === sessionId.toLowerCase()) return match[1];
+  }
+  return null;
+}
+
+async function resolveGeminiSessionIndex(cwd: string, sessionId: string): Promise<string | null> {
+  // Use the same isolated env as the launched session (env -i + allowlist) so the probe sees the
+  // identical config/auth the real session does — and never inherits nested-CLI leakage.
+  const [, , ...envPairs] = sessionEnvPrefix();
+  const env = Object.fromEntries(envPairs.map((pair) => {
+    const eq = pair.indexOf("=");
+    return [pair.slice(0, eq), pair.slice(eq + 1)];
+  }));
+  const proc = Bun.spawn(["gemini", "--list-sessions"], { cwd, env, stdout: "pipe", stderr: "pipe" });
+  const timer = setTimeout(() => proc.kill(), 30_000);
+  try {
+    const [stdout] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+    return parseGeminiSessionIndex(stdout, sessionId);
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 export function liveCliKindFor(reviewer: string): LiveCliKind | null {
   return LIVE_CLI_KINDS[reviewer] ?? null;

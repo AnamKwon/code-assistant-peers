@@ -294,7 +294,9 @@ checklist.
 broker), each falling back to its headless CLI if the broker/session is unavailable. Unlike
 Claude there is no headless-vs-interactive billing split for these — the benefit is a persistent
 per-repo session whose conversation memory can be kept across reviews
-(`CODE_ASSISTANT_PEERS_REVIEWER_CLEAR=never`). Host-side passes (self-review, the aggregate pass,
+(kept by default; `CODE_ASSISTANT_PEERS_REVIEWER_CLEAR=always` clears per review). `review_model`
+also applies to live reviewers: a model change restarts the session resuming the same
+conversation. Host-side passes (self-review, the aggregate pass,
 collaborative comparison) can also run on the host's live session with
 `CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS=1`. See [broker/REVIEWER.md](broker/REVIEWER.md).
 
@@ -693,7 +695,12 @@ Main cost drivers:
 - `CODE_ASSISTANT_PEERS_DIFF_BUDGET` controls how much raw diff is included. The default is `12000` characters.
 - `serena-auto` may add semantic context. `CODE_ASSISTANT_PEERS_SERENA_CONTEXT_BUDGET` defaults to `8000` characters.
 - Reviewers are allowed to inspect the repository directly when the included diff is insufficient, so Claude print mode or Codex exec may read additional files.
-- Previous review memory is included in later rounds so reviewers can verify earlier findings.
+- Previous review memory is included in later rounds so reviewers can verify earlier findings. Only the most recent `CODE_ASSISTANT_PEERS_MEMORY_ROUNDS` rounds (default `3`) are inlined; open findings are always included in full.
+
+Built-in savings:
+
+- **Same-state dedup**: when the repository state and review options match the latest completed review, the gate returns the recorded review instead of re-running reviewers (no tokens spent). Host-written `change_summary`/`files_changed` rewording does not defeat this. Pass `force_review: true` to re-run anyway.
+- **Memory cap**: long tasks no longer grow the prompt with every prior round (see above).
 
 Billing pool note: starting 2026-06-15, spawned `claude -p` reviews draw from the separate Agent
 SDK monthly credit instead of the Claude subscription. The `claude-live` adapter keeps Claude
@@ -703,20 +710,36 @@ reviews on the subscription pool by routing them to a backgrounded interactive s
 Low-token recommended setup:
 
 ```bash
-# Single external peer, compact gate output
-bun cli.ts setup codex --peers=claude --mode=gate
+# Single external peer, compact gate output. gate mode also disables host self-review.
+bun cli.ts setup codex --peers=claude-live --mode=gate
 
 # Or use Gemini explicitly as the only peer
 bun cli.ts setup codex --peers=gemini --mode=gate
 ```
 
-For tighter prompt budgets:
+Full low-cost profile (add these to the MCP server env):
 
 ```bash
-CODE_ASSISTANT_PEERS_DIFF_BUDGET=4000
-CODE_ASSISTANT_PEERS_SERENA_CONTEXT_BUDGET=2000
-CODE_ASSISTANT_PEERS_CONTEXT_PROVIDER=off
+CODE_ASSISTANT_PEERS_REVIEW_MODE=gate        # compact ALLOW/BLOCK output (setup --mode=gate writes this)
+CODE_ASSISTANT_PEERS_REVIEW_MODEL=auto       # route small/low-risk diffs to the cheap model tier by default
+CODE_ASSISTANT_PEERS_SELF_REVIEW=none        # skip the extra host self-review pass
+CODE_ASSISTANT_PEERS_DIFF_BUDGET=4000        # cap included diff (only truncates large diffs)
+CODE_ASSISTANT_PEERS_CONTEXT_PROVIDER=off    # drop semantic context entirely (serena-auto already
+                                             # skips small changes on its own)
+CODE_ASSISTANT_PEERS_MEMORY_ROUNDS=2         # inline fewer prior rounds (open findings always included)
+CODE_ASSISTANT_PEERS_REVIEWER_CLEAR=always   # live sessions: reset conversation per review — the
+                                             # keep-memory default re-reads a growing context each round
 ```
+
+Notes:
+
+- `CODE_ASSISTANT_PEERS_REVIEW_MODEL` is the default when the host does not pass `review_model`;
+  an explicit host value still wins. `auto` picks from the per-reviewer model catalog by diff
+  size/risk, so routine diffs run on `haiku`/`flash`/`-mini`-class models.
+- `claude-live` keeps Claude reviews on the subscription pool instead of API-rate credits — for
+  many setups that is the single largest cost lever. See [broker/REVIEWER.md](broker/REVIEWER.md).
+- The same-state dedup (above) means re-running the gate without new edits costs nothing; batch
+  your edits and run the gate once per work unit rather than per file save.
 
 Use `normal`, `adversarial`, `collaborative`, multi-peer review, and Serena-rich context when you want deeper review coverage and are willing to spend more tokens. Use `gate` mode and a single peer for routine final-response checks.
 
@@ -899,6 +922,11 @@ CODE_ASSISTANT_PEERS_HOME=/path/to/store
 | `CODE_ASSISTANT_PEERS_REVIEW_OUTPUT_BUDGET` | `6000` | Character budget for tool responses. |
 | `CODE_ASSISTANT_PEERS_REVIEW_TIMEOUT_MS` | adapter default, otherwise `600000` | Hard timeout for each reviewer CLI process. Built-in Gemini defaults to `180000`. |
 | `CODE_ASSISTANT_PEERS_ARGV_PROMPT_BUDGET` | `60000` | Maximum prompt size for custom adapters using `prompt_transport: "argv"`. |
+| `CODE_ASSISTANT_PEERS_REVIEW_MODEL` | unset | Default reviewer model when the host omits `review_model`; `auto` routes by diff size/risk. An explicit host value wins. |
+| `CODE_ASSISTANT_PEERS_SELF_REVIEW` | `codex` | Which hosts run a self-review: `codex` (default), `all`/`*`, `none`/`off`, or a comma list. |
+| `CODE_ASSISTANT_PEERS_MEMORY_ROUNDS` | `3` | Prior review rounds inlined into each review prompt (open findings always included in full). |
+| `CODE_ASSISTANT_PEERS_REVIEWER_CLEAR` | keep memory | Live-session conversation memory across reviews; `always` resets per review. See [broker/REVIEWER.md](broker/REVIEWER.md). |
+| `CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS` | unset | `1` routes host-side passes (self-review/aggregate/collaborative) through the host's live session. |
 | `CODE_ASSISTANT_PEERS_INCLUDE_SUCCESS_STDERR` | unset | Set `1` to include successful reviewer stderr in MCP responses. |
 
 ## CLI

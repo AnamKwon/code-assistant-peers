@@ -62,15 +62,12 @@ export async function runReviewCommand(
   // the adapter's CLI command over stdin (graceful degradation to the original behavior).
   let transport: "stdin" | "argv" = adapter.prompt_transport === "argv" ? "argv" : "stdin";
   if (adapter.prompt_transport === "channel") {
-    if (model?.trim()) {
-      // The live session reviews with whatever model it is running; review_model only applies
-      // to the spawned-CLI fallback path.
-      console.error(`[code-assistant-peers] review_model '${model.trim()}' is not applied to the live channel session for ${reviewer}; it will be used only if the review falls back to spawning the CLI.`);
-    }
     // Auto-start the broker + backgrounded reviewer worker if they are not already running, so a
     // host only has to pick `claude-live` — no manual daemon launch. Idempotent + reused.
     await ensureChannelBackend(cwd);
-    const reply = await reviewViaBroker(reviewer, prompt, resolveChannelTimeoutMs(), cwd);
+    // The requested model rides along on the job; the worker switches the live session to it
+    // (restart + resume, conversation preserved) when it differs from the session's current model.
+    const reply = await reviewViaBroker(reviewer, prompt, resolveChannelTimeoutMs(), cwd, model?.trim() || null);
     if (reply.ok) {
       return { exitCode: 0, stdout: reply.text, stderr: "", command: ["<broker>", reviewer] };
     }

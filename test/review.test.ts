@@ -1527,3 +1527,59 @@ describe("git status -z parsing", () => {
     expect(parseStatusEntriesZ("")).toEqual([]);
   });
 });
+
+describe("previous review memory cap", () => {
+  // Runs in a subprocess with an isolated CODE_ASSISTANT_PEERS_HOME so the real store stays
+  // untouched (STORE_DIR is resolved at module load, so an in-process env change cannot work).
+  test("inlines only the most recent rounds and notes the omitted ones", async () => {
+    const script = `
+      import { appendReviewRound } from "./shared/store.ts";
+      import { buildReviewPrompt } from "./shared/review.ts";
+      const now = new Date(0).toISOString();
+      // cwd = the isolated store dir (empty, non-git) so the prompt's included diff cannot
+      // contain this repo's working tree — which embeds this very test source.
+      const task = {
+        id: "memcap-task", host: "codex", peer: "codex", prompt: "memory cap test",
+        cwd: process.env.CODE_ASSISTANT_PEERS_HOME, git_root: null, baseline_status: [], baseline_diff: "",
+        created_at: now, updated_at: now, status: "open",
+      };
+      for (let i = 1; i <= 5; i++) {
+        await appendReviewRound(task, {
+          reviewer: "codex", command: ["codex"], exit_code: 0,
+          stdout: "ROUND_MARK_" + i, stderr: "", started_at: now, completed_at: now,
+        }, "prompt " + i);
+      }
+      const { prompt } = await buildReviewPrompt(task, {});
+      console.log(JSON.stringify(prompt));
+    `;
+    const { mkdtemp, rm } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const home = await mkdtemp(join(tmpdir(), "memcap-store-"));
+    try {
+      const proc = Bun.spawn(["bun", "-e", script], {
+        cwd: process.cwd(),
+        env: { ...process.env, CODE_ASSISTANT_PEERS_HOME: home },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+        proc.exited,
+      ]);
+      expect(exitCode).toBe(0);
+      if (exitCode !== 0) console.error(stderr);
+      const prompt = JSON.parse(stdout.trim().split("\n").pop()!);
+      // Default cap = 3: rounds 3..5 included, rounds 1..2 omitted with a note.
+      expect(prompt).toContain("ROUND_MARK_5");
+      expect(prompt).toContain("ROUND_MARK_4");
+      expect(prompt).toContain("ROUND_MARK_3");
+      expect(prompt).not.toContain("ROUND_MARK_2");
+      expect(prompt).not.toContain("ROUND_MARK_1\n");
+      expect(prompt).toContain("2 earlier rounds omitted");
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  }, 20000);
+});
