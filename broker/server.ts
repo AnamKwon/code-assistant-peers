@@ -11,6 +11,8 @@
 //
 // Run:  CODE_ASSISTANT_PEERS_BROKER_PORT=7899 bun broker/server.ts
 
+import { createDevLogger } from "./reviewer.ts";
+
 interface Job {
   id: string;
   reviewer: string;
@@ -18,6 +20,9 @@ interface Job {
   // Repo dir the review is for, so the reviewer worker drives a session pinned to the right repo
   // (per-repo isolation across concurrently reviewed repos). Empty => worker's default cwd.
   cwd: string;
+  // Host-selected model for this review, if any. The live worker may apply it by launching or
+  // resuming the interactive CLI with the model selected for this request.
+  model: string;
   status: "pending" | "claimed" | "done" | "error";
   result?: string;
   createdAt: number;
@@ -26,6 +31,7 @@ interface Job {
 const PORT = Number(process.env.CODE_ASSISTANT_PEERS_BROKER_PORT ?? 7899);
 const jobs = new Map<string, Job>();
 let seq = 0;
+const devLog = createDevLogger("broker");
 
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
@@ -39,10 +45,26 @@ Bun.serve({
 
     // --- channel transport side ---
     if (req.method === "POST" && pathname === "/jobs") {
-      const body = (await req.json().catch(() => ({}))) as { reviewer?: string; prompt?: string; cwd?: string };
+      const body = (await req.json().catch(() => ({}))) as { reviewer?: string; prompt?: string; cwd?: string; model?: string };
       if (!body.prompt) return json({ error: "prompt required" }, 400);
       const id = `job_${Date.now().toString(36)}_${seq++}`;
-      jobs.set(id, { id, reviewer: String(body.reviewer ?? "claude-live"), prompt: body.prompt, cwd: String(body.cwd ?? ""), status: "pending", createdAt: Date.now() });
+      jobs.set(id, {
+        id,
+        reviewer: String(body.reviewer ?? "claude-live"),
+        prompt: body.prompt,
+        cwd: String(body.cwd ?? ""),
+        model: String(body.model ?? ""),
+        status: "pending",
+        createdAt: Date.now(),
+      });
+      devLog("job_created", {
+        id,
+        reviewer: String(body.reviewer ?? "claude-live"),
+        cwd: String(body.cwd ?? ""),
+        requestedModel: String(body.model ?? ""),
+        usedModel: modelForLog(String(body.model ?? "")),
+        promptChars: String(body.prompt).length,
+      });
       return json({ id, status: "pending" });
     }
 
@@ -53,6 +75,7 @@ Bun.serve({
       const body = (await req.json().catch(() => ({}))) as { result?: string };
       job.status = "done";
       job.result = String(body.result ?? "");
+      devLog("job_done", { id: job.id, reviewer: job.reviewer, cwd: job.cwd, requestedModel: job.model, usedModel: modelForLog(job.model), resultChars: job.result.length });
       return json({ ok: true });
     }
 
@@ -63,6 +86,7 @@ Bun.serve({
       const body = (await req.json().catch(() => ({}))) as { error?: string };
       job.status = "error";
       job.result = String(body.error ?? "reviewer error");
+      devLog("job_error", { id: job.id, reviewer: job.reviewer, cwd: job.cwd, requestedModel: job.model, usedModel: modelForLog(job.model), error: job.result });
       return json({ ok: true });
     }
 
@@ -78,10 +102,22 @@ Bun.serve({
       for (const job of jobs.values()) {
         if (job.status === "pending") {
           job.status = "claimed";
-          return json({ id: job.id, reviewer: job.reviewer, prompt: job.prompt, cwd: job.cwd });
+          devLog("job_claimed", { id: job.id, reviewer: job.reviewer, cwd: job.cwd, requestedModel: job.model, usedModel: modelForLog(job.model) });
+          return json({ id: job.id, reviewer: job.reviewer, prompt: job.prompt, cwd: job.cwd, model: job.model });
         }
       }
       return json({ id: null });
+    }
+
+    // Worker startup: reclaim all "claimed" jobs back to "pending" so a crashed/replaced
+    // worker doesn't leave jobs permanently stuck in claimed state.
+    if (req.method === "POST" && pathname === "/reclaim") {
+      let count = 0;
+      for (const job of jobs.values()) {
+        if (job.status === "claimed") { job.status = "pending"; count++; }
+      }
+      devLog("jobs_reclaimed", { count });
+      return json({ reclaimed: count });
     }
 
     if (pathname === "/health") return json({ ok: true, jobs: jobs.size });
@@ -90,3 +126,8 @@ Bun.serve({
 });
 
 console.error(`[code-assistant-peers broker] listening on http://127.0.0.1:${PORT}`);
+devLog("broker_start", { port: PORT });
+
+function modelForLog(model: string): string {
+  return model.trim() || "cli-default";
+}
