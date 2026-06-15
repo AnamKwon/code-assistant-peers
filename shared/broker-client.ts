@@ -40,7 +40,7 @@ export async function reviewViaBroker(
   prompt: string,
   timeoutMs: number,
   cwd = "",
-  pollIntervalMs = 1000,
+  pollIntervalMs = 250,
   model?: string | null,
 ): Promise<BrokerReply> {
   const base = brokerUrl();
@@ -64,9 +64,18 @@ export async function reviewViaBroker(
     return { ok: false, text: "", error: `broker submit failed: ${error instanceof Error ? error.message : String(error)}` };
   }
 
+  // Poll with check-before-sleep: on the terminal iteration (when postResult() just fired) the
+  // result is already in the broker's in-memory map. Sleeping first adds up to pollIntervalMs of
+  // pure idle time after the reviewer finishes. Check immediately, then sleep between retries.
+  let firstPoll = true;
   while (Date.now() < deadline) {
-    // Clamp the inter-poll sleep to the remaining budget so it cannot overshoot the deadline.
-    await sleep(Math.min(pollIntervalMs, deadline - Date.now()));
+    if (!firstPoll) {
+      // Clamp the inter-poll sleep to the remaining budget so it cannot overshoot the deadline.
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      await sleep(Math.min(pollIntervalMs, remaining));
+    }
+    firstPoll = false;
     const remaining = deadline - Date.now();
     if (remaining <= 0) break;
     try {

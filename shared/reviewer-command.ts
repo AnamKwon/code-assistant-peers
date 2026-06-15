@@ -65,7 +65,7 @@ export async function runReviewCommand(
     // Auto-start the broker + backgrounded reviewer worker if they are not already running, so a
     // host only has to pick `claude-live` — no manual daemon launch. Idempotent + reused.
     await ensureChannelBackend(cwd);
-    const reply = await reviewViaBroker(reviewer, prompt, resolveChannelTimeoutMs(), cwd, 1000, model);
+    const reply = await reviewViaBroker(reviewer, prompt, resolveChannelTimeoutMs(), cwd, 250, model);
     if (reply.ok) {
       const command = model?.trim() ? ["<broker>", reviewer, "--model", model.trim()] : ["<broker>", reviewer];
       return { exitCode: 0, stdout: reply.text, stderr: "", command };

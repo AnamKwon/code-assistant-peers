@@ -414,7 +414,7 @@ const TOOLS = [
         },
         poll_interval_ms: {
           type: "number" as const,
-          description: "Polling interval in milliseconds. Defaults to 1000.",
+          description: "Polling interval in milliseconds. Defaults to 500 and is capped at 5000.",
         },
       },
       required: ["task_id"],
@@ -1138,7 +1138,7 @@ async function waitForPeerReviewTool(args: unknown) {
   const taskId = String(parsed.task_id ?? "").trim();
   if (!taskId) return textResult("task_id is required", true);
   const timeoutSeconds = clampNumber(Number(parsed.timeout_seconds ?? 30), 1, 90);
-  const pollIntervalMs = clampNumber(Number(parsed.poll_interval_ms ?? 1000), 250, 5000);
+  const pollIntervalMs = clampNumber(Number(parsed.poll_interval_ms ?? 500), 100, 5000);
   const deadline = Date.now() + timeoutSeconds * 1000;
 
   while (Date.now() <= deadline) {
@@ -1314,6 +1314,10 @@ async function runMultiPeerReviewTool(
   }
 
   const snapshot = promptSnapshot ?? await prepareReviewPromptSnapshot(task, options);
+
+  // Each peer round persists its result to SQLite immediately via appendReviewRound inside
+  // runSinglePeerRound (sets task.updated_at, upserts row, writes mirror). wait_for_peer_review
+  // therefore sees each peer's completion as soon as it happens — no extra wrapper needed.
   const selfReviewPromise = selfReviewEnabled
     // liveHostReviewer routes the self-review through the host's live (tmux) session when
     // CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS=1 and a <host>-live adapter is registered.

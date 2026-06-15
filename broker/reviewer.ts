@@ -26,7 +26,7 @@ import { randomUUID } from "node:crypto";
 import { codexReviewerInstructionsFor, liveReviewerSystemPromptFor, toTomlBasicString } from "../shared/review-prompts.ts";
 
 const DEFAULT_BROKER_URL = "http://127.0.0.1:7899";
-const DEFAULT_POLL_INTERVAL_MS = 1000;
+const DEFAULT_POLL_INTERVAL_MS = 250; // reduced from 1000ms — all polling layers share this
 const DEFAULT_DELIVER_TIMEOUT_MS = 600_000;
 
 export interface ReviewJob {
@@ -715,11 +715,15 @@ export class TmuxCliSession implements ReviewerSession {
       await tmux(["send-keys", "-t", sessionName, "Enter"]);
 
       const deadline = Date.now() + deliverTimeoutMs;
+      // Check-before-sleep with adaptive backoff: check immediately on each iteration, then sleep.
+      // Starting at 50ms and doubling up to pollIntervalMs eliminates the worst-case idle time
+      // when the reviewer has already written its output. The pattern mirrors reviewViaBroker:
+      // always check first, then decide how long to wait before the next check.
+      let adaptivePoll = 50;
       while (Date.now() < deadline) {
         // Bail out promptly on worker shutdown (SIGINT/SIGTERM) instead of polling until the
         // deliver timeout — the job is reported as an error and the worker loop can exit.
         if (signal.aborted) throw new Error("reviewer worker is shutting down");
-        await sleep(pollIntervalMs, signal);
 
         // Primary: poll output file (claude-live with system-prompt injection + Write permission).
         // File output avoids tmux rendering artifacts, pane-scroll truncation, and TUI chrome.
@@ -741,6 +745,10 @@ export class TmuxCliSession implements ReviewerSession {
           this.devLog("review_extracted", { jobId, chars: review.length, source: "capture", requestedModel, usedModel: this.usedModelForLog(), currentModel: this.currentModel, sessionId: this.sessionId });
           return review;
         }
+
+        // Sleep after check (not before) — adaptive backoff: 50ms → 100ms → … → pollIntervalMs.
+        await sleep(Math.min(adaptivePoll, Math.max(0, deadline - Date.now())), signal);
+        adaptivePoll = Math.min(adaptivePoll * 2, pollIntervalMs);
       }
       this.devLog("deliver_timeout", { jobId, timeoutMs: deliverTimeoutMs, requestedModel, usedModel: this.usedModelForLog(), currentModel: this.currentModel, sessionId: this.sessionId });
       throw new Error(`timed out after ${deliverTimeoutMs}ms waiting for the review marker in the live session`);
