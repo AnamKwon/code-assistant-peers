@@ -6,6 +6,8 @@ node_modules/
 *.sqlite-wal
 dist/
 coverage/
+.code-assistant-peers-dev/
+.peer-review/
 .env
 .env.*
 !.env.example

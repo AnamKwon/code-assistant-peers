@@ -24,17 +24,19 @@ function bootstrapDeps(overrides: Partial<BackendBootstrapDeps> = {}): BackendBo
 }
 
 // Mock broker: POST /jobs -> id; GET /jobs/:id -> done with a canned review.
-function startMockBroker(reviewText: string) {
+function startMockBroker(reviewText: string, onSubmit?: (body: unknown) => void) {
   let jobId = "";
   return Bun.serve({
     port: 0,
     hostname: "127.0.0.1",
-    fetch(req) {
+    async fetch(req) {
       const { pathname } = new URL(req.url);
       if (req.method === "GET" && pathname === "/health") {
         return Response.json({ ok: true }); // healthy => runReviewCommand's autostart is a no-op
       }
       if (req.method === "POST" && pathname === "/jobs") {
+        const body = await req.json().catch(() => ({}));
+        onSubmit?.(body);
         jobId = "mock-1";
         return Response.json({ id: jobId, status: "pending" });
       }
@@ -107,6 +109,22 @@ describe("channel review transport (broker)", () => {
     }
   });
 
+  test("runReviewCommand passes review_model to the broker and records it", async () => {
+    let submitted: any = null;
+    const server = startMockBroker("MOCK REVIEW via broker.", (body) => {
+      submitted = body;
+    });
+    process.env.CODE_ASSISTANT_PEERS_BROKER_URL = `http://127.0.0.1:${server.port}`;
+    try {
+      const result = await runReviewCommand("claude-live", process.cwd(), "review this", "sonnet");
+      expect(result.exitCode).toBe(0);
+      expect(result.command).toEqual(["<broker>", "claude-live", "--model", "sonnet"]);
+      expect(submitted.model).toBe("sonnet");
+    } finally {
+      server.stop(true);
+    }
+  });
+
   test("gemini-live and codex-live are built-in channel adapters with headless fallbacks", () => {
     for (const [id, base] of [["gemini-live", "gemini"], ["codex-live", "codex"]] as const) {
       const adapter = BUILTIN_ASSISTANTS[id];
@@ -116,10 +134,11 @@ describe("channel review transport (broker)", () => {
     }
   });
 
-  test("liveHostReviewer maps the host to its live adapter only when opted in", () => {
+  test("liveHostReviewer maps the host to its live adapter by default", () => {
     const registry = BUILTIN_ASSISTANTS;
-    expect(liveHostReviewer("claude", {}, registry)).toBe("claude"); // env off → unchanged
+    expect(liveHostReviewer("claude", {}, registry)).toBe("claude-live");
     expect(liveHostReviewer("claude", { CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS: "1" }, registry)).toBe("claude-live");
+    expect(liveHostReviewer("claude", { CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS: "0" }, registry)).toBe("claude");
     expect(liveHostReviewer("codex", { CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS: "1" }, registry)).toBe("codex-live");
     expect(liveHostReviewer("claude-live", { CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS: "1" }, registry)).toBe("claude-live"); // already live
     expect(liveHostReviewer("glm", { CODE_ASSISTANT_PEERS_LIVE_HOST_REVIEWS: "1" }, registry)).toBe("glm"); // no live variant
