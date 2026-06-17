@@ -11,3 +11,4 @@ coverage/
 !.env.example
 .serena/
 .gemini/
+docs/REDDIT_POSTS.md

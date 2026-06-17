@@ -29,9 +29,43 @@ interface Job {
 }
 
 const PORT = Number(process.env.CODE_ASSISTANT_PEERS_BROKER_PORT ?? 7899);
+// Default claim TTL matches the worker deliver timeout (10 min). After this, a claimed job
+// that never got a result is automatically moved to error so the chain doesn't block forever.
+const CLAIM_TTL_MS = Number(process.env.CODE_ASSISTANT_PEERS_REVIEW_TIMEOUT_MS ?? 600_000);
 const jobs = new Map<string, Job>();
 let seq = 0;
 const devLog = createDevLogger("broker");
+
+// Expire jobs that have been claimed longer than CLAIM_TTL_MS without a result.
+// This prevents stale chains from blocking new jobs indefinitely.
+function expireStaleClaimedJobs(): void {
+  const cutoff = Date.now() - CLAIM_TTL_MS;
+  let expired = 0;
+  for (const job of jobs.values()) {
+    if (job.status === "claimed" && job.createdAt < cutoff) {
+      job.status = "error";
+      job.result = `claim expired after ${Math.round(CLAIM_TTL_MS / 1000)}s without result`;
+      expired++;
+    }
+  }
+  if (expired > 0) console.error(`[broker] expired ${expired} stale claimed job(s)`);
+}
+
+// Evict completed/error jobs when the map grows large (keep at most 500 entries to avoid OOM).
+function evictOldJobs(): void {
+  if (jobs.size < 500) return;
+  const candidates: Job[] = [];
+  for (const job of jobs.values()) {
+    if (job.status === "done" || job.status === "error") candidates.push(job);
+  }
+  candidates.sort((a, b) => a.createdAt - b.createdAt);
+  const toDelete = candidates.slice(0, Math.max(0, jobs.size - 400));
+  for (const job of toDelete) jobs.delete(job.id);
+  if (toDelete.length > 0) console.error(`[broker] evicted ${toDelete.length} old completed/error jobs`);
+}
+
+// Run maintenance every minute.
+setInterval(() => { expireStaleClaimedJobs(); evictOldJobs(); }, 60_000).unref();
 
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
@@ -118,6 +152,19 @@ Bun.serve({
       }
       devLog("jobs_reclaimed", { count });
       return json({ reclaimed: count });
+    }
+
+    // Flush stale jobs: expire all claimed jobs immediately and evict completed/error jobs.
+    // Call this manually when the queue is clogged with old claimed jobs.
+    if (req.method === "POST" && pathname === "/flush") {
+      expireStaleClaimedJobs();
+      const sizeBefore = jobs.size;
+      for (const [id, job] of jobs) {
+        if (job.status === "done" || job.status === "error") jobs.delete(id);
+      }
+      const flushed = sizeBefore - jobs.size;
+      devLog("jobs_flushed", { remaining: jobs.size, flushed });
+      return json({ ok: true, remaining: jobs.size, flushed });
     }
 
     if (pathname === "/health") return json({ ok: true, jobs: jobs.size });

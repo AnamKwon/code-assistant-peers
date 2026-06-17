@@ -21,6 +21,7 @@ import {
   isUnknownExistingSession,
   liveSessionUntrackedState,
   liveCliKindFor,
+  paneTail,
   resolveReviewerWorkflow,
   runReviewerWorker,
   sessionNameFor,
@@ -411,6 +412,31 @@ describe("review extraction from a captured pane", () => {
     expect(wrapped).toContain("job-wrap");
     expect(wrapped).toContain("PEER-REVIEW-DONE-");
     expect(wrapped).toContain("Original review task");
+  });
+});
+
+describe("paneTail (liveness sampling slice)", () => {
+  const lines = (n: number) => Array.from({ length: n }, (_, i) => `line ${i + 1}`).join("\n");
+
+  test("returns the whole capture when it has fewer lines than the limit", () => {
+    expect(paneTail("a\nb\nc", 30)).toBe("a\nb\nc");
+  });
+
+  test("returns only the last N lines of a long capture", () => {
+    const tail = paneTail(lines(1000), 30);
+    expect(tail.split("\n")).toHaveLength(30);
+    expect(tail.split("\n")[0]).toBe("line 971");
+    expect(tail.endsWith("line 1000")).toBe(true);
+  });
+
+  test("trailing blank lines do not count as a change (trimmed before slicing)", () => {
+    // A flickering trailing newline must produce the SAME tail, so it is not read as 'still working'.
+    expect(paneTail("x\ny\nz", 30)).toBe(paneTail("x\ny\nz\n\n  \n", 30));
+  });
+
+  test("a ticking elapsed-timer on the last line changes the tail", () => {
+    const pane = (secs: number) => [lines(40), `esc to interrupt (${secs}s)`].join("\n");
+    expect(paneTail(pane(12), 30)).not.toBe(paneTail(pane(13), 30));
   });
 });
 

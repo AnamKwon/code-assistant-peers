@@ -24,10 +24,42 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { codexReviewerInstructionsFor, liveReviewerSystemPromptFor, toTomlBasicString } from "../shared/review-prompts.ts";
+import { spawnWithTimeout } from "../shared/process.ts";
 
 const DEFAULT_BROKER_URL = "http://127.0.0.1:7899";
 const DEFAULT_POLL_INTERVAL_MS = 250; // reduced from 1000ms — all polling layers share this
 const DEFAULT_DELIVER_TIMEOUT_MS = 600_000;
+// A review's wall-clock cost scales with how much there is to review, so a single fixed deadline is
+// either too short for a big diff or too long to detect a wedged reviewer. We bound a review by TWO
+// clocks: an IDLE clock (below) that fires when the reviewer's pane stops changing — i.e. it
+// crashed, exited to a shell prompt, or hung mid-task — and the existing deliverTimeoutMs HARD CAP
+// that fires even while output is still streaming (catches an infinite-but-animated loop). Active
+// reviewers (claude/codex/gemini TUIs) repaint a spinner/elapsed-timer sub-second, so a pane that is
+// static for the idle window is genuinely stuck. This lets a large review run for as long as it
+// keeps producing output (raise the hard cap via CODE_ASSISTANT_PEERS_REVIEW_TIMEOUT_MS) while a
+// dead reviewer is reclaimed in minutes instead of holding its slot for the full hard cap.
+const DEFAULT_REVIEW_IDLE_TIMEOUT_MS = 180_000;
+// Fast "the reviewer finished but produced no review" detection. A working coding-agent TUI repaints
+// its pane sub-second (a live elapsed-time counter / spinner), so a pane that FREEZES has returned to
+// an idle prompt — the turn ended. If that happens with no review markers and no output file, the
+// reviewer answered without delivering the artifact, and we can fail in seconds instead of waiting
+// out the full idle timeout. Liveness is sampled from a bounded TAIL of the pane (the last
+// TICK_TAIL_LINES lines, where the spinner/timer and newest output live) every TICK_SAMPLE_INTERVAL_MS
+// — comparing a few dozen lines instead of the whole scrollback keeps the comparison cheap and avoids
+// holding a huge capture in memory, while being far more robust than comparing only the last line. We
+// only trust the freeze signal once we have OBSERVED this reviewer tick (>= TICK_CONFIRM_COUNT
+// consecutive changed samples); a CLI that renders a static pane while thinking never gets the fast
+// path and falls back to DEFAULT_REVIEW_IDLE_TIMEOUT_MS.
+const QUIET_AFTER_TICKING_MS = 6_000;
+const TICK_SAMPLE_INTERVAL_MS = 2_000;
+const TICK_TAIL_LINES = 30;
+const TICK_CONFIRM_COUNT = 3;
+// tmux commands (has-session/send-keys/capture-pane/...) are local and normally return in
+// milliseconds. The deliver loop only re-checks its deadline *between* polls, so a single tmux
+// call that never returns (a wedged tmux server, a stuck pane) would block the loop forever and
+// bypass deliverTimeoutMs entirely. Bound every tmux call so a wedged server degrades to a normal
+// deliver timeout instead of an unbounded hang. Override with CODE_ASSISTANT_PEERS_TMUX_TIMEOUT_MS.
+const TMUX_TIMEOUT_MS = envInt("CODE_ASSISTANT_PEERS_TMUX_TIMEOUT_MS", 20_000);
 // How long a reviewer (kind × repo) is skipped after it reports a usage/rate limit, when the
 // limit message gives no explicit reset time. Override with CODE_ASSISTANT_PEERS_RATE_LIMIT_COOLDOWN_MS.
 const DEFAULT_RATE_LIMIT_COOLDOWN_MS = 15 * 60_000;
@@ -117,6 +149,8 @@ export interface ReviewerWorkerOptions {
   log?: (message: string) => void;
   // Cooldown after a reviewer reports a usage/rate limit with no explicit reset time.
   rateLimitCooldownMs?: number;
+  // Deliver timeout passed to session.deliver(); also used to set the periodic reclaim interval.
+  deliverTimeoutMs?: number;
   // Maximum number of (reviewer, cwd) sessions running concurrently. Default 8. Lower values
   // reduce the number of jobs that would be permanently lost if the worker crashes; higher values
   // allow more parallelism. Must be >= 1.
@@ -193,6 +227,15 @@ export async function runReviewerWorker(options: ReviewerWorkerOptions): Promise
   // Reclaim jobs left in "claimed" by a crashed/replaced prior worker so they become visible
   // to GET /next again. Best-effort — ignore if broker is unreachable.
   await reclaimStaleClaims(brokerUrl);
+
+  // Periodic reclaim: if the broker was restarted while the worker was running, the worker's
+  // in-flight jobs were wiped from broker memory (claimed→gone). A periodic reclaim is a no-op
+  // in steady state but recovers quickly when the broker restarts.
+  // Interval = deliver timeout + 30s buffer so we don't reclaim jobs that are still active.
+  const deliverTimeoutMs = options.deliverTimeoutMs ?? DEFAULT_DELIVER_TIMEOUT_MS;
+  const reclaimIntervalMs = deliverTimeoutMs + 30_000;
+  const reclaimTimer = setInterval(() => reclaimStaleClaims(brokerUrl).catch(() => {}), reclaimIntervalMs);
+  reclaimTimer.unref?.();
 
   // Per-(reviewer, cwd) promise chain: jobs for the SAME session run sequentially
   // (they share one tmux TUI), while jobs for DIFFERENT sessions run concurrently.
@@ -374,6 +417,16 @@ export function extractReviewFromCapture(capture: string, jobId: string): string
   return stripRenderedLineNumbers(cleanCapturedReview(between));
 }
 
+// The last `lines` lines of a pane capture (after trimming trailing blank lines so a flickering
+// trailing newline never counts as a change). This is the "live" region — the spinner/elapsed-timer
+// and the newest output — used to tell "still working" from "frozen" without storing or comparing
+// the entire scrollback.
+export function paneTail(capture: string, lines: number): string {
+  const trimmed = capture.replace(/\s+$/, "");
+  const all = trimmed.split("\n");
+  return all.slice(Math.max(0, all.length - lines)).join("\n");
+}
+
 // The Gemini TUI renders responses with leading line numbers. Strip them only under a conservative
 // signature so genuine content is never mangled.
 export function stripRenderedLineNumbers(text: string): string {
@@ -465,6 +518,9 @@ export interface TmuxSessionConfig {
   clearBetweenReviews: boolean;
   startupTimeoutMs: number;
   deliverTimeoutMs: number;
+  // Abort if the reviewer pane stops changing for this long (no streaming output) — catches a
+  // crashed/hung reviewer well before the deliverTimeoutMs hard cap. 0 disables the idle clock.
+  idleTimeoutMs: number;
   pollIntervalMs: number;
   useOutputFile: boolean;
   policyFile?: { path: string; content: string };
@@ -636,7 +692,7 @@ export class TmuxCliSession implements ReviewerSession {
     this.devLog("deliver_ready", { jobId, requestedModel, usedModel: this.usedModelForLog(), currentModel: this.currentModel, sessionId: this.sessionId });
     const begin = beginMarkerFor(jobId);
     const done = doneMarkerFor(jobId);
-    const { sessionName, promptDir, deliverTimeoutMs, pollIntervalMs } = this.config;
+    const { sessionName, promptDir, deliverTimeoutMs, idleTimeoutMs, pollIntervalMs } = this.config;
 
     await mkdir(promptDir, { recursive: true });
     const promptFile = join(promptDir, `${jobId}.md`);
@@ -665,9 +721,19 @@ export class TmuxCliSession implements ReviewerSession {
       await sleep(150, signal);
       await tmux(["send-keys", "-t", sessionName, "Enter"]);
 
-      const deadline = Date.now() + deliverTimeoutMs;
+      const start = Date.now();
+      const hardDeadline = start + deliverTimeoutMs;
+      // Idle clock: reset whenever the pane tail changes (the reviewer is streaming output). A static
+      // tail for idleTimeoutMs means the reviewer crashed/exited/hung. 0 disables the idle clock.
+      let lastProgressAt = start;
+      // Liveness is sampled from the pane TAIL every TICK_SAMPLE_INTERVAL_MS (see above), not from the
+      // full capture on every fast poll — so we compare a bounded slice on a coarse cadence.
+      let lastTail = "";
+      let lastTailCheckAt = 0;
+      let tickCount = 0;
+      let tickingConfirmed = false;
       let adaptivePoll = 50;
-      while (Date.now() < deadline) {
+      while (Date.now() < hardDeadline) {
         if (signal.aborted) throw new Error("reviewer worker is shutting down");
 
         if (this.config.useOutputFile) {
@@ -693,7 +759,41 @@ export class TmuxCliSession implements ReviewerSession {
           throw new RateLimitError(`reviewer hit its usage/rate limit: ${limited}`, parseResetAtMs(limited, Date.now()));
         }
 
-        await sleep(Math.min(adaptivePoll, Math.max(0, deadline - Date.now())), signal);
+        const now = Date.now();
+        // Classify thinking-vs-finished only on the sampling cadence, comparing the bounded pane tail
+        // rather than the whole capture. Marker/file/rate-limit checks above still run every fast poll.
+        if (now - lastTailCheckAt >= TICK_SAMPLE_INTERVAL_MS) {
+          lastTailCheckAt = now;
+          const tail = paneTail(capture, TICK_TAIL_LINES);
+          if (tail !== lastTail) {
+            // The pane tail repainted between samples — the reviewer is streaming output. A run of
+            // consecutive changed samples confirms this is a ticking TUI, so a later freeze can be
+            // trusted as "turn ended".
+            lastTail = tail;
+            lastProgressAt = now;
+            if (++tickCount >= TICK_CONFIRM_COUNT) tickingConfirmed = true;
+          } else {
+            tickCount = 0;
+            const idleFor = now - lastProgressAt;
+            // Fast path: a confirmed-ticking reviewer whose tail has frozen has returned to its idle
+            // prompt. No markers (checked above) and no output file means it finished without
+            // delivering the review — fail now with a distinct diagnosis instead of waiting out the
+            // full idle timeout.
+            if (tickingConfirmed && idleFor >= QUIET_AFTER_TICKING_MS) {
+              this.devLog("deliver_finished_no_artifact", { jobId, quietMs: idleFor, elapsedMs: now - start, requestedModel, usedModel: this.usedModelForLog(), currentModel: this.currentModel, sessionId: this.sessionId });
+              throw new Error(
+                `reviewer returned to an idle prompt after producing output but never wrote the review ` +
+                  `markers${this.config.useOutputFile ? " or the output file" : ""}; the turn finished without delivering a review`,
+              );
+            }
+            if (idleTimeoutMs > 0 && idleFor >= idleTimeoutMs) {
+              this.devLog("deliver_idle_timeout", { jobId, idleTimeoutMs, elapsedMs: now - start, requestedModel, usedModel: this.usedModelForLog(), currentModel: this.currentModel, sessionId: this.sessionId });
+              throw new Error(`reviewer produced no output for ${idleTimeoutMs}ms (idle timeout); the live session appears stuck or crashed`);
+            }
+          }
+        }
+
+        await sleep(Math.min(adaptivePoll, Math.max(0, hardDeadline - Date.now())), signal);
         adaptivePoll = Math.min(adaptivePoll * 2, pollIntervalMs);
       }
       this.devLog("deliver_timeout", { jobId, timeoutMs: deliverTimeoutMs, requestedModel, usedModel: this.usedModelForLog(), currentModel: this.currentModel, sessionId: this.sessionId });
@@ -848,13 +948,15 @@ export class TmuxCliSession implements ReviewerSession {
 }
 
 async function tmux(args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
-  const proc = Bun.spawn(["tmux", ...args], { stdout: "pipe", stderr: "pipe" });
-  const [stdout, stderr, code] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
-  return { code, stdout, stderr };
+  const result = await spawnWithTimeout(["tmux", ...args], { timeoutMs: TMUX_TIMEOUT_MS });
+  // On timeout the child is SIGTERM/SIGKILL'd; surface a non-zero code so callers treat a wedged
+  // tmux as a failed command (capture returns empty, has-session reports "missing", etc.) and the
+  // deliver loop falls through to its own deadline instead of waiting on a call that never returns.
+  const code = result.exitCode ?? (result.timedOut ? 124 : 1);
+  const stderr = result.timedOut
+    ? [result.stderr.trim(), `tmux ${args[0] ?? ""} timed out after ${TMUX_TIMEOUT_MS}ms`].filter(Boolean).join("\n")
+    : result.stderr;
+  return { code, stdout: result.stdout, stderr };
 }
 
 // A fake session for local testing without claude/tmux: echoes a canned review.
@@ -1005,6 +1107,7 @@ async function main(): Promise<void> {
       clearBetweenReviews: process.env.CODE_ASSISTANT_PEERS_REVIEWER_CLEAR === "always",
       startupTimeoutMs: envInt("CODE_ASSISTANT_PEERS_REVIEWER_STARTUP_MS", 30_000),
       deliverTimeoutMs: envInt("CODE_ASSISTANT_PEERS_REVIEW_TIMEOUT_MS", DEFAULT_DELIVER_TIMEOUT_MS),
+      idleTimeoutMs: envInt("CODE_ASSISTANT_PEERS_REVIEW_IDLE_TIMEOUT_MS", DEFAULT_REVIEW_IDLE_TIMEOUT_MS),
       pollIntervalMs: envInt("CODE_ASSISTANT_PEERS_REVIEWER_POLL_MS", DEFAULT_POLL_INTERVAL_MS),
       useOutputFile: (kind.useOutputFile ?? false) &&
         !process.env[`CODE_ASSISTANT_PEERS_REVIEWER_${kind.slug.toUpperCase()}_ARGS`],
@@ -1025,6 +1128,7 @@ async function main(): Promise<void> {
     signal: controller.signal,
     once,
     rateLimitCooldownMs: envInt("CODE_ASSISTANT_PEERS_RATE_LIMIT_COOLDOWN_MS", DEFAULT_RATE_LIMIT_COOLDOWN_MS),
+    deliverTimeoutMs: envInt("CODE_ASSISTANT_PEERS_REVIEW_TIMEOUT_MS", DEFAULT_DELIVER_TIMEOUT_MS),
     log: (message) => {
       console.error(`[reviewer] ${message}`);
       devLog("worker_log", { message });
