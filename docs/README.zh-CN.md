@@ -2,6 +2,8 @@
 
 [English](../README.md) | [한국어](README.ko.md) | [日本語](README.ja.md)
 
+![永不休眠的 AI 同行评审 — 持久 tmux 会话、并行评审、上下文持续累积](assets/peer-reviewers-overview.png)
+
 这是一个 MCP 服务器，用于在基于 CLI 的编码助手之间建立交叉代码审查流程。
 
 主助手完成代码修改后，本服务器会把 diff 发送给已配置的 peer 助手进行审查。Claude Code 和 Codex 内置支持，也可以通过 adapter 配置接入 Gemini、GLM、DeepSeek 等 CLI。审查轮次、findings 和 task 状态会保存在本地 SQLite 中，后续轮次可以验证之前的问题是否已经解决。

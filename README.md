@@ -2,6 +2,8 @@
 
 > Parallel peer review for CLI coding agents — fully live, no API keys required.
 
+![AI peer reviewers that never sleep — persistent tmux sessions, parallel reviews, context that sticks](docs/assets/peer-reviewers-overview.png)
+
 Translations: [한국어](docs/README.ko.md) | [日本語](docs/README.ja.md) | [中文](docs/README.zh-CN.md)
 
 ---

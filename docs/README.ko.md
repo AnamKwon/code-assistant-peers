@@ -2,6 +2,8 @@
 
 [English](../README.md) | [日本語](README.ja.md) | [中文](README.zh-CN.md)
 
+![잠들지 않는 AI 동료 리뷰어 — 지속되는 tmux 세션, 병렬 리뷰, 유지되는 맥락](assets/peer-reviewers-overview.png)
+
 CLI 기반 코딩 어시스턴트끼리 서로 코드를 검토하게 만드는 MCP 서버입니다.
 
 호스트 어시스턴트가 코드를 수정하면, 이 서버가 설정된 peer 어시스턴트에게 diff 리뷰를 요청합니다. Claude Code와 Codex는 기본 지원하며, Gemini, GLM, DeepSeek 같은 CLI도 adapter 설정으로 추가할 수 있습니다. 리뷰 라운드, finding, task 상태는 SQLite에 로컬 저장되어 이후 라운드에서 이전 지적이 해결됐는지 확인할 수 있습니다.
