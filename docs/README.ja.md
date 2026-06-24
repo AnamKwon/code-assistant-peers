@@ -2,6 +2,8 @@
 
 [English](../README.md) | [한국어](README.ko.md) | [中文](README.zh-CN.md)
 
+![眠らない AI ピアレビュアー — 永続的な tmux セッション、並列レビュー、文脈を保持](assets/peer-reviewers-overview.png)
+
 CLI ベースのコーディングアシスタント同士で相互レビューを行うための MCP サーバーです。
 
 ホスト側アシスタントがコードを変更したあと、このサーバーが設定済みの peer アシスタントに diff のレビューを依頼します。Claude Code と Codex は標準で利用でき、Gemini、GLM、DeepSeek などの CLI も adapter 設定で追加できます。レビューラウンド、finding、task 状態はローカル SQLite に保存され、後続ラウンドで過去の指摘が解決されたか確認できます。
