@@ -114,6 +114,10 @@ export interface AssistantAdapter {
   id: AssistantHost;
   command: string[];
   prompt_transport: "stdin" | "argv" | "channel";
+  // For "channel" adapters, the transport to use for the headless spawn FALLBACK when the broker /
+  // live session is unavailable. Defaults to "stdin". agy needs "argv" because its prompt is the
+  // positional query after --print, not stdin.
+  fallback_prompt_transport?: "stdin" | "argv";
   description?: string;
   timeout_ms?: number;
   env_allowlist?: string[];

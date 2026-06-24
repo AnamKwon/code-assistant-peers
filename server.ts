@@ -1944,7 +1944,7 @@ async function isAssistantAvailable(reviewer: AssistantHost): Promise<{ ok: bool
         detail: (stdout || stderr).trim() || `command '${command}' not found`,
       };
     }
-    if (reviewer === "gemini") {
+    if (command === "gemini") {
       const geminiAuth = await getGeminiAuthReadiness(process.env);
       if (!geminiAuth.ok) return geminiAuth;
     }

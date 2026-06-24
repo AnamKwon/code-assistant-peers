@@ -427,6 +427,19 @@ export function paneTail(capture: string, lines: number): string {
   return all.slice(Math.max(0, all.length - lines)).join("\n");
 }
 
+// Coding-agent TUIs (claude/codex/agy/gemini) show a "busy" footer while a turn is in progress —
+// "esc to cancel" / "esc to interrupt", or a "Generating…/Thinking…" spinner line. They routinely
+// pause for many seconds between tool calls or while the model responds, leaving the visible pane
+// static. A static pane that STILL shows a busy footer is working, not finished — the deliver loop
+// uses this to avoid killing a review mid-step (see the idle/finished-without-artifact clocks).
+const BUSY_PANE_PATTERNS: RegExp[] = [
+  /\besc to (?:cancel|interrupt)\b/i,
+  /\b(?:Generating|Thinking|Working|Reasoning|Reflecting)\b\s*(?:\.\.\.|…)/i,
+];
+export function reviewerLooksBusy(capture: string): boolean {
+  return BUSY_PANE_PATTERNS.some((re) => re.test(capture));
+}
+
 // The Gemini TUI renders responses with leading line numbers. Strip them only under a conservative
 // signature so genuine content is never mangled.
 export function stripRenderedLineNumbers(text: string): string {
@@ -544,6 +557,13 @@ export const DEFAULT_REVIEWER_CLAUDE_ARGS = [
 
 export function buildDefaultReviewerClaudeArgs(promptDir: string, workflow: "review_only" | "peer_fix"): string[] {
   return [
+    // "plan", deliberately. A live reviewer is non-interactive (driven via tmux), so it must NEVER
+    // block on a tool-approval prompt. In "default"/"acceptEdits" Claude runs agentically and tries
+    // exploratory commands beyond the allowlist (e.g. `cat`/`grep`/`ls` outside Bash(git ...)),
+    // which then prompt "Do you want to proceed?" and wedge the session — never delivering a review.
+    // Plan mode keeps Claude read-only: it analyzes and prints the review (with the BEGIN/DONE
+    // markers) to the pane, which the worker scrapes via extractReviewFromCapture. It cannot write
+    // the output file in plan mode, but it does not need to — pane extraction is the delivery path.
     "--permission-mode",
     "plan",
     "--append-system-prompt",
@@ -634,15 +654,23 @@ export function buildDefaultReviewerCodexArgs(promptDir: string, workflow: "revi
 
 export function buildGeminiReviewerPolicy(promptDir: string): string {
   const regexEscaped = promptDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const tomlEscaped = regexEscaped.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-  const filePathPattern = `^{\\s*\\"file_path\\"\\s*:\\s*\\"${tomlEscaped}/[a-zA-Z0-9._-]*\\"`;
+  // The regex contains `\s` and literal `"` — both INVALID inside a TOML basic ("..." ) string, which
+  // made the whole policy file fail to parse and silently load ZERO rules (so shell/writes were never
+  // actually restricted). Emit argsPattern as a TOML literal ('...') string: literals process no
+  // escapes, so `\s` and `"` are taken verbatim, exactly as the policy engine's regex wants. (Paths
+  // with a single quote would break the literal, but reviewer prompt dirs never contain one.)
+  // NOT anchored at `^{`: Gemini does not serialize the tool args with `file_path` as the first key,
+  // so an anchored pattern matched nothing and even legitimate output-dir writes fell through to the
+  // deny rule. Match `"file_path":"<dir>/<flat-name>"` anywhere in the args; the [a-zA-Z0-9._-]* run
+  // (no `/`) before the closing quote still forbids subdirectories and `..` traversal out of the dir.
+  const filePathPattern = `"file_path"\\s*:\\s*"${regexEscaped}/[a-zA-Z0-9._-]*"`;
   return [
     "# Reviewer session policy: restricts file writes to .peer-review/ and blocks MCP write tools.",
     "",
     "# Allow write_file/replace ONLY to the review output directory (flat filenames, no traversal).",
     "[[rule]]",
     `toolName = ["write_file", "replace"]`,
-    `argsPattern = "${filePathPattern}"`,
+    `argsPattern = '${filePathPattern}'`,
     `decision = "allow"`,
     `priority = 500`,
     "",
@@ -673,6 +701,14 @@ export const DEFAULT_REVIEWER_GEMINI_ARGS = [
   "--skip-trust",
   "--approval-mode", "auto_edit",
   "--allowed-mcp-server-names", "reviewer-session-no-mcp",
+];
+
+// Antigravity CLI (`agy`) reviewer flags. agy auto-approves all tool use with
+// --dangerously-skip-permissions (no per-tool prompts in the non-interactive tmux session); it
+// stays confined to the workspace dir added via --add-dir. agy has no policy-engine equivalent of
+// gemini's --admin-policy, so this is how we let it read the repo and write only its output file.
+export const DEFAULT_REVIEWER_AGY_ARGS = [
+  "--dangerously-skip-permissions",
 ];
 
 export class TmuxCliSession implements ReviewerSession {
@@ -772,13 +808,20 @@ export class TmuxCliSession implements ReviewerSession {
             lastTail = tail;
             lastProgressAt = now;
             if (++tickCount >= TICK_CONFIRM_COUNT) tickingConfirmed = true;
+          } else if (reviewerLooksBusy(capture)) {
+            // Tail is frozen but the reviewer still shows a "busy" footer (e.g. agy "esc to cancel" /
+            // "Generating…"). Coding-agent TUIs pause for many seconds between tool calls or while the
+            // model responds, with a static screen — that is WORKING, not finished. Count it as
+            // progress so neither the finished-without-artifact fast path nor the idle clock kills a
+            // review mid-step (the deliverTimeoutMs hard cap still bounds a genuinely wedged turn).
+            lastProgressAt = now;
           } else {
             tickCount = 0;
             const idleFor = now - lastProgressAt;
-            // Fast path: a confirmed-ticking reviewer whose tail has frozen has returned to its idle
-            // prompt. No markers (checked above) and no output file means it finished without
-            // delivering the review — fail now with a distinct diagnosis instead of waiting out the
-            // full idle timeout.
+            // Fast path: a confirmed-ticking reviewer whose tail has frozen AND shows no busy footer
+            // has returned to its idle prompt. No markers (checked above) and no output file means it
+            // finished without delivering the review — fail now with a distinct diagnosis instead of
+            // waiting out the full idle timeout.
             if (tickingConfirmed && idleFor >= QUIET_AFTER_TICKING_MS) {
               this.devLog("deliver_finished_no_artifact", { jobId, quietMs: idleFor, elapsedMs: now - start, requestedModel, usedModel: this.usedModelForLog(), currentModel: this.currentModel, sessionId: this.sessionId });
               throw new Error(
@@ -1115,7 +1158,7 @@ async function main(): Promise<void> {
         ? { path: join(kindPromptDir, "reviewer-policy.toml"), content: kind.policyContent(kindPromptDir) }
         : undefined,
       freshSessionId: kind.initialSessionId,
-      outputFileWriteMethod: kind.slug === "codex" ? "shell" : "write_file_tool",
+      outputFileWriteMethod: kind.outputFileWriteMethod ?? (kind.slug === "codex" ? "shell" : "write_file_tool"),
       rateLimitPatterns: (process.env.CODE_ASSISTANT_PEERS_RATE_LIMIT_PATTERNS ?? "").split(",").map((p) => p.trim()).filter(Boolean),
       devLog: (event, data) => devLog(event, { reviewer, cwd: repoCwd, ...data }),
     });
@@ -1151,6 +1194,8 @@ export interface LiveCliKind {
   discoverSessionId?: (cwd: string) => Promise<string | null>;
   clearCommand: string | null;
   useOutputFile?: boolean;
+  // How the reviewer should write the output file. Defaults to "shell" for codex, else "write_file_tool".
+  outputFileWriteMethod?: "write_file_tool" | "shell";
   policyContent?: (promptDir: string) => string;
 }
 
@@ -1219,38 +1264,39 @@ export const LIVE_CLI_KINDS: Record<string, LiveCliKind> = {
     clearCommand: "/clear",
     useOutputFile: true,
   },
+  // "gemini-live" now drives the Antigravity CLI (`agy`), Google's replacement for the Gemini CLI
+  // (Gemini CLI stopped serving Pro/Ultra on 2026-06-18). agy has NO policy engine (--admin-policy)
+  // or --approval-mode/--skip-trust, and it does not accept a caller-supplied --session-id. It runs
+  // read/write/shell tools, so to keep the non-interactive tmux session from blocking on per-tool
+  // approvals we launch it with --dangerously-skip-permissions (it still cannot escape the workspace
+  // dir). It writes the output file via a shell command (like codex), and conversation history is
+  // preserved by keeping the live session alive; on a model switch we relaunch with --continue.
   "gemini-live": {
     slug: "gemini",
     promptDir: (cwd) => join(cwd, ".peer-review"),
-    policyContent: (promptDir) => buildGeminiReviewerPolicy(promptDir),
-    launchCommand: (_cwd, promptDir, model, sessionId) => {
+    launchCommand: (_cwd, promptDir, model, _sessionId) => {
       const customArgs = parseArgsEnv(process.env.CODE_ASSISTANT_PEERS_REVIEWER_GEMINI_ARGS);
       return [
-        "gemini",
-        ...(sessionId ? ["--session-id", sessionId] : []),
+        "agy",
         ...(model ? ["--model", model] : []),
-        ...(customArgs ?? [
-          ...DEFAULT_REVIEWER_GEMINI_ARGS,
-          "--admin-policy", join(promptDir, "reviewer-policy.toml"),
-        ]),
+        ...(customArgs ?? DEFAULT_REVIEWER_AGY_ARGS),
+        "--add-dir", promptDir,
       ];
     },
-    resumeCommand: (_cwd, promptDir, sessionId, model) => {
+    resumeCommand: (_cwd, promptDir, _sessionId, model) => {
       const customArgs = parseArgsEnv(process.env.CODE_ASSISTANT_PEERS_REVIEWER_GEMINI_ARGS);
       return [
-        "gemini",
-        "--resume",
-        sessionId,
+        "agy",
+        "--continue",
         ...(model ? ["--model", model] : []),
-        ...(customArgs ?? [
-          ...DEFAULT_REVIEWER_GEMINI_ARGS,
-          "--admin-policy", join(promptDir, "reviewer-policy.toml"),
-        ]),
+        ...(customArgs ?? DEFAULT_REVIEWER_AGY_ARGS),
+        "--add-dir", promptDir,
       ];
     },
     initialSessionId: randomUUID,
-    clearCommand: "/clear",
+    clearCommand: null,
     useOutputFile: true,
+    outputFileWriteMethod: "shell",
   },
   "codex-live": {
     slug: "codex",
