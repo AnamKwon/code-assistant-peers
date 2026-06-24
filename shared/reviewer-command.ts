@@ -71,7 +71,7 @@ export async function runReviewCommand(
       return { exitCode: 0, stdout: reply.text, stderr: "", command };
     }
     console.error(`[code-assistant-peers] broker channel unavailable (${reply.error}); falling back to spawning ${reviewer}.`);
-    transport = "stdin";
+    transport = adapter.fallback_prompt_transport ?? "stdin";
   }
 
   // Built only after the channel branch so a successful broker route does no wasted command

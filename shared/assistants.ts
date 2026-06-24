@@ -83,9 +83,13 @@ export const BUILTIN_ASSISTANTS: Record<string, AssistantAdapter> = {
   },
   gemini: {
     id: "gemini",
-    command: ["gemini", "--skip-trust", "--approval-mode", "plan", "-p", ""],
-    prompt_transport: "stdin",
-    description: "Gemini CLI headless review mode.",
+    // Gemini CLI was retired 2026-06-18 and replaced by the Antigravity CLI (`agy`). This is the
+    // headless spawn fallback used only when the broker/live session is unavailable; the prompt is
+    // passed as the positional query after --print, and --dangerously-skip-permissions lets it use
+    // read tools without prompting in a non-interactive spawn. The live path uses the agy TUI.
+    command: ["agy", "--dangerously-skip-permissions", "-p"],
+    prompt_transport: "argv",
+    description: "Antigravity CLI (agy) headless review mode — replaces the retired Gemini CLI.",
     timeout_ms: 180000,
     model_arg: "--model",
     models: BUILTIN_REVIEWER_MODELS.gemini,
@@ -122,7 +126,9 @@ BUILTIN_ASSISTANTS["gemini-live"] = {
   ...BUILTIN_ASSISTANTS.gemini,
   id: "gemini-live",
   prompt_transport: "channel",
-  description: "Gemini review routed to a backgrounded interactive Gemini CLI session via the broker (persistent session/memory); falls back to spawning headless gemini if the broker/session is unavailable.",
+  // agy's headless fallback takes the prompt as the positional query after --print (argv), not stdin.
+  fallback_prompt_transport: "argv",
+  description: "Gemini review routed to a backgrounded interactive Antigravity CLI (agy) session via the broker (persistent session/memory); falls back to spawning headless agy if the broker/session is unavailable.",
 };
 
 BUILTIN_ASSISTANTS["codex-live"] = {

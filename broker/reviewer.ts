@@ -24,10 +24,42 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { codexReviewerInstructionsFor, liveReviewerSystemPromptFor, toTomlBasicString } from "../shared/review-prompts.ts";
+import { spawnWithTimeout } from "../shared/process.ts";
 
 const DEFAULT_BROKER_URL = "http://127.0.0.1:7899";
 const DEFAULT_POLL_INTERVAL_MS = 250; // reduced from 1000ms — all polling layers share this
 const DEFAULT_DELIVER_TIMEOUT_MS = 600_000;
+// A review's wall-clock cost scales with how much there is to review, so a single fixed deadline is
+// either too short for a big diff or too long to detect a wedged reviewer. We bound a review by TWO
+// clocks: an IDLE clock (below) that fires when the reviewer's pane stops changing — i.e. it
+// crashed, exited to a shell prompt, or hung mid-task — and the existing deliverTimeoutMs HARD CAP
+// that fires even while output is still streaming (catches an infinite-but-animated loop). Active
+// reviewers (claude/codex/gemini TUIs) repaint a spinner/elapsed-timer sub-second, so a pane that is
+// static for the idle window is genuinely stuck. This lets a large review run for as long as it
+// keeps producing output (raise the hard cap via CODE_ASSISTANT_PEERS_REVIEW_TIMEOUT_MS) while a
+// dead reviewer is reclaimed in minutes instead of holding its slot for the full hard cap.
+const DEFAULT_REVIEW_IDLE_TIMEOUT_MS = 180_000;
+// Fast "the reviewer finished but produced no review" detection. A working coding-agent TUI repaints
+// its pane sub-second (a live elapsed-time counter / spinner), so a pane that FREEZES has returned to
+// an idle prompt — the turn ended. If that happens with no review markers and no output file, the
+// reviewer answered without delivering the artifact, and we can fail in seconds instead of waiting
+// out the full idle timeout. Liveness is sampled from a bounded TAIL of the pane (the last
+// TICK_TAIL_LINES lines, where the spinner/timer and newest output live) every TICK_SAMPLE_INTERVAL_MS
+// — comparing a few dozen lines instead of the whole scrollback keeps the comparison cheap and avoids
+// holding a huge capture in memory, while being far more robust than comparing only the last line. We
+// only trust the freeze signal once we have OBSERVED this reviewer tick (>= TICK_CONFIRM_COUNT
+// consecutive changed samples); a CLI that renders a static pane while thinking never gets the fast
+// path and falls back to DEFAULT_REVIEW_IDLE_TIMEOUT_MS.
+const QUIET_AFTER_TICKING_MS = 6_000;
+const TICK_SAMPLE_INTERVAL_MS = 2_000;
+const TICK_TAIL_LINES = 30;
+const TICK_CONFIRM_COUNT = 3;
+// tmux commands (has-session/send-keys/capture-pane/...) are local and normally return in
+// milliseconds. The deliver loop only re-checks its deadline *between* polls, so a single tmux
+// call that never returns (a wedged tmux server, a stuck pane) would block the loop forever and
+// bypass deliverTimeoutMs entirely. Bound every tmux call so a wedged server degrades to a normal
+// deliver timeout instead of an unbounded hang. Override with CODE_ASSISTANT_PEERS_TMUX_TIMEOUT_MS.
+const TMUX_TIMEOUT_MS = envInt("CODE_ASSISTANT_PEERS_TMUX_TIMEOUT_MS", 20_000);
 // How long a reviewer (kind × repo) is skipped after it reports a usage/rate limit, when the
 // limit message gives no explicit reset time. Override with CODE_ASSISTANT_PEERS_RATE_LIMIT_COOLDOWN_MS.
 const DEFAULT_RATE_LIMIT_COOLDOWN_MS = 15 * 60_000;
@@ -117,6 +149,8 @@ export interface ReviewerWorkerOptions {
   log?: (message: string) => void;
   // Cooldown after a reviewer reports a usage/rate limit with no explicit reset time.
   rateLimitCooldownMs?: number;
+  // Deliver timeout passed to session.deliver(); also used to set the periodic reclaim interval.
+  deliverTimeoutMs?: number;
   // Maximum number of (reviewer, cwd) sessions running concurrently. Default 8. Lower values
   // reduce the number of jobs that would be permanently lost if the worker crashes; higher values
   // allow more parallelism. Must be >= 1.
@@ -193,6 +227,15 @@ export async function runReviewerWorker(options: ReviewerWorkerOptions): Promise
   // Reclaim jobs left in "claimed" by a crashed/replaced prior worker so they become visible
   // to GET /next again. Best-effort — ignore if broker is unreachable.
   await reclaimStaleClaims(brokerUrl);
+
+  // Periodic reclaim: if the broker was restarted while the worker was running, the worker's
+  // in-flight jobs were wiped from broker memory (claimed→gone). A periodic reclaim is a no-op
+  // in steady state but recovers quickly when the broker restarts.
+  // Interval = deliver timeout + 30s buffer so we don't reclaim jobs that are still active.
+  const deliverTimeoutMs = options.deliverTimeoutMs ?? DEFAULT_DELIVER_TIMEOUT_MS;
+  const reclaimIntervalMs = deliverTimeoutMs + 30_000;
+  const reclaimTimer = setInterval(() => reclaimStaleClaims(brokerUrl).catch(() => {}), reclaimIntervalMs);
+  reclaimTimer.unref?.();
 
   // Per-(reviewer, cwd) promise chain: jobs for the SAME session run sequentially
   // (they share one tmux TUI), while jobs for DIFFERENT sessions run concurrently.
@@ -374,6 +417,29 @@ export function extractReviewFromCapture(capture: string, jobId: string): string
   return stripRenderedLineNumbers(cleanCapturedReview(between));
 }
 
+// The last `lines` lines of a pane capture (after trimming trailing blank lines so a flickering
+// trailing newline never counts as a change). This is the "live" region — the spinner/elapsed-timer
+// and the newest output — used to tell "still working" from "frozen" without storing or comparing
+// the entire scrollback.
+export function paneTail(capture: string, lines: number): string {
+  const trimmed = capture.replace(/\s+$/, "");
+  const all = trimmed.split("\n");
+  return all.slice(Math.max(0, all.length - lines)).join("\n");
+}
+
+// Coding-agent TUIs (claude/codex/agy/gemini) show a "busy" footer while a turn is in progress —
+// "esc to cancel" / "esc to interrupt", or a "Generating…/Thinking…" spinner line. They routinely
+// pause for many seconds between tool calls or while the model responds, leaving the visible pane
+// static. A static pane that STILL shows a busy footer is working, not finished — the deliver loop
+// uses this to avoid killing a review mid-step (see the idle/finished-without-artifact clocks).
+const BUSY_PANE_PATTERNS: RegExp[] = [
+  /\besc to (?:cancel|interrupt)\b/i,
+  /\b(?:Generating|Thinking|Working|Reasoning|Reflecting)\b\s*(?:\.\.\.|…)/i,
+];
+export function reviewerLooksBusy(capture: string): boolean {
+  return BUSY_PANE_PATTERNS.some((re) => re.test(capture));
+}
+
 // The Gemini TUI renders responses with leading line numbers. Strip them only under a conservative
 // signature so genuine content is never mangled.
 export function stripRenderedLineNumbers(text: string): string {
@@ -465,6 +531,9 @@ export interface TmuxSessionConfig {
   clearBetweenReviews: boolean;
   startupTimeoutMs: number;
   deliverTimeoutMs: number;
+  // Abort if the reviewer pane stops changing for this long (no streaming output) — catches a
+  // crashed/hung reviewer well before the deliverTimeoutMs hard cap. 0 disables the idle clock.
+  idleTimeoutMs: number;
   pollIntervalMs: number;
   useOutputFile: boolean;
   policyFile?: { path: string; content: string };
@@ -488,6 +557,13 @@ export const DEFAULT_REVIEWER_CLAUDE_ARGS = [
 
 export function buildDefaultReviewerClaudeArgs(promptDir: string, workflow: "review_only" | "peer_fix"): string[] {
   return [
+    // "plan", deliberately. A live reviewer is non-interactive (driven via tmux), so it must NEVER
+    // block on a tool-approval prompt. In "default"/"acceptEdits" Claude runs agentically and tries
+    // exploratory commands beyond the allowlist (e.g. `cat`/`grep`/`ls` outside Bash(git ...)),
+    // which then prompt "Do you want to proceed?" and wedge the session — never delivering a review.
+    // Plan mode keeps Claude read-only: it analyzes and prints the review (with the BEGIN/DONE
+    // markers) to the pane, which the worker scrapes via extractReviewFromCapture. It cannot write
+    // the output file in plan mode, but it does not need to — pane extraction is the delivery path.
     "--permission-mode",
     "plan",
     "--append-system-prompt",
@@ -578,15 +654,23 @@ export function buildDefaultReviewerCodexArgs(promptDir: string, workflow: "revi
 
 export function buildGeminiReviewerPolicy(promptDir: string): string {
   const regexEscaped = promptDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const tomlEscaped = regexEscaped.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-  const filePathPattern = `^{\\s*\\"file_path\\"\\s*:\\s*\\"${tomlEscaped}/[a-zA-Z0-9._-]*\\"`;
+  // The regex contains `\s` and literal `"` — both INVALID inside a TOML basic ("..." ) string, which
+  // made the whole policy file fail to parse and silently load ZERO rules (so shell/writes were never
+  // actually restricted). Emit argsPattern as a TOML literal ('...') string: literals process no
+  // escapes, so `\s` and `"` are taken verbatim, exactly as the policy engine's regex wants. (Paths
+  // with a single quote would break the literal, but reviewer prompt dirs never contain one.)
+  // NOT anchored at `^{`: Gemini does not serialize the tool args with `file_path` as the first key,
+  // so an anchored pattern matched nothing and even legitimate output-dir writes fell through to the
+  // deny rule. Match `"file_path":"<dir>/<flat-name>"` anywhere in the args; the [a-zA-Z0-9._-]* run
+  // (no `/`) before the closing quote still forbids subdirectories and `..` traversal out of the dir.
+  const filePathPattern = `"file_path"\\s*:\\s*"${regexEscaped}/[a-zA-Z0-9._-]*"`;
   return [
     "# Reviewer session policy: restricts file writes to .peer-review/ and blocks MCP write tools.",
     "",
     "# Allow write_file/replace ONLY to the review output directory (flat filenames, no traversal).",
     "[[rule]]",
     `toolName = ["write_file", "replace"]`,
-    `argsPattern = "${filePathPattern}"`,
+    `argsPattern = '${filePathPattern}'`,
     `decision = "allow"`,
     `priority = 500`,
     "",
@@ -619,6 +703,14 @@ export const DEFAULT_REVIEWER_GEMINI_ARGS = [
   "--allowed-mcp-server-names", "reviewer-session-no-mcp",
 ];
 
+// Antigravity CLI (`agy`) reviewer flags. agy auto-approves all tool use with
+// --dangerously-skip-permissions (no per-tool prompts in the non-interactive tmux session); it
+// stays confined to the workspace dir added via --add-dir. agy has no policy-engine equivalent of
+// gemini's --admin-policy, so this is how we let it read the repo and write only its output file.
+export const DEFAULT_REVIEWER_AGY_ARGS = [
+  "--dangerously-skip-permissions",
+];
+
 export class TmuxCliSession implements ReviewerSession {
   private ready = false;
   private currentModel: string | null = null;
@@ -636,7 +728,7 @@ export class TmuxCliSession implements ReviewerSession {
     this.devLog("deliver_ready", { jobId, requestedModel, usedModel: this.usedModelForLog(), currentModel: this.currentModel, sessionId: this.sessionId });
     const begin = beginMarkerFor(jobId);
     const done = doneMarkerFor(jobId);
-    const { sessionName, promptDir, deliverTimeoutMs, pollIntervalMs } = this.config;
+    const { sessionName, promptDir, deliverTimeoutMs, idleTimeoutMs, pollIntervalMs } = this.config;
 
     await mkdir(promptDir, { recursive: true });
     const promptFile = join(promptDir, `${jobId}.md`);
@@ -665,9 +757,19 @@ export class TmuxCliSession implements ReviewerSession {
       await sleep(150, signal);
       await tmux(["send-keys", "-t", sessionName, "Enter"]);
 
-      const deadline = Date.now() + deliverTimeoutMs;
+      const start = Date.now();
+      const hardDeadline = start + deliverTimeoutMs;
+      // Idle clock: reset whenever the pane tail changes (the reviewer is streaming output). A static
+      // tail for idleTimeoutMs means the reviewer crashed/exited/hung. 0 disables the idle clock.
+      let lastProgressAt = start;
+      // Liveness is sampled from the pane TAIL every TICK_SAMPLE_INTERVAL_MS (see above), not from the
+      // full capture on every fast poll — so we compare a bounded slice on a coarse cadence.
+      let lastTail = "";
+      let lastTailCheckAt = 0;
+      let tickCount = 0;
+      let tickingConfirmed = false;
       let adaptivePoll = 50;
-      while (Date.now() < deadline) {
+      while (Date.now() < hardDeadline) {
         if (signal.aborted) throw new Error("reviewer worker is shutting down");
 
         if (this.config.useOutputFile) {
@@ -693,7 +795,48 @@ export class TmuxCliSession implements ReviewerSession {
           throw new RateLimitError(`reviewer hit its usage/rate limit: ${limited}`, parseResetAtMs(limited, Date.now()));
         }
 
-        await sleep(Math.min(adaptivePoll, Math.max(0, deadline - Date.now())), signal);
+        const now = Date.now();
+        // Classify thinking-vs-finished only on the sampling cadence, comparing the bounded pane tail
+        // rather than the whole capture. Marker/file/rate-limit checks above still run every fast poll.
+        if (now - lastTailCheckAt >= TICK_SAMPLE_INTERVAL_MS) {
+          lastTailCheckAt = now;
+          const tail = paneTail(capture, TICK_TAIL_LINES);
+          if (tail !== lastTail) {
+            // The pane tail repainted between samples — the reviewer is streaming output. A run of
+            // consecutive changed samples confirms this is a ticking TUI, so a later freeze can be
+            // trusted as "turn ended".
+            lastTail = tail;
+            lastProgressAt = now;
+            if (++tickCount >= TICK_CONFIRM_COUNT) tickingConfirmed = true;
+          } else if (reviewerLooksBusy(capture)) {
+            // Tail is frozen but the reviewer still shows a "busy" footer (e.g. agy "esc to cancel" /
+            // "Generating…"). Coding-agent TUIs pause for many seconds between tool calls or while the
+            // model responds, with a static screen — that is WORKING, not finished. Count it as
+            // progress so neither the finished-without-artifact fast path nor the idle clock kills a
+            // review mid-step (the deliverTimeoutMs hard cap still bounds a genuinely wedged turn).
+            lastProgressAt = now;
+          } else {
+            tickCount = 0;
+            const idleFor = now - lastProgressAt;
+            // Fast path: a confirmed-ticking reviewer whose tail has frozen AND shows no busy footer
+            // has returned to its idle prompt. No markers (checked above) and no output file means it
+            // finished without delivering the review — fail now with a distinct diagnosis instead of
+            // waiting out the full idle timeout.
+            if (tickingConfirmed && idleFor >= QUIET_AFTER_TICKING_MS) {
+              this.devLog("deliver_finished_no_artifact", { jobId, quietMs: idleFor, elapsedMs: now - start, requestedModel, usedModel: this.usedModelForLog(), currentModel: this.currentModel, sessionId: this.sessionId });
+              throw new Error(
+                `reviewer returned to an idle prompt after producing output but never wrote the review ` +
+                  `markers${this.config.useOutputFile ? " or the output file" : ""}; the turn finished without delivering a review`,
+              );
+            }
+            if (idleTimeoutMs > 0 && idleFor >= idleTimeoutMs) {
+              this.devLog("deliver_idle_timeout", { jobId, idleTimeoutMs, elapsedMs: now - start, requestedModel, usedModel: this.usedModelForLog(), currentModel: this.currentModel, sessionId: this.sessionId });
+              throw new Error(`reviewer produced no output for ${idleTimeoutMs}ms (idle timeout); the live session appears stuck or crashed`);
+            }
+          }
+        }
+
+        await sleep(Math.min(adaptivePoll, Math.max(0, hardDeadline - Date.now())), signal);
         adaptivePoll = Math.min(adaptivePoll * 2, pollIntervalMs);
       }
       this.devLog("deliver_timeout", { jobId, timeoutMs: deliverTimeoutMs, requestedModel, usedModel: this.usedModelForLog(), currentModel: this.currentModel, sessionId: this.sessionId });
@@ -848,13 +991,15 @@ export class TmuxCliSession implements ReviewerSession {
 }
 
 async function tmux(args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
-  const proc = Bun.spawn(["tmux", ...args], { stdout: "pipe", stderr: "pipe" });
-  const [stdout, stderr, code] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
-  return { code, stdout, stderr };
+  const result = await spawnWithTimeout(["tmux", ...args], { timeoutMs: TMUX_TIMEOUT_MS });
+  // On timeout the child is SIGTERM/SIGKILL'd; surface a non-zero code so callers treat a wedged
+  // tmux as a failed command (capture returns empty, has-session reports "missing", etc.) and the
+  // deliver loop falls through to its own deadline instead of waiting on a call that never returns.
+  const code = result.exitCode ?? (result.timedOut ? 124 : 1);
+  const stderr = result.timedOut
+    ? [result.stderr.trim(), `tmux ${args[0] ?? ""} timed out after ${TMUX_TIMEOUT_MS}ms`].filter(Boolean).join("\n")
+    : result.stderr;
+  return { code, stdout: result.stdout, stderr };
 }
 
 // A fake session for local testing without claude/tmux: echoes a canned review.
@@ -1005,6 +1150,7 @@ async function main(): Promise<void> {
       clearBetweenReviews: process.env.CODE_ASSISTANT_PEERS_REVIEWER_CLEAR === "always",
       startupTimeoutMs: envInt("CODE_ASSISTANT_PEERS_REVIEWER_STARTUP_MS", 30_000),
       deliverTimeoutMs: envInt("CODE_ASSISTANT_PEERS_REVIEW_TIMEOUT_MS", DEFAULT_DELIVER_TIMEOUT_MS),
+      idleTimeoutMs: envInt("CODE_ASSISTANT_PEERS_REVIEW_IDLE_TIMEOUT_MS", DEFAULT_REVIEW_IDLE_TIMEOUT_MS),
       pollIntervalMs: envInt("CODE_ASSISTANT_PEERS_REVIEWER_POLL_MS", DEFAULT_POLL_INTERVAL_MS),
       useOutputFile: (kind.useOutputFile ?? false) &&
         !process.env[`CODE_ASSISTANT_PEERS_REVIEWER_${kind.slug.toUpperCase()}_ARGS`],
@@ -1012,7 +1158,7 @@ async function main(): Promise<void> {
         ? { path: join(kindPromptDir, "reviewer-policy.toml"), content: kind.policyContent(kindPromptDir) }
         : undefined,
       freshSessionId: kind.initialSessionId,
-      outputFileWriteMethod: kind.slug === "codex" ? "shell" : "write_file_tool",
+      outputFileWriteMethod: kind.outputFileWriteMethod ?? (kind.slug === "codex" ? "shell" : "write_file_tool"),
       rateLimitPatterns: (process.env.CODE_ASSISTANT_PEERS_RATE_LIMIT_PATTERNS ?? "").split(",").map((p) => p.trim()).filter(Boolean),
       devLog: (event, data) => devLog(event, { reviewer, cwd: repoCwd, ...data }),
     });
@@ -1025,6 +1171,7 @@ async function main(): Promise<void> {
     signal: controller.signal,
     once,
     rateLimitCooldownMs: envInt("CODE_ASSISTANT_PEERS_RATE_LIMIT_COOLDOWN_MS", DEFAULT_RATE_LIMIT_COOLDOWN_MS),
+    deliverTimeoutMs: envInt("CODE_ASSISTANT_PEERS_REVIEW_TIMEOUT_MS", DEFAULT_DELIVER_TIMEOUT_MS),
     log: (message) => {
       console.error(`[reviewer] ${message}`);
       devLog("worker_log", { message });
@@ -1047,6 +1194,8 @@ export interface LiveCliKind {
   discoverSessionId?: (cwd: string) => Promise<string | null>;
   clearCommand: string | null;
   useOutputFile?: boolean;
+  // How the reviewer should write the output file. Defaults to "shell" for codex, else "write_file_tool".
+  outputFileWriteMethod?: "write_file_tool" | "shell";
   policyContent?: (promptDir: string) => string;
 }
 
@@ -1115,38 +1264,39 @@ export const LIVE_CLI_KINDS: Record<string, LiveCliKind> = {
     clearCommand: "/clear",
     useOutputFile: true,
   },
+  // "gemini-live" now drives the Antigravity CLI (`agy`), Google's replacement for the Gemini CLI
+  // (Gemini CLI stopped serving Pro/Ultra on 2026-06-18). agy has NO policy engine (--admin-policy)
+  // or --approval-mode/--skip-trust, and it does not accept a caller-supplied --session-id. It runs
+  // read/write/shell tools, so to keep the non-interactive tmux session from blocking on per-tool
+  // approvals we launch it with --dangerously-skip-permissions (it still cannot escape the workspace
+  // dir). It writes the output file via a shell command (like codex), and conversation history is
+  // preserved by keeping the live session alive; on a model switch we relaunch with --continue.
   "gemini-live": {
     slug: "gemini",
     promptDir: (cwd) => join(cwd, ".peer-review"),
-    policyContent: (promptDir) => buildGeminiReviewerPolicy(promptDir),
-    launchCommand: (_cwd, promptDir, model, sessionId) => {
+    launchCommand: (_cwd, promptDir, model, _sessionId) => {
       const customArgs = parseArgsEnv(process.env.CODE_ASSISTANT_PEERS_REVIEWER_GEMINI_ARGS);
       return [
-        "gemini",
-        ...(sessionId ? ["--session-id", sessionId] : []),
+        "agy",
         ...(model ? ["--model", model] : []),
-        ...(customArgs ?? [
-          ...DEFAULT_REVIEWER_GEMINI_ARGS,
-          "--admin-policy", join(promptDir, "reviewer-policy.toml"),
-        ]),
+        ...(customArgs ?? DEFAULT_REVIEWER_AGY_ARGS),
+        "--add-dir", promptDir,
       ];
     },
-    resumeCommand: (_cwd, promptDir, sessionId, model) => {
+    resumeCommand: (_cwd, promptDir, _sessionId, model) => {
       const customArgs = parseArgsEnv(process.env.CODE_ASSISTANT_PEERS_REVIEWER_GEMINI_ARGS);
       return [
-        "gemini",
-        "--resume",
-        sessionId,
+        "agy",
+        "--continue",
         ...(model ? ["--model", model] : []),
-        ...(customArgs ?? [
-          ...DEFAULT_REVIEWER_GEMINI_ARGS,
-          "--admin-policy", join(promptDir, "reviewer-policy.toml"),
-        ]),
+        ...(customArgs ?? DEFAULT_REVIEWER_AGY_ARGS),
+        "--add-dir", promptDir,
       ];
     },
     initialSessionId: randomUUID,
-    clearCommand: "/clear",
+    clearCommand: null,
     useOutputFile: true,
+    outputFileWriteMethod: "shell",
   },
   "codex-live": {
     slug: "codex",

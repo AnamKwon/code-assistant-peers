@@ -88,13 +88,14 @@ describe("assistant routing", () => {
     expect(shouldRunHostSelfReview("codex", "normal", { CODE_ASSISTANT_PEERS_SELF_REVIEW: "none" } as NodeJS.ProcessEnv)).toBe(false);
   });
 
-  test("exposes Gemini CLI as a built-in adapter", () => {
+  test("exposes the Antigravity CLI (agy) as the gemini built-in adapter", () => {
     const registry = loadAssistantRegistry({} as NodeJS.ProcessEnv);
 
-    expect(getAssistantAdapter("gemini", registry).command).toEqual(["gemini", "--skip-trust", "--approval-mode", "plan", "-p", ""]);
-    expect(getAssistantAdapter("gemini", registry).prompt_transport).toBe("stdin");
+    // Gemini CLI was retired 2026-06-18; the gemini adapter now spawns the Antigravity CLI (`agy`).
+    expect(getAssistantAdapter("gemini", registry).command).toEqual(["agy", "--dangerously-skip-permissions", "-p"]);
+    expect(getAssistantAdapter("gemini", registry).prompt_transport).toBe("argv");
     expect(getAssistantAdapter("gemini", registry).timeout_ms).toBe(180000);
-    expect(buildReviewCommand("gemini")).toEqual(["gemini", "--skip-trust", "--approval-mode", "plan", "-p", ""]);
+    expect(buildReviewCommand("gemini")).toEqual(["agy", "--dangerously-skip-permissions", "-p"]);
   });
 
   test("loads custom CLI assistants from environment JSON", () => {
@@ -137,8 +138,8 @@ describe("assistant routing", () => {
         gemini: { command: ["gemini", "-p"], prompt_transport: "argv" },
       }),
     } as NodeJS.ProcessEnv);
-    expect(registry.gemini.command).toEqual(["gemini", "--skip-trust", "--approval-mode", "plan", "-p", ""]);
-    expect(registry.gemini.prompt_transport).toBe("stdin");
+    expect(registry.gemini.command).toEqual(["agy", "--dangerously-skip-permissions", "-p"]);
+    expect(registry.gemini.prompt_transport).toBe("argv");
   });
 
   test("rejects illegal assistant ids through custom config", () => {
@@ -559,14 +560,11 @@ describe("review command construction", () => {
       "-",
     ]);
     expect(buildReviewCommand("gemini", "flash")).toEqual([
-      "gemini",
-      "--skip-trust",
-      "--approval-mode",
-      "plan",
+      "agy",
+      "--dangerously-skip-permissions",
       "--model",
       "flash",
       "-p",
-      "",
     ]);
   });
 

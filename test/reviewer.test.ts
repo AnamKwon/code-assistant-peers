@@ -21,6 +21,8 @@ import {
   isUnknownExistingSession,
   liveSessionUntrackedState,
   liveCliKindFor,
+  paneTail,
+  reviewerLooksBusy,
   resolveReviewerWorkflow,
   runReviewerWorker,
   sessionNameFor,
@@ -226,8 +228,9 @@ describe("reviewer worker loop", () => {
     const gemini = liveCliKindFor("gemini-live")!;
     expect(gemini.promptDir("/repo")).toBe("/repo/.peer-review"); // inside the trusted cwd
     const gemCmd = gemini.launchCommand("/repo", gemini.promptDir("/repo"));
-    expect(gemCmd[0]).toBe("gemini");
-    expect(gemCmd).not.toContain("--include-directories"); // avoids the second trust prompt
+    expect(gemCmd[0]).toBe("agy"); // Gemini CLI was retired 2026-06-18; gemini-live now drives Antigravity CLI
+    expect(gemCmd).toContain("--dangerously-skip-permissions"); // no per-tool prompts in the headless session
+    expect(gemCmd).toContain("--add-dir");
 
     const codex = liveCliKindFor("codex-live")!;
     expect(codex.launchCommand("/repo", codex.promptDir("/repo")).slice(0, 3)).toContain("codex");
@@ -241,9 +244,12 @@ describe("reviewer worker loop", () => {
     expect(claude.launchCommand("/repo", "/tmp/prompts", "opus", "11111111-1111-4111-8111-111111111111")).toEqual(expect.arrayContaining(["--session-id", "11111111-1111-4111-8111-111111111111", "--model", "opus"]));
     expect(claude.resumeCommand?.("/repo", "/tmp/prompts", "11111111-1111-4111-8111-111111111111", "sonnet")).toEqual(expect.arrayContaining(["--resume", "11111111-1111-4111-8111-111111111111", "--model", "sonnet"]));
 
+    // agy has no caller-supplied --session-id; the model is passed via --model and history is resumed with --continue.
     const gemini = liveCliKindFor("gemini-live")!;
-    expect(gemini.launchCommand("/repo", "/repo/.peer-review", "gemini-2.5-flash", "22222222-2222-4222-8222-222222222222")).toEqual(expect.arrayContaining(["--session-id", "22222222-2222-4222-8222-222222222222", "--model", "gemini-2.5-flash"]));
-    expect(gemini.resumeCommand?.("/repo", "/repo/.peer-review", "22222222-2222-4222-8222-222222222222", "gemini-2.5-pro")).toEqual(expect.arrayContaining(["--resume", "22222222-2222-4222-8222-222222222222", "--model", "gemini-2.5-pro"]));
+    const gemLaunch = gemini.launchCommand("/repo", "/repo/.peer-review", "gemini-3.5-flash", "22222222-2222-4222-8222-222222222222");
+    expect(gemLaunch).toEqual(expect.arrayContaining(["--model", "gemini-3.5-flash"]));
+    expect(gemLaunch).not.toContain("--session-id");
+    expect(gemini.resumeCommand?.("/repo", "/repo/.peer-review", "22222222-2222-4222-8222-222222222222", "gemini-3.5-pro")).toEqual(expect.arrayContaining(["--continue", "--model", "gemini-3.5-pro"]));
 
     const codex = liveCliKindFor("codex-live")!;
     expect(codex.launchCommand("/repo", "/tmp/prompts", "gpt-5.3-codex-spark")).toEqual(expect.arrayContaining(["-m", "gpt-5.3-codex-spark"]));
@@ -414,6 +420,46 @@ describe("review extraction from a captured pane", () => {
   });
 });
 
+describe("paneTail (liveness sampling slice)", () => {
+  const lines = (n: number) => Array.from({ length: n }, (_, i) => `line ${i + 1}`).join("\n");
+
+  test("returns the whole capture when it has fewer lines than the limit", () => {
+    expect(paneTail("a\nb\nc", 30)).toBe("a\nb\nc");
+  });
+
+  test("returns only the last N lines of a long capture", () => {
+    const tail = paneTail(lines(1000), 30);
+    expect(tail.split("\n")).toHaveLength(30);
+    expect(tail.split("\n")[0]).toBe("line 971");
+    expect(tail.endsWith("line 1000")).toBe(true);
+  });
+
+  test("trailing blank lines do not count as a change (trimmed before slicing)", () => {
+    // A flickering trailing newline must produce the SAME tail, so it is not read as 'still working'.
+    expect(paneTail("x\ny\nz", 30)).toBe(paneTail("x\ny\nz\n\n  \n", 30));
+  });
+
+  test("a ticking elapsed-timer on the last line changes the tail", () => {
+    const pane = (secs: number) => [lines(40), `esc to interrupt (${secs}s)`].join("\n");
+    expect(paneTail(pane(12), 30)).not.toBe(paneTail(pane(13), 30));
+  });
+});
+
+describe("reviewerLooksBusy (keeps a mid-step pause from being read as finished)", () => {
+  test("true while a coding-agent TUI shows its busy footer", () => {
+    expect(reviewerLooksBusy("...output...\nesc to cancel            Gemini 3.5 Flash")).toBe(true);
+    expect(reviewerLooksBusy("⏵⏵ working\nesc to interrupt (12s)")).toBe(true);
+    expect(reviewerLooksBusy("⣷  Generating...")).toBe(true);
+    expect(reviewerLooksBusy("▸ Thinking… 1.8k tokens")).toBe(true);
+  });
+
+  test("false at an idle prompt / for plain review content", () => {
+    expect(reviewerLooksBusy("> \n? for shortcuts            Gemini 3.5 Flash (Medium)")).toBe(false);
+    // Review prose mentioning these words without the footer/spinner shape must NOT count as busy.
+    expect(reviewerLooksBusy("The function is generating output and the user is thinking about it.")).toBe(false);
+  });
+});
+
 describe("extractReviewFromFile", () => {
   test("returns null when file does not exist", async () => {
     expect(await extractReviewFromFile("/tmp/nonexistent-peer-review-output.md", "job-x")).toBeNull();
@@ -514,6 +560,16 @@ describe("buildDefaultReviewerClaudeArgs", () => {
     const allowedValue = args[allowedIdx + 1];
     expect(allowedValue).toContain("Write(/tmp/prompt-dir:*)");
     expect(allowedValue).toContain("Read");
+  });
+
+  test("uses plan permission mode so the non-interactive reviewer never blocks on a tool-approval prompt", () => {
+    // "default"/"acceptEdits" let Claude run agentically and prompt on non-allowlisted commands
+    // (cat/grep/ls), wedging the live session. Plan mode keeps it read-only; the review is delivered
+    // via the pane markers (extractReviewFromCapture), not the output file.
+    const args = buildDefaultReviewerClaudeArgs("/tmp/prompt-dir", "review_only");
+    const modeIdx = args.indexOf("--permission-mode");
+    expect(modeIdx).toBeGreaterThan(-1);
+    expect(args[modeIdx + 1]).toBe("plan");
   });
 
   test("does not include Write in --disallowedTools", () => {
@@ -620,29 +676,20 @@ describe("gemini-live and codex-live kind configuration", () => {
     expect(cmd[cmd.indexOf("-a") + 1]).toBe("never");
   });
 
-  test("gemini-live launchCommand includes --admin-policy pointing to reviewer-policy.toml", () => {
+  test("gemini-live launchCommand drives agy with --dangerously-skip-permissions and --add-dir (no gemini policy)", () => {
     const cmd = LIVE_CLI_KINDS["gemini-live"].launchCommand("/cwd", "/cwd/.peer-review");
-    expect(cmd[0]).toBe("gemini");
-    expect(cmd).toContain("--admin-policy");
-    expect(cmd[cmd.indexOf("--admin-policy") + 1]).toBe("/cwd/.peer-review/reviewer-policy.toml");
+    expect(cmd[0]).toBe("agy"); // Antigravity CLI replaced the retired Gemini CLI
+    expect(cmd).toContain("--dangerously-skip-permissions");
+    expect(cmd[cmd.indexOf("--add-dir") + 1]).toBe("/cwd/.peer-review");
+    expect(cmd).not.toContain("--admin-policy"); // agy has no policy engine
+    expect(cmd).not.toContain("--session-id"); // agy does not accept a caller-supplied session id
   });
 
-  test("gemini-live kind has policyContent that generates TOML with promptDir-scoped allow rule", () => {
+  test("gemini-live writes its output file via a shell command (agy has no native write_file tool path here)", () => {
     const kind = LIVE_CLI_KINDS["gemini-live"];
-    expect(kind.policyContent).toBeDefined();
-    const policy = kind.policyContent!("/cwd/.peer-review");
-    expect(policy).toContain("write_file");
-    expect(policy).toContain("allow");
-    expect(policy).toContain("deny");
-    expect(policy).toContain(".peer-review");
-    expect(policy).toContain("priority = 500");
-    // Verify the regex correctly allows only flat files inside .peer-review/
-    const match = policy.match(/argsPattern = "([^"\\]|\\.)+"/);
-    expect(match).not.toBeNull();
-    const rawPattern = match![0].slice('argsPattern = "'.length, -1);
-    const pattern = rawPattern.replace(/\\"/g, '"').replace(/\\\\/g, "\\");
-    expect(new RegExp(pattern).test(`{"file_path":"/cwd/.peer-review/job-output.md","content":""}`)).toBe(true);
-    expect(new RegExp(pattern).test(`{"file_path":"/cwd/src/main.ts","content":""}`)).toBe(false);
+    expect(kind.outputFileWriteMethod).toBe("shell");
+    expect(kind.policyContent).toBeUndefined(); // no admin-policy file is generated for agy
+    expect(kind.useOutputFile).toBe(true);
   });
 
   test("claude-live kind has useOutputFile=true", () => {
@@ -674,10 +721,10 @@ describe("buildGeminiReviewerPolicy", () => {
 
   test("dots in promptDir are regex-escaped so the allow rule matches literal dot paths", () => {
     const policy = buildGeminiReviewerPolicy("/my.project/.peer-review");
-    const match = policy.match(/argsPattern = "([^"\\]|\\.)+"/);
+    // argsPattern is emitted as a TOML literal ('...') string: content is verbatim, no escaping.
+    const match = policy.match(/argsPattern = '([^']*)'/);
     expect(match).not.toBeNull();
-    const rawPattern = match![0].slice('argsPattern = "'.length, -1);
-    const pattern = rawPattern.replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+    const pattern = match![1];
     // An output file inside the promptDir must match.
     const validArgs = `{"file_path":"/my.project/.peer-review/job-output.md","content":""}`;
     expect(new RegExp(pattern).test(validArgs)).toBe(true);
@@ -688,12 +735,14 @@ describe("buildGeminiReviewerPolicy", () => {
 
   test("argsPattern defends against content-injection, sibling paths, and all traversal variants", () => {
     const policy = buildGeminiReviewerPolicy("/repo/.peer-review");
-    const match = policy.match(/argsPattern = "([^"\\]|\\.)+"/);
+    // argsPattern is emitted as a TOML literal ('...') string: content is verbatim, no escaping.
+    const match = policy.match(/argsPattern = '([^']*)'/);
     expect(match).not.toBeNull();
-    const rawPattern = match![0].slice('argsPattern = "'.length, -1);
-    // Unescape TOML escapes to get the actual regex string the policy engine will use.
-    const pattern = rawPattern.replace(/\\"/g, '"').replace(/\\\\/g, "\\");
-    expect(pattern.startsWith("^")).toBe(true);
+    const pattern = match![1];
+    // Intentionally NOT anchored at "^{": Gemini does not put file_path first in the args JSON, so an
+    // anchored pattern matched nothing. Security comes from requiring "file_path":"<dir>/<flat-name>"
+    // where the flat-name run excludes "/", which still blocks traversal and sibling paths (below).
+    expect(pattern).toContain('"file_path"');
 
     // Valid: flat filename directly in promptDir.
     const valid = `{"file_path":"/repo/.peer-review/uuid-abc-output.md","content":"review body"}`;

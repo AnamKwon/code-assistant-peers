@@ -599,8 +599,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
     case "get_peer_review_status": {
       const taskId = String((args as { task_id?: unknown }).task_id ?? "").trim();
-      const task = await loadTask(taskId);
-      if (!task) return textResult(`Task not found: ${taskId}`, true);
+      const loaded = await loadTask(taskId);
+      if (!loaded) return textResult(`Task not found: ${taskId}`, true);
+      const task = await reapAbandonedReview(loaded);
       return textResult(await buildReviewStatusJson(task), task.status === "review_failed");
     }
 
@@ -1128,6 +1129,38 @@ async function runAsyncPeerReview(
   }
 }
 
+// Safety net for the polling path. A review can become permanently non-terminal if the background
+// reviewer process vanished — the MCP server restarted (the in-memory activeAsyncReviews set is
+// lost) or the reviewer wedged past its deliver timeout without persisting a failure. Pure
+// wait_for_peer_review / get_peer_review_status polling never restarts such a job (only a fresh
+// review request does, via claimStaleReviewRecovery), so the host would poll a "running" task
+// forever. When a task has had no status update for the recovery window AND no reviewer is active
+// in this process, mark it review_failed so the host's wait loop always terminates.
+async function reapAbandonedReview(task: PeerTask): Promise<PeerTask> {
+  if (isTerminalReviewStatus(task.status)) return task;
+  if (activeAsyncReviews.has(task.id)) return task;
+  if (!isStaleReviewState(task)) return task;
+  const committed = await withReviewFailureCommitLock(task.id, undefined, async (current) => {
+    // Re-check under the lock: a reviewer may have started, finished, or refreshed the task
+    // between the unlocked staleness check and acquiring the lock.
+    if (isTerminalReviewStatus(current.status) || activeAsyncReviews.has(current.id) || !isStaleReviewState(current)) {
+      return false;
+    }
+    await recordReviewFailure(
+      current,
+      current.host,
+      `Peer review for task ${current.id} exceeded ${STALE_REVIEW_RECOVERY_MS}ms with no active reviewer in this MCP server process and no status update; ` +
+        "the background reviewer was likely lost to a process restart or wedged past its deliver timeout. " +
+        "Marked review_failed so the host stops waiting. Re-run the review to try again.",
+    );
+    return true;
+  });
+  if (committed === true) {
+    log(`Reaped abandoned peer review for task ${task.id} (stale >= ${STALE_REVIEW_RECOVERY_MS}ms, no active reviewer).`);
+  }
+  return await loadTask(task.id) ?? task;
+}
+
 async function waitForPeerReviewTool(args: unknown) {
   const parsed = args as { task_id?: unknown; timeout_seconds?: unknown; poll_interval_ms?: unknown };
   const taskId = String(parsed.task_id ?? "").trim();
@@ -1137,16 +1170,18 @@ async function waitForPeerReviewTool(args: unknown) {
   const deadline = Date.now() + timeoutSeconds * 1000;
 
   while (Date.now() <= deadline) {
-    const task = await loadTask(taskId);
-    if (!task) return textResult(`Task not found: ${taskId}`, true);
+    const loaded = await loadTask(taskId);
+    if (!loaded) return textResult(`Task not found: ${taskId}`, true);
+    const task = await reapAbandonedReview(loaded);
     if (isTerminalReviewStatus(task.status)) {
       return textResult(await buildReviewStatusJson(task), task.status === "review_failed");
     }
     await sleep(Math.min(pollIntervalMs, Math.max(0, deadline - Date.now())));
   }
 
-  const task = await loadTask(taskId);
-  if (!task) return textResult(`Task not found: ${taskId}`, true);
+  const loaded = await loadTask(taskId);
+  if (!loaded) return textResult(`Task not found: ${taskId}`, true);
+  const task = await reapAbandonedReview(loaded);
   if (isTerminalReviewStatus(task.status)) {
     return textResult(await buildReviewStatusJson(task), task.status === "review_failed");
   }
@@ -1909,7 +1944,7 @@ async function isAssistantAvailable(reviewer: AssistantHost): Promise<{ ok: bool
         detail: (stdout || stderr).trim() || `command '${command}' not found`,
       };
     }
-    if (reviewer === "gemini") {
+    if (command === "gemini") {
       const geminiAuth = await getGeminiAuthReadiness(process.env);
       if (!geminiAuth.ok) return geminiAuth;
     }
